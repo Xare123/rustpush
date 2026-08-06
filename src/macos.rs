@@ -1,5 +1,7 @@
-
-use std::{collections::HashMap, time::{Duration, SystemTime}};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use open_absinthe::nac::ValidationCtx;
@@ -7,7 +9,11 @@ use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, REQWEST, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{
+    activation::ActivationInfo,
+    util::{encode_hex, get_bag, plist_to_buf, IDS_BAG, REQWEST},
+    DebugMeta, OSConfig, PushError, RegisterMeta,
+};
 
 pub use open_absinthe::nac::HardwareConfig;
 
@@ -71,11 +77,17 @@ impl OSConfig for MacOSConfig {
     }
 
     fn get_mme_clientinfo(&self, for_item: &str) -> String {
-        format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, for_item)
+        format!(
+            "<{}> <macOS;{};{}> <{}>",
+            self.inner.product_name, self.version, self.inner.os_build_num, for_item
+        )
     }
 
     fn get_version_ua(&self) -> String {
-        format!("[macOS,{},{},{}]", self.version, self.inner.os_build_num, self.inner.product_name)
+        format!(
+            "[macOS,{},{},{}]",
+            self.version, self.inner.os_build_num, self.inner.product_name
+        )
     }
 
     fn get_activation_device(&self) -> String {
@@ -91,10 +103,11 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-
-        let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
-        let key = REQWEST.get(url)
-            .send().await?;
+        let url = get_bag(IDS_BAG, "id-validation-cert")
+            .await?
+            .into_string()
+            .unwrap();
+        let key = REQWEST.get(url).send().await?;
         let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
         let certs: Vec<u8> = response.cert.into();
 
@@ -102,14 +115,15 @@ impl OSConfig for MacOSConfig {
         let mut ctx = ValidationCtx::new(&certs, &mut output_req, &self.inner)?;
 
         let init = SessionInfoRequest {
-            session_info_request: output_req.into()
+            session_info_request: output_req.into(),
         };
 
         let info = plist_to_buf(&init)?;
-        let url = get_bag(IDS_BAG, "id-initialize-validation").await?.into_string().unwrap();
-        let activation = REQWEST.post(url)
-            .body(info)
-            .send().await?;
+        let url = get_bag(IDS_BAG, "id-initialize-validation")
+            .await?
+            .into_string()
+            .unwrap();
+        let activation = REQWEST.post(url).body(info).send().await?;
 
         let response: SessionInfoResponse = plist::from_bytes(&activation.bytes().await?)?;
         let output: Vec<u8> = response.session_info.into();
@@ -143,7 +157,10 @@ impl OSConfig for MacOSConfig {
             ("X-Apple-I-MLB", self.inner.mlb.as_str()),
             ("X-Apple-I-ROM", &encode_hex(&self.inner.rom)), // intentional lowercase
             ("X-Apple-I-SRL-NO", &self.inner.platform_serial_number),
-        ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
     }
 
     fn get_serial_number(&self) -> String {
@@ -158,18 +175,21 @@ impl OSConfig for MacOSConfig {
         let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
         Dictionary::from_iter([
             ("ap", Value::String("0".to_string())), // 1 for ios
-
-            ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
+            (
+                "d",
+                Value::String(format!(
+                    "{:.6}",
+                    apple_epoch.elapsed().unwrap().as_secs_f64()
+                )),
+            ),
             ("dt", Value::Integer(1.into())),
             ("gt", Value::String("0".to_string())),
             ("h", Value::String("1".to_string())),
             ("m", Value::String("0".to_string())),
             ("p", Value::String("0".to_string())),
-
             ("pb", Value::String(self.inner.os_build_num.clone())),
             ("pn", Value::String("macOS".to_string())),
             ("pv", Value::String(self.version.clone())),
-
             ("s", Value::String("0".to_string())),
             ("t", Value::String("0".to_string())),
             ("u", Value::String(self.device_id.clone().to_uppercase())),

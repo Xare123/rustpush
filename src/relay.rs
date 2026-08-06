@@ -1,11 +1,17 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 
-use std::{collections::HashMap, time::{Duration, SystemTime}};
-
+use crate::{
+    activation::ActivationInfo,
+    util::{base64_decode, REQWEST},
+    DebugMeta, OSConfig, PushError, RegisterMeta,
+};
 use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{activation::ActivationInfo, util::{base64_decode, REQWEST}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Deserialize)]
 pub struct DataResp {
@@ -41,8 +47,13 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
-    pub async fn get_versions(host: &str, code: &str, beeper_token: &Option<String>) -> Result<Versions, PushError> {
-        let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-version-info", host))
+    pub async fn get_versions(
+        host: &str,
+        code: &str,
+        beeper_token: &Option<String>,
+    ) -> Result<Versions, PushError> {
+        let mut data = REQWEST
+            .post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code)
             .header("Content-Length", "0");
 
@@ -53,13 +64,9 @@ impl RelayConfig {
         let result = data.send().await?;
 
         match result.status().as_u16() {
-            200 => {},
-            404 => {
-                return Err(PushError::DeviceNotFound)
-            },
-            _status => {
-                return Err(PushError::RelayError(_status, result.text().await?))
-            }
+            200 => {}
+            404 => return Err(PushError::DeviceNotFound),
+            _status => return Err(PushError::RelayError(_status, result.text().await?)),
         }
 
         let result: VersionsResp = result.json().await?;
@@ -98,7 +105,14 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_mme_clientinfo(&self, item: &str) -> String {
-        format!("<{}> <{};{};{}> <{}>", self.version.hardware_version, self.version.software_name, self.version.software_version, self.version.software_build_id, item)
+        format!(
+            "<{}> <{};{};{}> <{}>",
+            self.version.hardware_version,
+            self.version.software_name,
+            self.version.software_version,
+            self.version.software_build_id,
+            item
+        )
     }
 
     fn get_adi_mme_info(&self, item: &str, require_mac: bool) -> String {
@@ -115,13 +129,20 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
-        [
-            ("X-Apple-I-SRL-NO", &self.version.serial_number),
-        ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        [("X-Apple-I-SRL-NO", &self.version.serial_number)]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
     }
 
     fn get_version_ua(&self) -> String {
-        format!("[{},{},{},{}]", self.version.software_name, self.version.software_version, self.version.software_build_id, self.version.hardware_version)
+        format!(
+            "[{},{},{},{}]",
+            self.version.software_name,
+            self.version.software_version,
+            self.version.software_build_id,
+            self.version.hardware_version
+        )
     }
 
     fn get_login_url(&self) -> &'static str {
@@ -145,7 +166,8 @@ impl OSConfig for RelayConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-validation-data", self.host))
+        let mut data = REQWEST
+            .post(format!("{}/api/v1/bridge/get-validation-data", self.host))
             .bearer_auth(&self.code)
             .header("Content-Length", "0");
 
@@ -156,13 +178,9 @@ impl OSConfig for RelayConfig {
         let result = data.send().await?;
 
         match result.status().as_u16() {
-            200 => {},
-            404 => {
-                return Err(PushError::DeviceNotFound)
-            },
-            _status => {
-                return Err(PushError::RelayError(_status, result.text().await?))
-            }
+            200 => {}
+            404 => return Err(PushError::DeviceNotFound),
+            _status => return Err(PushError::RelayError(_status, result.text().await?)),
         }
 
         let result: DataResp = result.json().await?;
@@ -173,7 +191,12 @@ impl OSConfig for RelayConfig {
     fn get_register_meta(&self) -> RegisterMeta {
         RegisterMeta {
             hardware_version: self.version.hardware_version.clone(),
-            os_version: format!("{},{},{}", self.version.software_name, self.version.software_version, self.version.software_build_id),
+            os_version: format!(
+                "{},{},{}",
+                self.version.software_name,
+                self.version.software_version,
+                self.version.software_build_id
+            ),
             software_version: self.version.software_build_id.clone(),
         }
     }
@@ -191,8 +214,13 @@ impl OSConfig for RelayConfig {
         Dictionary::from_iter([
             // apple pay
             ("ap", Value::String("0".to_string())),
-
-            ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
+            (
+                "d",
+                Value::String(format!(
+                    "{:.6}",
+                    apple_epoch.elapsed().unwrap().as_secs_f64()
+                )),
+            ),
             // device type
             ("dt", Value::Integer(1.into())),
             // green tea - ??
@@ -201,16 +229,20 @@ impl OSConfig for RelayConfig {
             ("h", Value::String("1".to_string())),
             // supports phone calls
             ("p", Value::String("0".to_string())),
-
             ("pb", Value::String(self.version.software_build_id.clone())),
-            ("pn", Value::String(if self.version.software_name == "MacOS" { "macOS".to_string() } else { self.version.software_name.clone() })),
+            (
+                "pn",
+                Value::String(if self.version.software_name == "MacOS" {
+                    "macOS".to_string()
+                } else {
+                    self.version.software_name.clone()
+                }),
+            ),
             ("pv", Value::String(self.version.software_version.clone())),
-            
             // mms router support
             ("m", Value::String("1".to_string())),
             // sms router support
             ("s", Value::String("1".to_string())),
-
             // tethering support
             // ec = enclosure color
             // c = data color
@@ -223,5 +255,4 @@ impl OSConfig for RelayConfig {
             ("v", Value::String("1".to_string())),
         ])
     }
-
 }

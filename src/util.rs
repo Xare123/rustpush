@@ -11,10 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use base64::engine::general_purpose;
+use base64::Engine;
 use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::hmac::Hmac;
 use keystore::KeystorePublicKey;
-use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
+use libflate::gzip::{Decoder, EncodeOptions, Encoder, HeaderBuilder};
 use log::{debug, info, warn};
 use num_bigint::{BigInt, Sign};
 use openssl::bn::{BigNum, BigNumContext};
@@ -28,28 +29,29 @@ use openssl::sha::sha256;
 use openssl::sign::{Signer, Verifier};
 use openssl::symm::{decrypt, encrypt, Cipher, Crypter, Mode};
 use plist::{Data, Date, Dictionary, Error, Uid, Value};
-use base64::Engine;
 use prost::Message;
 use rasn::{AsnType, Decode, Encode};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
-use serde::de::{DeserializeOwned, value};
+use serde::de::{value, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::fmt::{Debug, Display, Write as FmtWrite};
+use std::io::{Read, Write};
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio_rustls::client;
 use uuid::Uuid;
-use std::io::{Write, Read};
-use std::fmt::{Debug, Display, Write as FmtWrite};
 
-use rand::{Rng, thread_rng};
-use rand::seq::SliceRandom;
 use futures::FutureExt;
+use rand::seq::SliceRandom;
+use rand::{thread_rng, Rng};
 
 use crate::{APSConnection, OSConfig, PushError};
 
@@ -58,29 +60,28 @@ pub const IDS_BAG: &str = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/g
 
 pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
     static CACHE: LazyLock<Mutex<HashMap<String, Dictionary>>> = LazyLock::new(Default::default);
-    
+
     let mut locked = CACHE.lock().await;
 
     if !locked.contains_key(url) {
         let content = REQWEST.get(url).send().await?;
         if !content.status().is_success() {
-            return Err(PushError::StatusError(content.status()))
+            return Err(PushError::StatusError(content.status()));
         }
 
         #[derive(Deserialize)]
         struct BagBody {
-            bag: Data
+            bag: Data,
         }
         let parsed: BagBody = plist::from_bytes(&content.bytes().await?)?;
         let dict: Dictionary = plist::from_bytes(parsed.bag.as_ref())?;
-        
+
         locked.insert(url.to_string(), dict);
     }
 
     let bag = locked.get(url).unwrap();
     bag.get(item).cloned().ok_or(PushError::BagKeyNotFound)
 }
-
 
 pub struct DebugGuard<'a, T>(MutexGuard<'a, T>, Location<'a>, u16, u16);
 
@@ -110,7 +111,7 @@ impl<T> DebugMutex<T> {
         let id: u16 = rand::random();
         Self(Mutex::new(v), id)
     }
-    
+
     #[track_caller]
     pub fn lock(&self) -> impl Future<Output = DebugGuard<'_, T>> {
         let caller = Location::caller();
@@ -144,7 +145,10 @@ pub struct DebugWriteGuard<'a, T>(Option<RwLockWriteGuard<'a, T>>, Location<'a>,
 
 impl<'a, T> DebugWriteGuard<'a, T> {
     pub fn downgrade(mut self) -> DebugReadGuard<'a, T> {
-        info!("Write mtx {} guard {}@{} downgraded", self.3, self.1, self.2);
+        info!(
+            "Write mtx {} guard {}@{} downgraded",
+            self.3, self.1, self.2
+        );
 
         DebugReadGuard(self.0.take().unwrap().downgrade(), self.1, self.2, self.3)
     }
@@ -204,10 +208,12 @@ impl<T> DebugRwLock<T> {
     }
 }
 
-
 fn build_proxy() -> Client {
     let mut headers = HeaderMap::new();
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
 
     reqwest::Client::builder()
         .use_rustls_tls()
@@ -215,19 +221,24 @@ fn build_proxy() -> Client {
         .default_headers(headers)
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true)
-        .build().unwrap()
+        .build()
+        .unwrap()
 }
-
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     // return build_proxy();
     let certificates = vec![
-        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!(
+            "../certs/root/profileidentity.ess.apple.com.cert"
+        ))
+        .unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
     ];
     let mut headers = HeaderMap::new();
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
 
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
@@ -244,14 +255,18 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
 pub static CARRIER_REQWEST: LazyLock<Client> = LazyLock::new(|| {
     // return build_proxy();
     let mut headers = HeaderMap::new();
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
 
     reqwest::Client::builder()
         // we need native TLS because carriers suck at providing modern TLS ciphers (with PFS)
         .use_native_tls()
         .default_headers(headers.clone())
         .http1_title_case_headers()
-        .build().unwrap()
+        .build()
+        .unwrap()
 });
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
@@ -285,7 +300,9 @@ where
 {
     use serde::de::Error;
     let s: Data = Deserialize::deserialize(d)?;
-    EcKey::private_key_from_der(s.as_ref()).map_err(Error::custom).and_then(|a| a.try_into().map_err(Error::custom))
+    EcKey::private_key_from_der(s.as_ref())
+        .map_err(Error::custom)
+        .and_then(|a| a.try_into().map_err(Error::custom))
 }
 
 pub fn ec_serialize<S>(x: &EcKey<Public>, s: S) -> Result<S::Ok, S::Error>
@@ -302,7 +319,9 @@ where
 {
     use serde::de::Error;
     let s: Data = Deserialize::deserialize(d)?;
-    EcKey::public_key_from_der(s.as_ref()).map_err(Error::custom).and_then(|a| a.try_into().map_err(Error::custom))
+    EcKey::public_key_from_der(s.as_ref())
+        .map_err(Error::custom)
+        .and_then(|a| a.try_into().map_err(Error::custom))
 }
 
 pub fn rsa_serialize_priv<S>(x: &Rsa<Private>, s: S) -> Result<S::Ok, S::Error>
@@ -346,9 +365,10 @@ where
     S: Serializer,
     T: Message,
 {
-    x.as_ref().map(|a| Data::new(a.encode_to_vec())).serialize(s)
+    x.as_ref()
+        .map(|a| Data::new(a.encode_to_vec()))
+        .serialize(s)
 }
-
 
 pub fn proto_deserialize_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
@@ -364,15 +384,16 @@ where
     })
 }
 
-
 pub fn proto_serialize_vec<S, T>(x: &Vec<T>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
     T: Message,
 {
-    x.iter().map(|a| Data::new(a.encode_to_vec())).collect::<Vec<_>>().serialize(s)
+    x.iter()
+        .map(|a| Data::new(a.encode_to_vec()))
+        .collect::<Vec<_>>()
+        .serialize(s)
 }
-
 
 pub fn proto_deserialize_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
@@ -381,9 +402,9 @@ where
 {
     use serde::de::Error;
     let s: Vec<Data> = Deserialize::deserialize(d)?;
-    s.into_iter().map(|s| {
-        T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)
-    }).collect()
+    s.into_iter()
+        .map(|s| T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom))
+        .collect()
 }
 
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>
@@ -445,7 +466,9 @@ where
 
 pub fn date_to_ms(date: Date) -> u64 {
     let time: SystemTime = date.into();
-    time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 pub fn ms_to_date(ms: u64) -> Date {
@@ -467,7 +490,9 @@ where
     let s: Option<Date> = Deserialize::deserialize(d)?;
     Ok(s.map(|s| {
         let time: SystemTime = s.into();
-        time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }))
 }
 
@@ -485,7 +510,10 @@ where
 {
     let s: Date = Deserialize::deserialize(d)?;
     let time: SystemTime = s.into();
-    Ok(time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+    Ok(time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64)
 }
 
 // both in der
@@ -587,7 +615,7 @@ pub fn decode_uleb128(cursor: &mut impl Read) -> Result<u64, std::io::Error> {
         cursor.read_exact(&mut read_buf)?;
         result |= ((read_buf[0] & 0x7f) as u64) << (7 * i);
         if read_buf[0] & 0x80 == 0 {
-            return Ok(result)
+            return Ok(result);
         }
     }
     panic!()
@@ -600,7 +628,7 @@ pub fn encode_uleb128(mut val: u64) -> Vec<u8> {
         val >>= 7;
         if val == 0 {
             result.push(byte);
-            return result
+            return result;
         }
         result.push(byte | 0x80)
     }
@@ -611,13 +639,30 @@ pub fn ec_key_from_apple(apple: &[u8], curve: &EcGroup) -> EcKey<Private> {
     let expected_uncompressed_len = 1 + 2 * field_len;
 
     let mut num_context_ref = BigNumContext::new().unwrap();
-    let main_point = EcPoint::from_bytes(curve, &apple[..expected_uncompressed_len], &mut num_context_ref).unwrap();
-    EcKey::from_private_components(curve, &BigNum::from_slice(&apple[expected_uncompressed_len..]).unwrap(), &main_point).unwrap()
+    let main_point = EcPoint::from_bytes(
+        curve,
+        &apple[..expected_uncompressed_len],
+        &mut num_context_ref,
+    )
+    .unwrap();
+    EcKey::from_private_components(
+        curve,
+        &BigNum::from_slice(&apple[expected_uncompressed_len..]).unwrap(),
+        &main_point,
+    )
+    .unwrap()
 }
 
 pub fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
     let mut num_context_ref = BigNumContext::new().unwrap();
-    let mut point = key.public_key().to_bytes(&key.group(), PointConversionForm::UNCOMPRESSED, &mut num_context_ref).unwrap();
+    let mut point = key
+        .public_key()
+        .to_bytes(
+            &key.group(),
+            PointConversionForm::UNCOMPRESSED,
+            &mut num_context_ref,
+        )
+        .unwrap();
     point.extend(key.private_key().to_vec());
     point
 }
@@ -626,7 +671,7 @@ pub fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
 #[serde(rename_all = "PascalCase")]
 struct MasterList {
     mobile_device_carriers_by_mcc_mnc: HashMap<String, MobileCarrier>,
-    mobile_device_carrier_bundles_by_product_version: HashMap<String, Value>
+    mobile_device_carrier_bundles_by_product_version: HashMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -652,7 +697,7 @@ impl MobileCarrier {
 #[derive(Deserialize, Debug)]
 struct MobileCarrierBundle {
     #[serde(rename = "BundleURL")]
-    bundle_url: Option<String>
+    bundle_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -680,7 +725,6 @@ struct Carrier {
 
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
-
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CarrierEntitlements {
@@ -690,7 +734,11 @@ pub struct CarrierEntitlements {
 }
 
 impl CarrierEntitlements {
-    async fn invoke(&self, requests: &[serde_json::Value], config: &dyn OSConfig) -> Result<Vec<serde_json::Value>, PushError> {
+    async fn invoke(
+        &self,
+        requests: &[serde_json::Value],
+        config: &dyn OSConfig,
+    ) -> Result<Vec<serde_json::Value>, PushError> {
         let user_agent = self.user_agent.as_ref().map(|i| i.as_str()).unwrap_or("Entitlement/$version ($device) iOS/$iOSVersion ($build) Carrier Settings/$carrierBundleVersion")
             .replace("$version", "2")
             .replace("$device", "iPhone")
@@ -699,18 +747,30 @@ impl CarrierEntitlements {
 
         let value = gzip_normal(&serde_json::to_vec(requests)?)?;
 
-        Ok(CARRIER_REQWEST.post(&self.server_address)
+        Ok(CARRIER_REQWEST
+            .post(&self.server_address)
             .header("Content-Type", "application/json")
             .header("x-country-iso-code", "us")
             .header("Accept", "application/json")
             .header("Content-Encoding", "gzip")
-            .header("User-Agent", format!("{} Carrier Settings/50.0.2", user_agent))
+            .header(
+                "User-Agent",
+                format!("{} Carrier Settings/50.0.2", user_agent),
+            )
             .header("Accept-Language", "en")
             .header("Accept-Encoding", "gzip")
-            .header("x-protocol-version", self.protocol_version.as_ref().map(|i| i.as_str()).unwrap_or("2"))
+            .header(
+                "x-protocol-version",
+                self.protocol_version
+                    .as_ref()
+                    .map(|i| i.as_str())
+                    .unwrap_or("2"),
+            )
             .body(value)
-            .send().await?
-            .json().await?)
+            .send()
+            .await?
+            .json()
+            .await?)
     }
 }
 
@@ -720,37 +780,63 @@ pub struct CarrierConfig {
 }
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, PushError> {
-    let data = REQWEST.get(CARRIER_CONFIG)
-        .send().await?;
-    
+    let data = REQWEST.get(CARRIER_CONFIG).send().await?;
+
     let master: MasterList = plist::from_bytes(&data.bytes().await?)?;
-    let my_carrier = master.mobile_device_carriers_by_mcc_mnc.get(mccmnc).ok_or(PushError::CarrierNotFound)?;
+    let my_carrier = master
+        .mobile_device_carriers_by_mcc_mnc
+        .get(mccmnc)
+        .ok_or(PushError::CarrierNotFound)?;
 
     let mut my_bundles = my_carrier.get_bundles();
     my_bundles.shuffle(&mut thread_rng());
     for my_bundle in my_bundles {
-        let Some(bundle) = master.mobile_device_carrier_bundles_by_product_version.get(my_bundle) else { continue };
+        let Some(bundle) = master
+            .mobile_device_carrier_bundles_by_product_version
+            .get(my_bundle)
+        else {
+            continue;
+        };
 
         let bundles_by_version: HashMap<String, MobileCarrierBundle> = plist::from_value(bundle)?;
-        let Some(latest) = bundles_by_version.keys().max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0)) else { continue };
-        let Some(latest_url) = &bundles_by_version[latest].bundle_url else { continue };
+        let Some(latest) = bundles_by_version
+            .keys()
+            .max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0))
+        else {
+            continue;
+        };
+        let Some(latest_url) = &bundles_by_version[latest].bundle_url else {
+            continue;
+        };
 
-        let zipped = REQWEST.get(latest_url)
-            .send().await?;
+        let zipped = REQWEST.get(latest_url).send().await?;
         let mut cursor = Cursor::new(zipped.bytes().await?);
         let mut archive = zip::ZipArchive::new(&mut cursor)?;
 
-        let Some(carrier) = archive.file_names().find(|name| name.starts_with("Payload/") && name.ends_with("/carrier.plist")) else { continue };
+        let Some(carrier) = archive
+            .file_names()
+            .find(|name| name.starts_with("Payload/") && name.ends_with("/carrier.plist"))
+        else {
+            continue;
+        };
         let mut out = vec![];
-        archive.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
+        archive
+            .by_name(&carrier.to_string())
+            .unwrap()
+            .read_to_end(&mut out)?;
 
         info!("here {:?}", plist::from_bytes::<Value>(&out)?);
 
         let parsed_file: Carrier = plist::from_bytes(&out)?;
         return Ok(CarrierConfig {
-            gateway: parsed_file.phone_number_registration_gateway_address.vec().choose(&mut thread_rng()).ok_or(PushError::CarrierNotFound)?.clone(),
+            gateway: parsed_file
+                .phone_number_registration_gateway_address
+                .vec()
+                .choose(&mut thread_rng())
+                .ok_or(PushError::CarrierNotFound)?
+                .clone(),
             carrier: parsed_file.carrier_entitlements,
-        })
+        });
     }
 
     Err(PushError::CarrierNotFound)
@@ -765,12 +851,22 @@ pub struct EntitlementAuthState {
     mccmnc: String,
 }
 
-fn find_entitlement_result<T: DeserializeOwned>(entitlements: &[serde_json::Value], id: u64) -> Result<T, PushError> {
-    let entitlement = entitlements.iter().find(|i| {
-        let serde_json::Value::Object(o) = i else { return false };
-        let Some(serde_json::Value::Number(n)) = o.get("response-id") else { return false };
-        n.as_u64().expect("not u64") == id
-    }).expect("Entitlement response not found!");
+fn find_entitlement_result<T: DeserializeOwned>(
+    entitlements: &[serde_json::Value],
+    id: u64,
+) -> Result<T, PushError> {
+    let entitlement = entitlements
+        .iter()
+        .find(|i| {
+            let serde_json::Value::Object(o) = i else {
+                return false;
+            };
+            let Some(serde_json::Value::Number(n)) = o.get("response-id") else {
+                return false;
+            };
+            n.as_u64().expect("not u64") == id
+        })
+        .expect("Entitlement response not found!");
     Ok(serde_json::from_value(entitlement.clone())?)
 }
 
@@ -788,7 +884,6 @@ pub struct EntitlementsResponse {
 }
 
 impl EntitlementAuthState {
-
     pub fn new(subscriber: String, mccmnc: String, imei: String) -> Self {
         Self {
             device_account_identifier: Uuid::new_v4().to_string().to_uppercase(),
@@ -799,8 +894,16 @@ impl EntitlementAuthState {
         }
     }
 
-    pub async fn get_entitlements<Fut: Future<Output = Result<String, PushError>>>(&mut self, config: &dyn OSConfig, aps: &APSConnection, process_challenge: impl FnOnce(String) -> Fut) -> Result<EntitlementsResponse, PushError> {
-        let entitlements = get_gateways_for_mccmnc(&self.mccmnc).await?.carrier.ok_or(PushError::ICCAuthUnsupported)?;
+    pub async fn get_entitlements<Fut: Future<Output = Result<String, PushError>>>(
+        &mut self,
+        config: &dyn OSConfig,
+        aps: &APSConnection,
+        process_challenge: impl FnOnce(String) -> Fut,
+    ) -> Result<EntitlementsResponse, PushError> {
+        let entitlements = get_gateways_for_mccmnc(&self.mccmnc)
+            .await?
+            .carrier
+            .ok_or(PushError::ICCAuthUnsupported)?;
 
         let mut starting_id = rand::thread_rng().gen_range(3..5);
 
@@ -843,14 +946,19 @@ impl EntitlementAuthState {
             })
         };
 
-        let response = entitlements.invoke(&[
-            auth_challenge,
-            json!({
-                "client-nonce": base64_encode(&aps.get_token().await),
-                "action-name": "getPhoneNumber",
-                "request-id": starting_id + 1,
-            })
-        ], config).await?;
+        let response = entitlements
+            .invoke(
+                &[
+                    auth_challenge,
+                    json!({
+                        "client-nonce": base64_encode(&aps.get_token().await),
+                        "action-name": "getPhoneNumber",
+                        "request-id": starting_id + 1,
+                    }),
+                ],
+                config,
+            )
+            .await?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "kebab-case")]
@@ -865,21 +973,24 @@ impl EntitlementAuthState {
 
         Ok(EntitlementsResponse {
             phone,
-            host: entitlements.server_address.clone()
+            host: entitlements.server_address.clone(),
         })
     }
 }
 
-
-
 pub trait Resource: Send + Sync + Sized {
     // resolve when resource is done, on a timeout of RESOURCE_GENERATE_TIMEOUT (currently 5 minutes)
-    fn generate(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send;
+    fn generate(
+        self: &Arc<Self>,
+    ) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send;
 
-    fn generate_unwind_safe(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send {
+    fn generate_unwind_safe(
+        self: &Arc<Self>,
+    ) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send {
         async {
             std::panic::AssertUnwindSafe(self.generate())
-                .catch_unwind().await
+                .catch_unwind()
+                .await
                 .map_err(|e| {
                     let string = if let Some(str) = e.downcast_ref::<&str>() {
                         str.to_string()
@@ -934,22 +1045,35 @@ pub struct ResourceFailure {
 
 impl Display for ResourceFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to generate resource {}; {}", self.error, 
-            if let Some(retry_in) = self.retry_wait { format!("retrying in {}s", retry_in) } else { "not retrying".to_string() })
+        write!(
+            f,
+            "Failed to generate resource {}; {}",
+            self.error,
+            if let Some(retry_in) = self.retry_wait {
+                format!("retrying in {}s", retry_in)
+            } else {
+                "not retrying".to_string()
+            }
+        )
     }
 }
-
 
 #[derive(Clone)]
 pub enum ResourceState {
     Generated,
     Generating,
-    Failed (ResourceFailure),
+    Failed(ResourceFailure),
     Closed,
 }
 
 impl<T: Resource + 'static> ResourceManager<T> {
-    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, generate_timeout: Duration, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
+    pub fn new<B: BackoffBuilder + 'static>(
+        name: &'static str,
+        resource: Arc<T>,
+        backoff: B,
+        generate_timeout: Duration,
+        running_resource: Option<JoinHandle<()>>,
+    ) -> Arc<ResourceManager<T>> {
         let (retry_send, _) = broadcast::channel::<Result<(), ResourceFailure>>(9999);
         let (sig_send, mut sig_recv) = mpsc::channel(1);
         let (retry_now_send, mut retry_now_recv) = mpsc::channel(1);
@@ -965,7 +1089,12 @@ impl<T: Resource + 'static> ResourceManager<T> {
             retry_now_signal: retry_now_send,
             death_signal: death_send,
             generated_signal: generated_send.clone(),
-            resource_state: watch::channel(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }).0,
+            resource_state: watch::channel(if running_resource.is_some() {
+                ResourceState::Generated
+            } else {
+                ResourceState::Generating
+            })
+            .0,
         });
 
         let mut current_resource = running_resource.unwrap_or_else(|| tokio::spawn(async {}));
@@ -975,11 +1104,14 @@ impl<T: Resource + 'static> ResourceManager<T> {
         let resource_ref = manager.resource.clone();
         let loop_manager = Arc::downgrade(&manager);
         tokio::spawn(async move {
-            let resolve_items = move |result: Result<(), ResourceFailure>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
-                while let Ok(_) = sig_recv.try_recv() { }
-                while let Ok(_) = sig_recv_now.try_recv() { }
-                let _ = retry_send.send(result.clone());
-            };
+            let resolve_items =
+                move |result: Result<(), ResourceFailure>,
+                      sig_recv: &mut mpsc::Receiver<()>,
+                      sig_recv_now: &mut mpsc::Receiver<()>| {
+                    while let Ok(_) = sig_recv.try_recv() {}
+                    while let Ok(_) = sig_recv_now.try_recv() {}
+                    let _ = retry_send.send(result.clone());
+                };
 
             'stop: loop {
                 debug!("Resource {}: waiting for retry reason", resource_name);
@@ -1012,8 +1144,12 @@ impl<T: Resource + 'static> ResourceManager<T> {
                     let is_final = matches!(*shared_err, PushError::DoNotRetry(_));
 
                     let failure = ResourceFailure {
-                        retry_wait: if !is_final { Some(retry_in.as_secs()) } else { None },
-                        error: shared_err
+                        retry_wait: if !is_final {
+                            Some(retry_in.as_secs())
+                        } else {
+                            None
+                        },
+                        error: shared_err,
                     };
                     resolve_items(Err(failure.clone()), &mut sig_recv, &mut retry_now_recv);
                     debug!("Resource {}: resource marking", resource_name);
@@ -1066,7 +1202,11 @@ impl<T: Resource + 'static> ResourceManager<T> {
 
     pub async fn ensure_ready(&self) -> Result<(), PushError> {
         // wait for any generation to finish
-        self.resource_state.subscribe().wait_for(|i| !matches!(i, ResourceState::Generating)).await.map_err(|_| PushError::ResourceClosed)?;
+        self.resource_state
+            .subscribe()
+            .wait_for(|i| !matches!(i, ResourceState::Generating))
+            .await
+            .map_err(|_| PushError::ResourceClosed)?;
         self.ensure_not_failed()
     }
 
@@ -1075,7 +1215,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
         match &*self.resource_state.borrow() {
             ResourceState::Failed(error) => Err(error.clone().into()),
             ResourceState::Closed => Err(PushError::ResourceClosed),
-            _ => Ok(())
+            _ => Ok(()),
         }
     }
 
@@ -1088,22 +1228,37 @@ impl<T: Resource + 'static> ResourceManager<T> {
         let _ = self.retry_signal.try_send(());
     }
 
+    /// Requests regeneration immediately, including while the resource is
+    /// sleeping in an exponential-backoff window.
+    pub async fn request_update_now(&self) {
+        info!("Requesting immediate update {}", self.name);
+        let _ = self.retry_now_signal.try_send(());
+    }
+
     pub async fn refresh(&self) -> Result<(), PushError> {
         self.refresh_option(false).await
     }
-    
+
     pub async fn refresh_now(&self) -> Result<(), PushError> {
         self.refresh_option(true).await
     }
 
     async fn refresh_option(&self, now: bool) -> Result<(), PushError> {
-        if let ResourceState::Failed(ResourceFailure { retry_wait: None, error }) = &*self.resource_state.borrow() {
+        if let ResourceState::Failed(ResourceFailure {
+            retry_wait: None,
+            error,
+        }) = &*self.resource_state.borrow()
+        {
             // this is a permanent failure
-            return Err(ResourceFailure { retry_wait: None, error: error.clone() }.into())
+            return Err(ResourceFailure {
+                retry_wait: None,
+                error: error.clone(),
+            }
+            .into());
         }
         let elapsed = self.refreshed_at.lock().await.elapsed().unwrap();
         if elapsed < MAX_RESOURCE_REGEN {
-            return Ok(())
+            return Ok(());
         }
         let mut subscribe = self.request_retries.subscribe();
         info!("Retrying {now} {}", self.name);
@@ -1112,9 +1267,11 @@ impl<T: Resource + 'static> ResourceManager<T> {
         } else {
             let _ = self.retry_signal.try_send(());
         }
-        Ok(tokio::time::timeout(MAX_RESOURCE_WAIT, subscribe.recv()).await.map_err(|_| PushError::ResourceTimeout)?.unwrap()?)
+        Ok(tokio::time::timeout(MAX_RESOURCE_WAIT, subscribe.recv())
+            .await
+            .map_err(|_| PushError::ResourceTimeout)?
+            .unwrap()?)
     }
-
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1193,16 +1350,17 @@ const CLASS_SPECS: &[ClassData] = &[
             "icon",
             "images",
             "icons",
-            "specialization2"
-        ]
+            "specialization2",
+        ],
     },
     ClassData {
         name: "LPPasswordsInviteMetadata",
-        classes: &["LPPasswordsInviteMetadata", "LPSpecializationMetadata", "NSObject"],
-        uid_fields: &[
-            "groupName",
-            "urlParameters"
-        ]
+        classes: &[
+            "LPPasswordsInviteMetadata",
+            "LPSpecializationMetadata",
+            "NSObject",
+        ],
+        uid_fields: &["groupName", "urlParameters"],
     },
     ClassData {
         name: "RichLink",
@@ -1241,7 +1399,7 @@ const CLASS_SPECS: &[ClassData] = &[
             "timeFontConfiguration",
             "timeNumberingSystem",
             "titleContentStyle",
-        ]
+        ],
     },
     ClassData {
         name: "PRPosterColor",
@@ -1261,11 +1419,15 @@ const CLASS_SPECS: &[ClassData] = &[
     ClassData {
         name: "PRPosterContentVibrantMaterialStyle",
         classes: &["PRPosterContentVibrantMaterialStyle", "NSObject"],
-        uid_fields: &[]
+        uid_fields: &[],
     },
     ClassData {
         name: "PRPosterSystemTimeFontConfiguration",
-        classes: &["PRPosterSystemTimeFontConfiguration", "PRPosterTimeFontConfiguration", "NSObject"],
+        classes: &[
+            "PRPosterSystemTimeFontConfiguration",
+            "PRPosterTimeFontConfiguration",
+            "NSObject",
+        ],
         uid_fields: &["timeFontIdentifier", "weight"],
     },
     ClassData {
@@ -1296,24 +1458,35 @@ const CLASS_SPECS: &[ClassData] = &[
     ClassData {
         name: "PFParallaxLayoutConfiguration",
         classes: &["PFParallaxLayoutConfiguration", "NSObject"],
-        uid_fields: &["inactiveTimeRect", "timeRect", "screenSize", "parallaxPadding"],
+        uid_fields: &[
+            "inactiveTimeRect",
+            "timeRect",
+            "screenSize",
+            "parallaxPadding",
+        ],
     },
     ClassData {
         name: "PFPosterConfiguration",
         classes: &["PFPosterConfiguration", "NSObject"],
-        uid_fields: &["media", "layoutConfiguration", "editConfiguration", "identifier", "userInfo"],
+        uid_fields: &[
+            "media",
+            "layoutConfiguration",
+            "editConfiguration",
+            "identifier",
+            "userInfo",
+        ],
     },
     ClassData {
         name: "PRPosterContentGradientStyle",
         classes: &["PRPosterContentGradientStyle", "NSObject"],
         uid_fields: &["colors", "startPoint", "locations", "endPoint"],
-    }
+    },
 ];
 
 struct LegacyClassData {
     name: &'static str,
     classes: &'static [&'static str],
-    version: u32
+    version: u32,
 }
 
 const LEGACY_SPECS: &[LegacyClassData] = &[
@@ -1345,9 +1518,7 @@ impl Default for KeyedArchive {
             version: 100000,
             objects: vec![Value::String("$null".to_string())],
             archiver: "NSKeyedArchiver".to_string(),
-            top: HashMap::from_iter([
-                ("root".to_string(), Uid::new(0))
-            ]),
+            top: HashMap::from_iter([("root".to_string(), Uid::new(0))]),
             class_uids: HashMap::new(),
         }
     }
@@ -1357,7 +1528,12 @@ impl KeyedArchive {
     pub fn expand(archive: &[u8]) -> Result<HashMap<String, Value>, PushError> {
         let parsed: KeyedArchive = plist::from_bytes(archive)?;
 
-        parsed.top.clone().into_iter().map(|(n, k)| Ok((n, parsed.expand_key(k)?))).collect()
+        parsed
+            .top
+            .clone()
+            .into_iter()
+            .map(|(n, k)| Ok((n, parsed.expand_key(k)?)))
+            .collect()
     }
 
     pub fn expand_root(archive: &[u8]) -> Result<Value, PushError> {
@@ -1372,9 +1548,9 @@ impl KeyedArchive {
             #[serde(rename = "NS.objects")]
             objects: Vec<Value>,
         }
-        
+
         let dict: ArchiveDict = plist::from_value(&value)?;
-        
+
         let mut second = dict.objects.into_iter();
         let mut dict_result = Dictionary::new();
         for key in dict.keys.into_iter() {
@@ -1391,30 +1567,34 @@ impl KeyedArchive {
                 for item in items {
                     self.expand_obj(item)?
                 }
-            },
+            }
             Value::Dictionary(dict) => {
                 for (key, item) in dict.iter_mut() {
                     if let ("$class", Value::Uid(uid)) = (key.as_str(), &item) {
-                        let class: KeyedArchiveClass = plist::from_value(&self.objects[uid.get() as usize])?;
+                        let class: KeyedArchiveClass =
+                            plist::from_value(&self.objects[uid.get() as usize])?;
                         my_class = Some(class.classname.clone());
                         *item = Value::String(class.classname);
                         continue;
                     }
                     self.expand_obj(item)?
                 }
-            },
+            }
             Value::Uid(uid) => {
                 *obj = self.expand_key(*uid)?;
-            },
+            }
             _ => { /* nothing to do */ }
         }
 
         match my_class.as_ref().map(|i| i.as_str()) {
             Some("NSMutableDictionary") | Some("NSDictionary") => {
                 let mut dict = self.expand_dict(obj)?;
-                dict.insert("$class".to_string(), Value::String(my_class.clone().unwrap()));
+                dict.insert(
+                    "$class".to_string(),
+                    Value::String(my_class.clone().unwrap()),
+                );
                 *obj = Value::Dictionary(dict);
-            },
+            }
             _ => { /* nothing to do */ }
         }
 
@@ -1443,9 +1623,11 @@ impl KeyedArchive {
 
         for (key, item) in dict {
             if key == "$class" {
-                continue
+                continue;
             }
-            archive.keys.push(self.archive_key(Value::String(key), true)?);
+            archive
+                .keys
+                .push(self.archive_key(Value::String(key), true)?);
             archive.objects.push(self.archive_key(item, true)?);
         }
 
@@ -1456,9 +1638,7 @@ impl KeyedArchive {
 
     fn archive_key(&mut self, mut item: Value, archive: bool) -> Result<Uid, PushError> {
         match &item {
-            Value::String(str) if str == "$null" => {
-                return Ok(Uid::new(0))
-            },
+            Value::String(str) if str == "$null" => return Ok(Uid::new(0)),
             _ => {}
         }
         if archive {
@@ -1473,11 +1653,20 @@ impl KeyedArchive {
         if let Some(uid) = self.class_uids.get(class_name) {
             return Ok(*uid);
         }
-        let spec = CLASS_SPECS.iter().find(|spec| spec.name == class_name).ok_or(PushError::KeyedArchiveError(format!("No spec found for {class_name}!")))?;
+        let spec = CLASS_SPECS
+            .iter()
+            .find(|spec| spec.name == class_name)
+            .ok_or(PushError::KeyedArchiveError(format!(
+                "No spec found for {class_name}!"
+            )))?;
         let class = KeyedArchiveClass {
             classes: spec.classes.iter().map(|i| i.to_string()).collect(),
             classname: spec.name.to_string(),
-            class_hints: if spec.name == "UIColor" { vec!["NSColor".to_string()] } else { vec![] },
+            class_hints: if spec.name == "UIColor" {
+                vec!["NSColor".to_string()]
+            } else {
+                vec![]
+            },
         };
         let key = self.archive_key(plist::to_value(&class)?, false)?;
         self.class_uids.insert(class_name.to_string(), (key, spec));
@@ -1487,27 +1676,32 @@ impl KeyedArchive {
     fn archive_obj(&mut self, item: &mut Value) -> Result<(), PushError> {
         match item {
             Value::Dictionary(dict) => {
-                let Some(Value::String(class)) = dict.get("$class") else { panic!("No class?") };
+                let Some(Value::String(class)) = dict.get("$class") else {
+                    panic!("No class?")
+                };
                 match class.as_str() {
                     "NSMutableDictionary" | "NSDictionary" => {
                         *item = self.archive_dict(dict.clone(), class)?;
-                    },
+                    }
                     _class => {
                         let (uid, class) = self.get_class_key(&_class)?;
                         dict.insert("$class".to_string(), Value::Uid(uid));
                         for item in class.uid_fields {
-                            let Some(item_value) = dict.get_mut(*item) else { continue };
+                            let Some(item_value) = dict.get_mut(*item) else {
+                                continue;
+                            };
                             if let Value::Array(arr) = item_value {
                                 for item in arr {
                                     *item = Value::Uid(self.archive_key(item.clone(), true)?)
                                 }
                             } else {
-                                *item_value = Value::Uid(self.archive_key(item_value.clone(), true)?);
+                                *item_value =
+                                    Value::Uid(self.archive_key(item_value.clone(), true)?);
                             }
                         }
                     }
                 }
-            },
+            }
             Value::Array(arr) => {
                 for item in arr {
                     self.archive_obj(item)?;
@@ -1519,10 +1713,15 @@ impl KeyedArchive {
     }
 
     pub fn archive(items: HashMap<String, Value>) -> Result<Value, PushError> {
-        if let Ok(archive) = plist_to_string(&items) { debug!("archiving {}", archive); }
+        if let Ok(archive) = plist_to_string(&items) {
+            debug!("archiving {}", archive);
+        }
         let mut archive = KeyedArchive::default();
 
-        archive.top = items.into_iter().map(|(k, v)| Ok((k, archive.archive_key(v, true)?))).collect::<Result<HashMap<_, _>, PushError>>()?;
+        archive.top = items
+            .into_iter()
+            .map(|(k, v)| Ok((k, archive.archive_key(v, true)?)))
+            .collect::<Result<HashMap<_, _>, PushError>>()?;
 
         Ok(plist::to_value(&archive)?)
     }
@@ -1530,9 +1729,7 @@ impl KeyedArchive {
     pub fn archive_item(item: Value) -> Result<Value, PushError> {
         Self::archive(HashMap::from_iter([("root".to_string(), item)]))
     }
-
 }
-
 
 #[derive(DekuRead, DekuWrite, Clone, Debug)]
 #[deku(endian = "big")]
@@ -1552,20 +1749,27 @@ fn rfc6637_kdf(fingerprint: &[u8], secret: &[u8]) -> [u8; 32] {
     fingerprint.resize(20, 0);
 
     // RFC6637 KDF
-    sha256(&[
-        &1u32.to_be_bytes()[..],
-        secret,
-        &[0x8, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07], // curve oid
-        &[18], // public key alg
-        &[0x03, 0x01],
-        &[8], // KDF hash id (sha256)
-        &[7], // cipher (aes128)
-        "Anonymous Sender    ".as_bytes(),
-        &fingerprint,
-    ].concat())
+    sha256(
+        &[
+            &1u32.to_be_bytes()[..],
+            secret,
+            &[0x8, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07], // curve oid
+            &[18],                                                  // public key alg
+            &[0x03, 0x01],
+            &[8], // KDF hash id (sha256)
+            &[7], // cipher (aes128)
+            "Anonymous Sender    ".as_bytes(),
+            &fingerprint,
+        ]
+        .concat(),
+    )
 }
 
-pub fn rfc6637_wrap_key<T: HasPublic>(public_key: &CompactECKey<T>, key: &[u8], fingerprint: &[u8]) -> Result<Vec<u8>, PushError> {
+pub fn rfc6637_wrap_key<T: HasPublic>(
+    public_key: &CompactECKey<T>,
+    key: &[u8],
+    fingerprint: &[u8],
+) -> Result<Vec<u8>, PushError> {
     let ephemeral = CompactECKey::new()?;
 
     let private_key = ephemeral.get_pkey();
@@ -1588,7 +1792,12 @@ pub fn rfc6637_wrap_key<T: HasPublic>(public_key: &CompactECKey<T>, key: &[u8], 
         *i = padding_count as u8;
     }
 
-    let mut c = Crypter::new(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), Mode::Encrypt, &aes_key[..16], None)?;
+    let mut c = Crypter::new(
+        Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(),
+        Mode::Encrypt,
+        &aes_key[..16],
+        None,
+    )?;
     let mut out = vec![0u8; message.len() + 16];
 
     let mut count = c.update(&message, &mut out)?;
@@ -1601,14 +1810,24 @@ pub fn rfc6637_wrap_key<T: HasPublic>(public_key: &CompactECKey<T>, key: &[u8], 
         public_ephemeral: ephemeral.compress().to_vec(),
         wrapped_size: out.len() as u8,
         wrapped: out,
-    }.to_bytes()?)
+    }
+    .to_bytes()?)
 }
 
-pub fn rfc6637_unwrap_key(private_key: &CompactECKey<Private>, wrapped_key: &[u8], fingerprint: &[u8]) -> Result<Vec<u8>, PushError> {
+pub fn rfc6637_unwrap_key(
+    private_key: &CompactECKey<Private>,
+    wrapped_key: &[u8],
+    fingerprint: &[u8],
+) -> Result<Vec<u8>, PushError> {
     let (_, unpacked) = RFC6637WrappedKey::from_bytes((wrapped_key, 0))?;
 
-    let compact = CompactECKey::decompress(unpacked.public_ephemeral.try_into().expect("RFC6637 Bad Ephemeral size"));
-    
+    let compact = CompactECKey::decompress(
+        unpacked
+            .public_ephemeral
+            .try_into()
+            .expect("RFC6637 Bad Ephemeral size"),
+    );
+
     let private_key = private_key.get_pkey();
     let public_key = compact.get_pkey();
     let mut deriver = Deriver::new(&private_key)?;
@@ -1618,7 +1837,12 @@ pub fn rfc6637_unwrap_key(private_key: &CompactECKey<Private>, wrapped_key: &[u8
     // RFC6637 KDF
     let hash = rfc6637_kdf(fingerprint, &secret);
 
-    let unwrapped = decrypt(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), &hash[..16], None, &unpacked.wrapped)?;
+    let unwrapped = decrypt(
+        Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(),
+        &hash[..16],
+        None,
+        &unpacked.wrapped,
+    )?;
 
     let padding_len = *unwrapped.last().unwrap() as usize;
     for i in 0..padding_len {
@@ -1648,14 +1872,18 @@ struct ECSignature {
 pub struct CompactECKey<T>(EcKey<T>);
 
 impl<T> Clone for CompactECKey<T>
-    where EcKey<T>: Clone {
+where
+    EcKey<T>: Clone,
+{
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 impl<T> Debug for CompactECKey<T>
-    where EcKey<T>: Debug {
+where
+    EcKey<T>: Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -1668,13 +1896,20 @@ impl<T: HasPublic> TryFrom<EcKey<T>> for CompactECKey<T> {
         let mut y = BigNum::new()?;
         let mut p = BigNum::new()?;
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        group.components_gfp(&mut p, &mut BigNum::new().unwrap(), &mut BigNum::new().unwrap(), &mut ctx)?;
+        group.components_gfp(
+            &mut p,
+            &mut BigNum::new().unwrap(),
+            &mut BigNum::new().unwrap(),
+            &mut ctx,
+        )?;
         let mut scratch = BigNum::new()?;
 
-        value.public_key().affine_coordinates(&group, &mut scratch, &mut y, &mut ctx)?;
+        value
+            .public_key()
+            .affine_coordinates(&group, &mut scratch, &mut y, &mut ctx)?;
         y.mul_word(2)?;
         if y > p {
-            return Err(PushError::BadCompactECKey)
+            return Err(PushError::BadCompactECKey);
         }
         Ok(Self(value))
     }
@@ -1686,14 +1921,20 @@ impl CompactECKey<Private> {
         let mut y = BigNum::new()?;
         let mut p = BigNum::new()?;
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        group.components_gfp(&mut p, &mut BigNum::new().unwrap(), &mut BigNum::new().unwrap(), &mut ctx)?;
+        group.components_gfp(
+            &mut p,
+            &mut BigNum::new().unwrap(),
+            &mut BigNum::new().unwrap(),
+            &mut ctx,
+        )?;
         let mut scratch = BigNum::new()?;
         loop {
             let key = EcKey::generate(&group).expect("Couldn't generate key?");
-            key.public_key().affine_coordinates(&group, &mut scratch, &mut y, &mut ctx)?;
+            key.public_key()
+                .affine_coordinates(&group, &mut scratch, &mut y, &mut ctx)?;
             y.mul_word(2)?;
             if y <= p {
-                break Ok(Self(key))
+                break Ok(Self(key));
             }
         }
     }
@@ -1707,9 +1948,9 @@ impl CompactECKey<Private> {
 
         let r = parsed.r.to_bytes_be().1;
         let s = parsed.s.to_bytes_be().1;
-        
-        compacted[32-r.len()..32].clone_from_slice(&r);
-        compacted[32 + 32-s.len()..].clone_from_slice(&s);
+
+        compacted[32 - r.len()..32].clone_from_slice(&r);
+        compacted[32 + 32 - s.len()..].clone_from_slice(&s);
 
         Ok(compacted)
     }
@@ -1719,21 +1960,32 @@ impl<T: HasPublic> CompactECKey<T> {
     pub fn compress(&self) -> [u8; 32] {
         let mut ctx = BigNumContext::new().unwrap();
         let mut x = BigNum::new().unwrap();
-        self.public_key().affine_coordinates(&self.group(), &mut x, &mut BigNum::new().unwrap(), &mut ctx).unwrap();
+        self.public_key()
+            .affine_coordinates(&self.group(), &mut x, &mut BigNum::new().unwrap(), &mut ctx)
+            .unwrap();
 
-        x.to_vec_padded(32).unwrap().try_into().expect("Bad compressed key size!")
+        x.to_vec_padded(32)
+            .unwrap()
+            .try_into()
+            .expect("Bad compressed key size!")
     }
 
-    pub fn verify(&self, digest: MessageDigest, data: &[u8], signature: [u8; 64]) -> Result<(), PushError> {
+    pub fn verify(
+        &self,
+        digest: MessageDigest,
+        data: &[u8],
+        signature: [u8; 64],
+    ) -> Result<(), PushError> {
         let encoded = rasn::der::encode(&ECSignature {
             r: BigInt::from_bytes_be(Sign::Plus, &signature[..32]),
             s: BigInt::from_bytes_be(Sign::Plus, &signature[32..]),
-        }).expect("Failed to encode!");
+        })
+        .expect("Failed to encode!");
         let pkey = self.get_pkey();
         let mut verifier = Verifier::new(digest, &pkey)?;
 
         if !verifier.verify_oneshot(&encoded, &data)? {
-            return Err(PushError::VerificationFailed)
+            return Err(PushError::VerificationFailed);
         }
         Ok(())
     }
@@ -1748,7 +2000,14 @@ impl CompactECKey<Private> {
     pub fn decompress_private(key: [u8; 64]) -> Self {
         let compact_key = CompactECKey::decompress(key[..32].try_into().unwrap());
         let private_number = BigNum::from_slice(&key[32..]).unwrap();
-        Self(EcKey::from_private_components(compact_key.group(), &private_number, compact_key.public_key()).unwrap())
+        Self(
+            EcKey::from_private_components(
+                compact_key.group(),
+                &private_number,
+                compact_key.public_key(),
+            )
+            .unwrap(),
+        )
     }
 
     pub fn compress_private(&self) -> [u8; 64] {
@@ -1758,12 +2017,17 @@ impl CompactECKey<Private> {
 
         let private = self.0.private_key().to_vec_padded(32).unwrap();
         output[32..].copy_from_slice(&private);
-        
+
         output
     }
 
     pub fn compress_private_small(&self) -> [u8; 32] {
-        self.0.private_key().to_vec_padded(32).unwrap().try_into().unwrap()
+        self.0
+            .private_key()
+            .to_vec_padded(32)
+            .unwrap()
+            .try_into()
+            .unwrap()
     }
 
     pub fn decompress_private_small(key: [u8; 32]) -> Self {
@@ -1773,10 +2037,12 @@ impl CompactECKey<Private> {
 
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
         let mut pub_point = EcPoint::new(&group).unwrap();
-        pub_point.mul_generator(&group, &private_number, &mut ctx).expect("mul generator failed");
+        pub_point
+            .mul_generator(&group, &private_number, &mut ctx)
+            .expect("mul generator failed");
 
         Self(EcKey::from_private_components(&group, &private_number, &pub_point).unwrap())
-    } 
+    }
 }
 
 impl CompactECKey<Public> {
@@ -1787,21 +2053,28 @@ impl CompactECKey<Public> {
         unpacked_key[1..].copy_from_slice(&key);
 
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut ctx).expect("Ec point decompress failed!");
+        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut ctx)
+            .expect("Ec point decompress failed!");
 
         let mut ctx = BigNumContext::new().expect("a failed");
         let mut x = BigNum::new().expect("New bn failed!");
         let mut y = BigNum::new().expect("b failed");
         let mut p = BigNum::new().expect("c failed");
         let mut scratch = BigNum::new().expect("New bn failed!");
-        group.components_gfp(&mut p, &mut scratch, &mut BigNum::new().unwrap(), &mut ctx).expect("d failed");
-        point.affine_coordinates(&group, &mut x, &mut y, &mut ctx).expect("e failed");
+        group
+            .components_gfp(&mut p, &mut scratch, &mut BigNum::new().unwrap(), &mut ctx)
+            .expect("d failed");
+        point
+            .affine_coordinates(&group, &mut x, &mut y, &mut ctx)
+            .expect("e failed");
 
         let result = scratch.checked_sub(&p, &y);
         y.mul_word(2).expect("What");
         if y >= p {
             result.expect("Sub failed!");
-            point.set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx).expect("Set affine coordinates failed!");
+            point
+                .set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx)
+                .expect("Set affine coordinates failed!");
         }
 
         Self(EcKey::from_public_key(&group, &point).unwrap())
@@ -1834,7 +2107,7 @@ fn compact_test() -> Result<(), PushError> {
     let sig = create.sign_raw(MessageDigest::sha256(), &data)?;
     println!("what");
     public.verify(MessageDigest::sha256(), &data, sig)?;
-    
+
     Ok(())
 }
 
@@ -1856,7 +2129,7 @@ pub fn kdf_ctr_hmac(key: &[u8], label: &[u8], context: &[u8], out_len: usize) ->
     while out.len() < out_len {
         let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key");
         mac.update(&i.to_be_bytes()); // [i]_32
-        mac.update(&suffix);          // Label || 0x00 || Context || [L]_32
+        mac.update(&suffix); // Label || 0x00 || Context || [L]_32
         let block = mac.finalize().into_bytes();
         let need = out_len - out.len();
         out.extend_from_slice(&block[..need.min(block.len())]);
@@ -1869,7 +2142,9 @@ pub fn kdf_ctr_hmac(key: &[u8], label: &[u8], context: &[u8], out_len: usize) ->
 pub struct NSDictionaryTypedCoder(pub HashMap<String, StCollapsedValue>);
 impl NSDictionaryTypedCoder {
     fn decode(val: &StCollapsedValue) -> Self {
-        let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
+        let StCollapsedValue::Object { class, fields } = val else {
+            panic!("Not an object!")
+        };
         if class != "NSDictionary" && class != "NSMutableDictionary" {
             panic!("Bad string type!");
         }
@@ -1880,10 +2155,12 @@ impl NSDictionaryTypedCoder {
     }
 
     fn encode(&self) -> StCollapsedValue {
-        let mut fields = vec![
-            vec![StCollapsedValue::Int(self.0.len() as u32, true)],
-        ];
-        fields.extend(self.0.iter().flat_map(|(k, v)| [vec![NSString(k.clone()).encode()], vec![v.clone()]]));
+        let mut fields = vec![vec![StCollapsedValue::Int(self.0.len() as u32, true)]];
+        fields.extend(
+            self.0
+                .iter()
+                .flat_map(|(k, v)| [vec![NSString(k.clone()).encode()], vec![v.clone()]]),
+        );
         StCollapsedValue::Object {
             class: "NSDictionary".to_string(),
             fields,
@@ -1894,20 +2171,22 @@ impl NSDictionaryTypedCoder {
 pub struct NSString(pub String);
 impl NSString {
     pub fn decode(val: &StCollapsedValue) -> Self {
-        let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
+        let StCollapsedValue::Object { class, fields } = val else {
+            panic!("Not an object!")
+        };
         if class != "NSString" && class != "NSMutableString" {
             panic!("Bad string type!");
         }
-        let StCollapsedValue::String(text) = &fields[0][0] else { panic!("no text?") };
+        let StCollapsedValue::String(text) = &fields[0][0] else {
+            panic!("no text?")
+        };
         Self(text.clone())
     }
 
     pub fn encode(&self) -> StCollapsedValue {
         StCollapsedValue::Object {
             class: "NSString".to_string(),
-            fields: vec![vec![
-                StCollapsedValue::String(self.0.clone())
-            ]],
+            fields: vec![vec![StCollapsedValue::String(self.0.clone())]],
         }
     }
 }
@@ -1915,9 +2194,13 @@ impl NSString {
 pub struct NSNumber(pub u32);
 impl NSNumber {
     pub fn decode(val: &StCollapsedValue) -> Self {
-        let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
+        let StCollapsedValue::Object { class, fields } = val else {
+            panic!("Not an object!")
+        };
         assert_eq!(class, "NSNumber");
-        let StCollapsedValue::Int(text, _) = &fields[1][0] else { panic!("no text?") };
+        let StCollapsedValue::Int(text, _) = &fields[1][0] else {
+            panic!("no text?")
+        };
         Self(*text)
     }
 
@@ -1941,28 +2224,31 @@ pub struct NSAttributedString {
 impl NSAttributedString {
     pub fn new(text: String, dict: NSDictionaryTypedCoder) -> Self {
         let ranges = vec![(text.chars().count() as u32, dict)];
-        Self {
-            text,
-            ranges,
-        }
+        Self { text, ranges }
     }
 
     pub fn decode(val: &StCollapsedValue) -> Self {
         let mut range_cache: HashMap<u32, NSDictionaryTypedCoder> = HashMap::new();
-        
-        let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
+
+        let StCollapsedValue::Object { class, fields } = val else {
+            panic!("Not an object!")
+        };
         if class != "NSAttributedString" && class != "NSMutableAttributedString" {
             panic!("Bad attributed string variant!")
         }
-        
+
         let mut obj = fields.iter();
         let text = NSString::decode(&obj.next().unwrap()[0]);
-        
+
         let mut ranges = vec![];
         loop {
             let Some(next) = obj.next() else { break };
-            let StCollapsedValue::Int(id, _) = &next[0] else { panic!("first not") };
-            let StCollapsedValue::Int(len, _) = &next[1] else { panic!("len not int") };
+            let StCollapsedValue::Int(id, _) = &next[0] else {
+                panic!("first not")
+            };
+            let StCollapsedValue::Int(len, _) = &next[1] else {
+                panic!("len not int")
+            };
 
             if let Some(cached) = range_cache.get(id) {
                 ranges.push((*len, cached.clone()));
@@ -1983,13 +2269,20 @@ impl NSAttributedString {
     pub fn encode(&self) -> StCollapsedValue {
         let mut fields = vec![vec![NSString(self.text.clone()).encode()]];
 
-        fields.extend(self.ranges.iter().enumerate().flat_map(|(idx, range)| 
-            [vec![StCollapsedValue::Int(idx as u32 + 1, true), StCollapsedValue::Int(range.0, false)], vec![range.1.encode()]]));
+        fields.extend(self.ranges.iter().enumerate().flat_map(|(idx, range)| {
+            [
+                vec![
+                    StCollapsedValue::Int(idx as u32 + 1, true),
+                    StCollapsedValue::Int(range.0, false),
+                ],
+                vec![range.1.encode()],
+            ]
+        }));
 
         StCollapsedValue::Object {
-            class: "NSAttributedString".to_string(), 
-            fields
-        } 
+            class: "NSAttributedString".to_string(),
+            fields,
+        }
     }
 }
 
@@ -2043,7 +2336,7 @@ enum StreamTypedObject {
     Placeholder,
     CString {
         value: String,
-    }
+    },
 }
 const TAG_START: u8 = 0x84;
 const TAG_EMPTY: u8 = 0x85;
@@ -2053,7 +2346,9 @@ const FIELDS_END: u8 = 0x86;
 
 impl<T: Read> StreamTypedCoder<T> {
     fn read_tag(&mut self, tag: Option<u8>) -> u8 {
-        if let Some(tag) = tag { return tag }
+        if let Some(tag) = tag {
+            return tag;
+        }
         let mut data = [0u8];
         self.buffer.read_exact(&mut data).unwrap();
         data[0]
@@ -2066,12 +2361,12 @@ impl<T: Read> StreamTypedCoder<T> {
                 let mut data = [0u8; 2];
                 self.buffer.read_exact(&mut data).unwrap();
                 u16::from_le_bytes(data) as u32
-            },
+            }
             0x82 => {
                 let mut data = [0u8; 4];
                 self.buffer.read_exact(&mut data).unwrap();
                 u32::from_le_bytes(data)
-            },
+            }
             val if TAG_RANGE.contains(&val) => panic!("Invalid Number!"),
             _num => _num as u32,
         }
@@ -2084,7 +2379,7 @@ impl<T: Read> StreamTypedCoder<T> {
                 let mut data = [0u8; 4];
                 self.buffer.read_exact(&mut data).unwrap();
                 f32::from_le_bytes(data)
-            },
+            }
             _ => self.read_number(Some(tag)) as f32,
         }
     }
@@ -2096,7 +2391,7 @@ impl<T: Read> StreamTypedCoder<T> {
                 let mut data = [0u8; 8];
                 self.buffer.read_exact(&mut data).unwrap();
                 f64::from_le_bytes(data)
-            },
+            }
             _ => self.read_number(Some(tag)) as f64,
         }
     }
@@ -2118,11 +2413,16 @@ impl<T: Read> StreamTypedCoder<T> {
                 let str = self.read_string_raw();
                 self.string_cache.push(str.clone());
                 Some(str)
-            },
+            }
             TAG_EMPTY => None,
             _tag => {
                 let ref_idx = self.read_number(Some(_tag)) as usize - REF_START;
-                Some(self.string_cache.get(ref_idx).expect(&format!("missing tag for {}", ref_idx)).clone())
+                Some(
+                    self.string_cache
+                        .get(ref_idx)
+                        .expect(&format!("missing tag for {}", ref_idx))
+                        .clone(),
+                )
             }
         }
     }
@@ -2135,16 +2435,13 @@ impl<T: Read> StreamTypedCoder<T> {
                 let name = self.read_string(None).expect("Class has no name!");
                 let tag = self.read_number(None);
                 let parent = self.decode_class_list();
-                self.object_cache.insert(current_len, StreamTypedObject::Class {
-                    parent,
-                    tag,
-                    name
-                });
+                self.object_cache
+                    .insert(current_len, StreamTypedObject::Class { parent, tag, name });
 
                 Some(current_len)
-            },
+            }
             TAG_EMPTY => None,
-            _tag => Some(self.read_number(Some(_tag)) as usize - REF_START)
+            _tag => Some(self.read_number(Some(_tag)) as usize - REF_START),
         }
     }
 
@@ -2153,11 +2450,12 @@ impl<T: Read> StreamTypedCoder<T> {
             TAG_START => {
                 let string = self.read_string(None).expect("No String?");
                 let size = self.object_cache.len();
-                self.object_cache.push(StreamTypedObject::CString { value: string });
+                self.object_cache
+                    .push(StreamTypedObject::CString { value: string });
                 Some(size)
-            },
+            }
             TAG_EMPTY => None,
-            _tag => Some(self.read_number(Some(_tag)) as usize - REF_START)
+            _tag => Some(self.read_number(Some(_tag)) as usize - REF_START),
         }
     }
 
@@ -2173,39 +2471,47 @@ impl<T: Read> StreamTypedCoder<T> {
                 loop {
                     let next = self.read_tag(None);
                     if next == FIELDS_END {
-                        break
+                        break;
                     }
                     members.push(self.decode_type(Some(next)));
                 }
 
-                self.object_cache[index] = StreamTypedObject::Object { class, fields: members };
+                self.object_cache[index] = StreamTypedObject::Object {
+                    class,
+                    fields: members,
+                };
                 Some(index)
-            },
-            TAG_EMPTY => None,
-            _tag => {
-                Some(self.read_number(Some(_tag)) as usize - REF_START)
             }
+            TAG_EMPTY => None,
+            _tag => Some(self.read_number(Some(_tag)) as usize - REF_START),
         }
     }
 
     fn decode_type(&mut self, tag: Option<u8>) -> Vec<StreamTypedValue> {
         let r#type = self.read_string(tag).expect("Type string cannot be nil");
         if r#type.starts_with("[") && r#type.ends_with("c]") {
-            let size: usize = r#type[1..r#type.len()-2].parse().expect("bad array length!");
-            return vec![StreamTypedValue::Array(self.read_vec(size))]
+            let size: usize = r#type[1..r#type.len() - 2]
+                .parse()
+                .expect("bad array length!");
+            return vec![StreamTypedValue::Array(self.read_vec(size))];
         }
-        r#type.chars().map(|t| match t {
-            '@' => StreamTypedValue::Object(self.decode_object()),
-            '+' => StreamTypedValue::String(self.read_string_raw()),
-            '*' => StreamTypedValue::Object(self.decode_c_string()),
-            'B' => StreamTypedValue::Bool(self.read_tag(None) == 1),
-            'C' | 'c' => StreamTypedValue::Byte(self.read_tag(None)),
-            's' | 'i' | 'l' | 'q' | 
-                'S' | 'I' | 'L' | 'Q' => StreamTypedValue::Int(self.read_number(None), matches!(t, 's' | 'i' | 'l' | 'q')),
-            'f' => StreamTypedValue::Float(self.read_float(None)),
-            'd' => StreamTypedValue::Double(self.read_double(None)),
-            _ => panic!("Unknown tag {}", r#type)
-        }).collect()
+        r#type
+            .chars()
+            .map(|t| match t {
+                '@' => StreamTypedValue::Object(self.decode_object()),
+                '+' => StreamTypedValue::String(self.read_string_raw()),
+                '*' => StreamTypedValue::Object(self.decode_c_string()),
+                'B' => StreamTypedValue::Bool(self.read_tag(None) == 1),
+                'C' | 'c' => StreamTypedValue::Byte(self.read_tag(None)),
+                's' | 'i' | 'l' | 'q' | 'S' | 'I' | 'L' | 'Q' => StreamTypedValue::Int(
+                    self.read_number(None),
+                    matches!(t, 's' | 'i' | 'l' | 'q'),
+                ),
+                'f' => StreamTypedValue::Float(self.read_float(None)),
+                'd' => StreamTypedValue::Double(self.read_double(None)),
+                _ => panic!("Unknown tag {}", r#type),
+            })
+            .collect()
     }
 
     pub fn decode(&mut self) -> Vec<StreamTypedValue> {
@@ -2237,16 +2543,25 @@ impl<T: Read> StreamTypedCoder<T> {
                 if let Some(obj) = obj {
                     let item = &self.object_cache[obj];
                     match item {
-                        StreamTypedObject::CString { value } => StCollapsedValue::CString(value.clone()),
+                        StreamTypedObject::CString { value } => {
+                            StCollapsedValue::CString(value.clone())
+                        }
                         StreamTypedObject::Class { parent, tag, name } => panic!("Class Item??"),
                         StreamTypedObject::Object { class, fields } => {
-                            let StreamTypedObject::Class { parent, tag, name } = &self.object_cache[*class] else { panic!("not a class!") };
+                            let StreamTypedObject::Class { parent, tag, name } =
+                                &self.object_cache[*class]
+                            else {
+                                panic!("not a class!")
+                            };
                             StCollapsedValue::Object {
                                 class: name.clone(),
-                                fields: fields.iter().map(|f| f.iter().map(|f| self.type_to_value(f)).collect()).collect()
+                                fields: fields
+                                    .iter()
+                                    .map(|f| f.iter().map(|f| self.type_to_value(f)).collect())
+                                    .collect(),
                             }
-                        },
-                        StreamTypedObject::Placeholder => panic!("what?? placeholder")
+                        }
+                        StreamTypedObject::Placeholder => panic!("what?? placeholder"),
                     }
                 } else {
                     StCollapsedValue::None
@@ -2270,7 +2585,10 @@ impl<T> StreamTypedCoder<T> {
 pub fn coder_encode_flattened(value: &[StCollapsedValue]) -> Vec<u8> {
     let mut encoded = vec![];
     let mut encoder = StreamTypedCoder::new(Cursor::new(&mut encoded));
-    let v = value.iter().map(|v| encoder.value_to_type(&v)).collect::<Vec<_>>();
+    let v = value
+        .iter()
+        .map(|v| encoder.value_to_type(&v))
+        .collect::<Vec<_>>();
     encoder.encode(v);
     encoded
 }
@@ -2278,7 +2596,10 @@ pub fn coder_encode_flattened(value: &[StCollapsedValue]) -> Vec<u8> {
 pub fn coder_decode_flattened(data: &[u8]) -> Vec<StCollapsedValue> {
     let mut decoder = StreamTypedCoder::new(Cursor::new(data));
     let result = decoder.decode();
-    result.into_iter().map(|r| decoder.type_to_value(&r)).collect()
+    result
+        .into_iter()
+        .map(|r| decoder.type_to_value(&r))
+        .collect()
 }
 
 impl<T: Write> StreamTypedCoder<T> {
@@ -2337,15 +2658,21 @@ impl<T: Write> StreamTypedCoder<T> {
     }
 
     fn write_class_list(&mut self, class: usize) -> usize {
-        let StreamTypedObject::Class { parent, tag, name } = &self.encode_objects[class] else { panic!("class not a class!") };
+        let StreamTypedObject::Class { parent, tag, name } = &self.encode_objects[class] else {
+            panic!("class not a class!")
+        };
         let class_name = name.clone();
-        let Some(meta) = LEGACY_SPECS.iter().find(|spec| spec.name == &class_name) else { panic!("Unknown name {class}") };
+        let Some(meta) = LEGACY_SPECS.iter().find(|spec| spec.name == &class_name) else {
+            panic!("Unknown name {class}")
+        };
         let mut terminated = false;
         for item in meta.classes {
-            if let Some(existing) = self.object_cache.iter().position(|obj| matches!(obj, StreamTypedObject::Class { parent, tag, name } if name == item)) {
+            if let Some(existing) = self.object_cache.iter().position(
+                |obj| matches!(obj, StreamTypedObject::Class { parent, tag, name } if name == item),
+            ) {
                 self.write_ref(existing);
                 terminated = true;
-                break
+                break;
             } else {
                 self.write_tag(TAG_START);
                 self.write_string(*item);
@@ -2364,12 +2691,18 @@ impl<T: Write> StreamTypedCoder<T> {
     }
 
     fn write_c_string(&mut self, text: &str) {
-        if let Some(existing) = self.object_cache.iter().position(|p| matches!(p, StreamTypedObject::CString { value } if value == text)) {
+        if let Some(existing) = self
+            .object_cache
+            .iter()
+            .position(|p| matches!(p, StreamTypedObject::CString { value } if value == text))
+        {
             self.write_ref(existing);
         } else {
             self.write_tag(TAG_START);
             self.write_string(text);
-            self.object_cache.push(StreamTypedObject::CString { value: text.to_string() });
+            self.object_cache.push(StreamTypedObject::CString {
+                value: text.to_string(),
+            });
         }
     }
 
@@ -2377,7 +2710,10 @@ impl<T: Write> StreamTypedCoder<T> {
         self.write_tag(TAG_START);
         let obj_idx = self.object_cache.len();
         self.object_cache.push(StreamTypedObject::Placeholder);
-        self.object_cache[obj_idx] = StreamTypedObject::Object { class: self.write_class_list(class), fields: members.clone() };
+        self.object_cache[obj_idx] = StreamTypedObject::Object {
+            class: self.write_class_list(class),
+            fields: members.clone(),
+        };
         for member in members {
             self.encode_type(member);
         }
@@ -2388,12 +2724,10 @@ impl<T: Write> StreamTypedCoder<T> {
         let mut tag = String::new();
         for f in &r#type {
             let t = match f {
-                StreamTypedValue::Object(Some(idx)) => {
-                    match &self.encode_objects[*idx] {
-                        StreamTypedObject::CString { value } => "*".to_string(),
-                        StreamTypedObject::Object { class, fields } => "@".to_string(),
-                        _ => panic!("No type for encode object!")
-                    }
+                StreamTypedValue::Object(Some(idx)) => match &self.encode_objects[*idx] {
+                    StreamTypedObject::CString { value } => "*".to_string(),
+                    StreamTypedObject::Object { class, fields } => "@".to_string(),
+                    _ => panic!("No type for encode object!"),
                 },
                 StreamTypedValue::Object(None) => "@".to_string(),
                 StreamTypedValue::Array(count) => format!("[{}c]", count.len()),
@@ -2410,16 +2744,16 @@ impl<T: Write> StreamTypedCoder<T> {
         self.write_string(&tag);
         for f in r#type {
             match f {
-                StreamTypedValue::Object(Some(idx)) => {
-                    match self.encode_objects[idx].clone() {
-                        StreamTypedObject::CString { value } => self.write_c_string(&value),
-                        StreamTypedObject::Object { class, fields } => self.encode_object(class, fields),
-                        _ => panic!("No type for encode object!")
+                StreamTypedValue::Object(Some(idx)) => match self.encode_objects[idx].clone() {
+                    StreamTypedObject::CString { value } => self.write_c_string(&value),
+                    StreamTypedObject::Object { class, fields } => {
+                        self.encode_object(class, fields)
                     }
+                    _ => panic!("No type for encode object!"),
                 },
                 StreamTypedValue::Object(None) => {
                     self.write_tag(TAG_EMPTY);
-                },
+                }
                 StreamTypedValue::Array(count) => self.buffer.write_all(&count).unwrap(),
                 StreamTypedValue::String(string) => self.write_string_raw(&string),
                 StreamTypedValue::Bool(item) => self.write_tag(if item { 1 } else { 0 }),
@@ -2436,7 +2770,7 @@ impl<T: Write> StreamTypedCoder<T> {
         self.encode_objects.push(val);
         idx
     }
-    
+
     pub fn encode(&mut self, value: Vec<StreamTypedValue>) {
         self.write_tag(0x04);
         self.write_string_raw("streamtyped");
@@ -2456,14 +2790,21 @@ impl<T: Write> StreamTypedCoder<T> {
             StCollapsedValue::CString(s) => {
                 let idx = self.add_serialize_value(StreamTypedObject::CString { value: s.clone() });
                 StreamTypedValue::Object(Some(idx))
-            },
+            }
             StCollapsedValue::None => StreamTypedValue::Object(None),
             StCollapsedValue::Object { class, fields } => {
                 // todo how do we get tag?
-                let class = self.add_serialize_value(StreamTypedObject::Class { parent: None, tag: 0, name: class.clone() });
+                let class = self.add_serialize_value(StreamTypedObject::Class {
+                    parent: None,
+                    tag: 0,
+                    name: class.clone(),
+                });
                 let object = StreamTypedObject::Object {
-                    class, 
-                    fields: fields.iter().map(|f| f.iter().map(|f| self.value_to_type(f)).collect()).collect()
+                    class,
+                    fields: fields
+                        .iter()
+                        .map(|f| f.iter().map(|f| self.value_to_type(f)).collect())
+                        .collect(),
                 };
                 let idx = self.add_serialize_value(object);
                 StreamTypedValue::Object(Some(idx))
@@ -2471,7 +2812,6 @@ impl<T: Write> StreamTypedCoder<T> {
         }
     }
 }
-
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2513,13 +2853,19 @@ pub struct NSDictionary<T> {
 
 impl<T: Serialize> Serialize for NSDictionary<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer {
+    where
+        S: Serializer,
+    {
         let mut serialized = plist::to_value(&self.item).map_err(serde::ser::Error::custom)?;
-        let Some(dict) = serialized.as_dictionary_mut() else { panic!("not a dictionary!") };
+        let Some(dict) = serialized.as_dictionary_mut() else {
+            panic!("not a dictionary!")
+        };
 
-        dict.insert("$class".to_string(), plist::to_value(&self.class).map_err(serde::ser::Error::custom)?);
-        
+        dict.insert(
+            "$class".to_string(),
+            plist::to_value(&self.class).map_err(serde::ser::Error::custom)?,
+        );
+
         serialized.serialize(serializer)
     }
 }
@@ -2560,7 +2906,9 @@ pub struct NSUUID {
 
 impl From<Uuid> for NSUUID {
     fn from(value: Uuid) -> Self {
-        NSUUID { data: value.into_bytes().to_vec().into() }
+        NSUUID {
+            data: value.into_bytes().to_vec().into(),
+        }
     }
 }
 
@@ -2576,7 +2924,6 @@ impl Deref for NSUUID {
         &self.data.as_ref()
     }
 }
-
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2596,8 +2943,6 @@ impl Into<String> for NSURL {
         format!("{}{}", self.base, self.relative)
     }
 }
-
-
 
 use std::io;
 

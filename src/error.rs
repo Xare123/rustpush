@@ -1,17 +1,37 @@
-use std::{any::Any, io, sync::Arc, time::SystemTimeError};
+use std::{
+    any::Any,
+    io,
+    sync::Arc,
+    time::{Duration, SystemTimeError},
+};
 
 use deku::DekuError;
 use keystore::KeystoreError;
 use omnisette::AnisetteError;
 #[cfg(feature = "macos-validation-data")]
 use open_absinthe::AbsintheError;
-use openssl::{error::ErrorStack, aes::KeyError};
+use openssl::{aes::KeyError, error::ErrorStack};
 use plist::Value;
 use thiserror::Error;
-use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Elapsed};
+use tokio::{
+    sync::{
+        broadcast::{self, error::SendError},
+        Mutex,
+    },
+    time::error::Elapsed,
+};
 
-use crate::{aps::APSMessage, ids::user::{IDSError, SupportAlert}, util::ResourceFailure};
+use crate::{
+    aps::APSMessage,
+    ids::user::{IDSError, SupportAlert},
+    util::ResourceFailure,
+};
 
+#[derive(Error, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CloudKitProtocolError {
+    #[error("CloudKit continuation token did not advance")]
+    ContinuationTokenNoProgress,
+}
 
 #[derive(Error, Debug)]
 pub enum PushError {
@@ -134,6 +154,13 @@ pub enum PushError {
     DelegateLoginFailed(String, i64, String),
     #[error("Cloudkit error {0:?}")]
     CloudKitError(cloudkit_proto::response_operation::Result),
+    #[error("CloudKit HTTP error {status}")]
+    CloudKitHttpError {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+    #[error("CloudKit protocol error: {0}")]
+    CloudKitProtocolError(#[from] CloudKitProtocolError),
     #[error("NickName Crypto Error: {0}")]
     NickNameCryptoError(String),
     #[error("APS Channel subscribe Error: {0}")]

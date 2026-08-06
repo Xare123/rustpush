@@ -4,9 +4,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-
-pub mod software;
 pub mod backup;
+pub mod software;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub enum EcCurve {
@@ -28,12 +27,12 @@ pub enum KeystorePadding {
         md: KeystoreDigest,
         mgf1: KeystoreDigest,
     },
-    None
+    None,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum EncryptMode {
-    Rsa (KeystorePadding),
+    Rsa(KeystorePadding),
     Gcm,
 }
 
@@ -100,7 +99,12 @@ pub trait Keystore: Send + Sync + 'static {
         None
     }
 
-    fn create_key(&self, alias: &str, r#type: KeyType, access_rules: KeystoreAccessRules) -> Result<(), KeystoreError>;
+    fn create_key(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError>;
     fn destroy_key(&self, alias: &str) -> Result<(), KeystoreError>;
     fn list_keys(&self) -> Result<Vec<String>, KeystoreError>;
 
@@ -121,22 +125,56 @@ pub trait Keystore: Send + Sync + 'static {
 
     // priv key can be EC private key in DER, raw AES key bytes
     // or a DER RSA private key.
-    fn import_key(&self, alias: &str, r#type: KeyType, priv_key: &[u8], access_rules: KeystoreAccessRules) -> Result<(), KeystoreError>;
+    fn import_key(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        priv_key: &[u8],
+        access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError>;
     fn get_key_type(&self, alias: &str) -> Result<Option<KeyType>, KeystoreError>;
-    
-    fn sign(&self, alias: &str, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8]) -> Result<Vec<u8>, KeystoreError>;
-    fn verify(&self, alias: &str, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8], sig: &[u8]) -> Result<bool, KeystoreError>;
+
+    fn sign(
+        &self,
+        alias: &str,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+    ) -> Result<Vec<u8>, KeystoreError>;
+    fn verify(
+        &self,
+        alias: &str,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+        sig: &[u8],
+    ) -> Result<bool, KeystoreError>;
     // returns in DER
     fn get_public_key(&self, alias: &str) -> Result<Vec<u8>, KeystoreError>;
     // peer is a EC public key starting with 02, 03, or 04
     fn derive(&self, alias: &str, peer: &[u8]) -> Result<Vec<u8>, KeystoreError>;
 
-    fn encrypt(&self, alias: &str, plaintext: &[u8], mode: &mut EncryptMode) -> Result<Vec<u8>, KeystoreError>;
-    fn decrypt(&self, alias: &str, ciphertext: &[u8], mode: &EncryptMode) -> Result<Vec<u8>, KeystoreError>;
+    fn encrypt(
+        &self,
+        alias: &str,
+        plaintext: &[u8],
+        mode: &mut EncryptMode,
+    ) -> Result<Vec<u8>, KeystoreError>;
+    fn decrypt(
+        &self,
+        alias: &str,
+        ciphertext: &[u8],
+        mode: &EncryptMode,
+    ) -> Result<Vec<u8>, KeystoreError>;
 
-    fn ensure_exists(&self, alias: &str, r#type: KeyType, access_rules: KeystoreAccessRules) -> Result<(), KeystoreError> {
+    fn ensure_exists(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError> {
         if self.get_key_type(alias)?.is_some() {
-            return Ok(())
+            return Ok(());
         }
 
         self.create_key(alias, r#type, access_rules)?;
@@ -144,15 +182,25 @@ pub trait Keystore: Send + Sync + 'static {
         Ok(())
     }
 
-    fn overwrite_new(&self, alias: &str, r#type: KeyType, access_rules: KeystoreAccessRules) -> Result<(), KeystoreError> {
+    fn overwrite_new(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError> {
         self.destroy_key(alias)?;
         self.create_key(alias, r#type, access_rules)?;
         Ok(())
     }
 
-    fn create_new(&self, prefix: &str, r#type: KeyType, access_rules: KeystoreAccessRules) -> Result<String, KeystoreError> {
+    fn create_new(
+        &self,
+        prefix: &str,
+        r#type: KeyType,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<String, KeystoreError> {
         let alias = format!("{prefix}:{}", rand::thread_rng().next_u64());
-        
+
         self.create_key(&alias, r#type, access_rules)?;
 
         Ok(alias)
@@ -176,11 +224,22 @@ pub trait KeystoreDeriveKey: KeystoreKey {
 }
 
 pub trait KeystoreSignKey: KeystorePublicKey {
-    fn sign(&self, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+    fn sign(
+        &self,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+    ) -> Result<Vec<u8>, KeystoreError> {
         keystore().sign(self.alias(), digest, padding, data)
     }
-    
-    fn verify(&self, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8], sig: &[u8]) -> Result<bool, KeystoreError> {
+
+    fn verify(
+        &self,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+        sig: &[u8],
+    ) -> Result<bool, KeystoreError> {
         keystore().verify(self.alias(), digest, padding, data, sig)
     }
 }
@@ -198,22 +257,39 @@ pub trait KeystoreEncryptKey: KeystoreKey {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RsaKey(pub String);
 impl RsaKey {
-    pub fn overwrite(key: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn overwrite(
+        key: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().overwrite_new(key, KeyType::Rsa(bits), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn ensure(key: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn ensure(
+        key: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().ensure_exists(key, KeyType::Rsa(bits), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn create_new(prefix: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn create_new(
+        prefix: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         let key = keystore().create_new(prefix, KeyType::Rsa(bits), access_rules)?;
         Ok(Self(key))
     }
-    
-    pub fn import(key: &str, bits: u16, priv_key: &[u8], access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+
+    pub fn import(
+        key: &str,
+        bits: u16,
+        priv_key: &[u8],
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().import_key(key, KeyType::Rsa(bits), priv_key, access_rules)?;
         Ok(Self(key.to_string()))
     }
@@ -224,28 +300,45 @@ impl KeystoreKey for RsaKey {
         &self.0
     }
 }
-impl KeystorePublicKey for RsaKey { }
-impl KeystoreEncryptKey for RsaKey { }
-impl KeystoreSignKey for RsaKey { }
+impl KeystorePublicKey for RsaKey {}
+impl KeystoreEncryptKey for RsaKey {}
+impl KeystoreSignKey for RsaKey {}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EcKeystoreKey(pub String);
 impl EcKeystoreKey {
-    pub fn overwrite(key: &str, curve: EcCurve, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn overwrite(
+        key: &str,
+        curve: EcCurve,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().overwrite_new(key, KeyType::Ec(curve), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn ensure(key: &str, curve: EcCurve, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn ensure(
+        key: &str,
+        curve: EcCurve,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().ensure_exists(key, KeyType::Ec(curve), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn create_new(prefix: &str, curve: EcCurve, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn create_new(
+        prefix: &str,
+        curve: EcCurve,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         let key = keystore().create_new(prefix, KeyType::Ec(curve), access_rules)?;
         Ok(Self(key))
     }
 
-    pub fn import(key: &str, curve: EcCurve, priv_key: &[u8], access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn import(
+        key: &str,
+        curve: EcCurve,
+        priv_key: &[u8],
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().import_key(key, KeyType::Ec(curve), priv_key, access_rules)?;
         Ok(Self(key.to_string()))
     }
@@ -255,29 +348,46 @@ impl KeystoreKey for EcKeystoreKey {
         &self.0
     }
 }
-impl KeystorePublicKey for EcKeystoreKey { }
-impl KeystoreSignKey for EcKeystoreKey { }
-impl KeystoreDeriveKey for EcKeystoreKey { }
+impl KeystorePublicKey for EcKeystoreKey {}
+impl KeystoreSignKey for EcKeystoreKey {}
+impl KeystoreDeriveKey for EcKeystoreKey {}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AesKeystoreKey(pub String);
 impl AesKeystoreKey {
-    pub fn overwrite(key: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn overwrite(
+        key: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().overwrite_new(key, KeyType::Aes(bits), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn ensure(key: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn ensure(
+        key: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().ensure_exists(key, KeyType::Aes(bits), access_rules)?;
         Ok(Self(key.to_string()))
     }
 
-    pub fn create_new(prefix: &str, bits: u16, access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn create_new(
+        prefix: &str,
+        bits: u16,
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         let key = keystore().create_new(prefix, KeyType::Aes(bits), access_rules)?;
         Ok(Self(key))
     }
 
-    pub fn import(key: &str, bits: u16, priv_key: &[u8], access_rules: KeystoreAccessRules) -> Result<Self, KeystoreError> {
+    pub fn import(
+        key: &str,
+        bits: u16,
+        priv_key: &[u8],
+        access_rules: KeystoreAccessRules,
+    ) -> Result<Self, KeystoreError> {
         keystore().import_key(key, KeyType::Aes(bits), priv_key, access_rules)?;
         Ok(Self(key.to_string()))
     }
@@ -287,4 +397,4 @@ impl KeystoreKey for AesKeystoreKey {
         &self.0
     }
 }
-impl KeystoreEncryptKey for AesKeystoreKey { }
+impl KeystoreEncryptKey for AesKeystoreKey {}

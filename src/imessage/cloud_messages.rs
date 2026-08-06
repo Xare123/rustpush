@@ -6,13 +6,31 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::cloud_messages::cloudmessagesp::{
+    ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4,
+};
+use crate::cloudkit::{
+    pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest,
+    DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords,
+    QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS,
+    CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE, NO_ASSETS,
+};
+use crate::mmcs::{prepare_put_v2, PreparedPut};
+use crate::pcs::{get_boundary_key, PCSKey, PCSService};
+use crate::util::DebugMutex;
 use backon::{ConstantBuilder, Retryable};
+use bitflags::bitflags;
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::request_operation::header::IsolationLevel;
 use cloudkit_proto::retrieve_changes_response::RecordChange;
 use cloudkit_proto::sealed::PlistKind;
-use cloudkit_proto::{base64_encode, Asset, CloudKitBytes, CloudKitBytesKind, CloudKitEncryptedValue, CloudKitRecord, Date, RecordZoneIdentifier};
+use cloudkit_proto::RecordIdentifier;
+use cloudkit_proto::{
+    base64_encode, Asset, CloudKitBytes, CloudKitBytesKind, CloudKitEncryptedValue, CloudKitRecord,
+    Date, Record, RecordZoneIdentifier,
+};
 use hkdf::Hkdf;
+use log::info;
 use omnisette::AnisetteProvider;
 use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::PKey;
@@ -22,22 +40,22 @@ use plist::{Data, Value};
 use prost::Message;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
-use cloudkit_proto::RecordIdentifier;
 use tokio::sync::Mutex;
-use crate::util::DebugMutex;
-use log::info;
 use uuid::Uuid;
-use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
-use crate::mmcs::{prepare_put_v2, PreparedPut};
-use crate::pcs::{get_boundary_key, PCSKey, PCSService};
-use bitflags::bitflags;
 
 use crate::keychain::KeychainClient;
-use crate::util::{base64_decode, bin_deserialize, bin_serialize, bin_deserialize_opt_vec, proto_serialize_opt, proto_deserialize_opt, bin_serialize_opt_vec, coder_encode_flattened, decode_hex, encode_hex, gzip, plist_to_bin, ungzip, NSAttributedString, NSDictionaryTypedCoder, NSNumber, NSString, StreamTypedCoder};
+use crate::util::{
+    base64_decode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec,
+    coder_encode_flattened, decode_hex, encode_hex, gzip, plist_to_bin, proto_deserialize_opt,
+    proto_serialize_opt, ungzip, NSAttributedString, NSDictionaryTypedCoder, NSNumber, NSString,
+    StreamTypedCoder,
+};
+use crate::{
+    cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer},
+    PushError,
+};
 use crate::{Attachment, AttachmentType, FileContainer};
 use cloudkit_proto::CloudKitEncryptor;
-use crate::{cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer}, PushError};
 
 pub const MESSAGES_SERVICE: PCSService = PCSService {
     name: "Messages3",
@@ -121,7 +139,6 @@ bitflags! {
     }
 }
 
-
 // gp and gpid (group photo and group photo id)
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -156,7 +173,11 @@ pub struct MessageEditRange {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct MessageSummaryInfo {
     pub ams: Option<String>,
-    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec",
+        default
+    )]
     pub ampt: Option<Vec<u8>>, // am part (full text part of ams)
     pub amc: Option<u32>,
     pub amb: Option<String>, // balloon id
@@ -259,11 +280,19 @@ pub struct CloudChat {
     pub guid: String,
     #[cloudkit(rename = "name")]
     pub display_name: Option<String>,
-    #[serde(default, serialize_with = "proto_serialize_opt_gzip", deserialize_with = "proto_deserialize_opt_gzip")]
+    #[serde(
+        default,
+        serialize_with = "proto_serialize_opt_gzip",
+        deserialize_with = "proto_deserialize_opt_gzip"
+    )]
     pub proto001: Option<GZipWrapper<ChatProto>>,
     #[cloudkit(rename = "gpid")]
     pub group_photo_guid: Option<String>,
-    #[serde(default, serialize_with = "proto_serialize_opt", deserialize_with = "proto_deserialize_opt")]
+    #[serde(
+        default,
+        serialize_with = "proto_serialize_opt",
+        deserialize_with = "proto_deserialize_opt"
+    )]
     #[cloudkit(rename = "gp")]
     pub group_photo: Option<Asset>,
 }
@@ -276,7 +305,9 @@ where
     use serde::de::Error;
     let s: Option<Data> = Deserialize::deserialize(d)?;
     Ok(if let Some(s) = s {
-        Some(GZipWrapper(T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)?))
+        Some(GZipWrapper(
+            T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)?,
+        ))
     } else {
         None
     })
@@ -287,7 +318,9 @@ where
     S: Serializer,
     T: Message,
 {
-    x.as_ref().map(|a| Data::new(a.encode_to_vec())).serialize(s)
+    x.as_ref()
+        .map(|a| Data::new(a.encode_to_vec()))
+        .serialize(s)
 }
 
 #[derive(CloudKitRecord, Debug, Default, Clone)]
@@ -298,7 +331,7 @@ pub struct CloudMessageSummary {
     #[cloudkit(rename = "chatEncryptedv2")]
     pub chat_summary: Vec<i64>,
     #[cloudkit(rename = "attachment")]
-    pub attachment_summary: Vec<i64>
+    pub attachment_summary: Vec<i64>,
 }
 
 impl CloudMessageSummary {
@@ -340,14 +373,23 @@ pub struct CloudMessage {
 }
 
 impl CloudKitEncryptedValue for MessageFlags {
-    fn from_value_encrypted(value: &cloudkit_proto::record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self>
-        where
-            Self: Sized {
-        
-        i64::from_value_encrypted(value, encryptor, field_name).map(|v| MessageFlags::from_bits_truncate(v))
+    fn from_value_encrypted(
+        value: &cloudkit_proto::record::field::Value,
+        encryptor: &impl CloudKitEncryptor,
+        field_name: &str,
+    ) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        i64::from_value_encrypted(value, encryptor, field_name)
+            .map(|v| MessageFlags::from_bits_truncate(v))
     }
 
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<cloudkit_proto::record::field::Value> {
+    fn to_value_encrypted(
+        &self,
+        encryptor: &impl CloudKitEncryptor,
+        field_name: &str,
+    ) -> Option<cloudkit_proto::record::field::Value> {
         self.bits().to_value_encrypted(encryptor, field_name)
     }
 }
@@ -385,38 +427,37 @@ pub struct MMCSAttachmentMeta {
     pub name: Option<String>,
 }
 
-
 impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
     fn into(self) -> Option<MMCSAttachmentMeta> {
         match &self.a_type {
-            AttachmentType::Inline(_inline) => Some(MMCSAttachmentMeta { 
-                mmcs_signature_hex: None, 
-                decryption_key: None, 
-                mmcs_owner: None, 
-                mmcs_url: None, 
+            AttachmentType::Inline(_inline) => Some(MMCSAttachmentMeta {
+                mmcs_signature_hex: None,
+                decryption_key: None,
+                mmcs_owner: None,
+                mmcs_url: None,
 
                 inline_attachment: Some("ia-0".to_string()),
                 message_part: Some("0".to_string()),
 
-                file_size: Some(NumOrString::Num(_inline.len() as u32)), 
-                uti_type: Some(self.uti_type.clone()), 
+                file_size: Some(NumOrString::Num(_inline.len() as u32)),
+                uti_type: Some(self.uti_type.clone()),
                 mime_type: Some(self.mime.clone()),
-                name: Some(self.name.clone())
+                name: Some(self.name.clone()),
             }),
-            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta { 
-                mmcs_signature_hex: Some(encode_hex(&mmcs.signature)), 
-                decryption_key: Some(encode_hex(&mmcs.key)), 
-                mmcs_owner: Some(mmcs.object.clone()), 
-                mmcs_url: Some(mmcs.url.clone()), 
+            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta {
+                mmcs_signature_hex: Some(encode_hex(&mmcs.signature)),
+                decryption_key: Some(encode_hex(&mmcs.key)),
+                mmcs_owner: Some(mmcs.object.clone()),
+                mmcs_url: Some(mmcs.url.clone()),
 
                 inline_attachment: None,
                 message_part: None,
 
-                file_size: Some(NumOrString::Num(mmcs.size as u32)), 
-                uti_type: Some(self.uti_type.clone()), 
+                file_size: Some(NumOrString::Num(mmcs.size as u32)),
+                uti_type: Some(self.uti_type.clone()),
                 mime_type: Some(self.mime.clone()),
-                name: Some(self.name.clone())
-            })
+                name: Some(self.name.clone()),
+            }),
         }
     }
 }
@@ -476,6 +517,371 @@ pub struct CloudAttachment {
     pub lqa: Asset,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CloudMessageRecordSystemFields {
+    pub etag: Option<String>,
+    pub created_at: Option<f64>,
+    pub modified_at: Option<f64>,
+    pub permission: Option<u32>,
+}
+
+impl CloudMessageRecordSystemFields {
+    fn from_record(record: &Record, change_etag: Option<&str>) -> Self {
+        Self {
+            etag: change_etag
+                .map(ToOwned::to_owned)
+                .or_else(|| record.etag.clone()),
+            created_at: record
+                .time_statistics
+                .as_ref()
+                .and_then(|statistics| statistics.creation.as_ref())
+                .and_then(|date| date.time),
+            modified_at: record
+                .time_statistics
+                .as_ref()
+                .and_then(|statistics| statistics.modification.as_ref())
+                .and_then(|date| date.time),
+            permission: record.permission,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_message_page_tests {
+    use super::*;
+
+    fn fixture_identifier(name: &str) -> RecordIdentifier {
+        RecordIdentifier {
+            value: Some(cloudkit_proto::Identifier {
+                name: Some(name.to_string()),
+                r#type: Some(cloudkit_proto::identifier::Type::Record as i32),
+            }),
+            zone_identifier: None,
+        }
+    }
+
+    #[test]
+    fn ordered_page_preserves_upsert_then_tombstone_and_system_metadata() {
+        let changes = vec![
+            RecordChange {
+                identifier: Some(fixture_identifier("fixture-upsert")),
+                etag: Some("etag-upsert".to_string()),
+                record_type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                r#type: Some(1),
+                record: Some(Record {
+                    etag: Some("record-etag".to_string()),
+                    record_identifier: Some(fixture_identifier("fixture-upsert")),
+                    r#type: Some(cloudkit_proto::record::Type {
+                        name: Some("FixtureRecord".to_string()),
+                    }),
+                    permission: Some(7),
+                    ..Default::default()
+                }),
+            },
+            RecordChange {
+                identifier: Some(fixture_identifier("fixture-delete")),
+                etag: Some("etag-delete".to_string()),
+                record_type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                r#type: Some(2),
+                record: None,
+            },
+        ];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].record_name.as_deref(), Some("fixture-upsert"));
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::EncryptedUpsert
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+        assert!(mapped[0].tombstone_payload.is_none());
+        assert_eq!(
+            mapped[0]
+                .system_fields
+                .as_ref()
+                .and_then(|fields| fields.etag.as_deref()),
+            Some("etag-upsert"),
+        );
+        assert_eq!(
+            mapped[0]
+                .system_fields
+                .as_ref()
+                .and_then(|fields| fields.permission),
+            Some(7),
+        );
+
+        assert_eq!(mapped[1].record_name.as_deref(), Some("fixture-delete"));
+        assert!(matches!(mapped[1].kind, CloudMessageRecordKind::Tombstone));
+        assert!(mapped[1].encrypted_record.is_none());
+        assert!(mapped[1].tombstone_payload.is_some());
+    }
+
+    #[test]
+    fn unexpected_record_type_is_retained_but_not_decoded() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-unknown")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FutureRecordType".to_string()),
+            }),
+            r#type: Some(1),
+            record: Some(Record {
+                record_identifier: Some(fixture_identifier("fixture-unknown")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FutureRecordType".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::UnsupportedRecordType
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+    }
+
+    #[test]
+    fn malformed_field_metadata_is_quarantined_without_decoding() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-malformed")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(1),
+            record: Some(Record {
+                record_identifier: Some(fixture_identifier("fixture-malformed")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                record_field: vec![cloudkit_proto::record::Field {
+                    identifier: None,
+                    value: None,
+                }],
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::MalformedMetadata
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+    }
+
+    #[test]
+    fn mismatched_record_identity_is_quarantined_without_decoding() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("outer-record")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(1),
+            record: Some(Record {
+                record_identifier: Some(fixture_identifier("different-inner-record")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::MalformedMetadata
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+    }
+
+    #[test]
+    fn contradictory_change_shape_is_quarantined_without_decoding() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-contradictory")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(2),
+            record: Some(Record {
+                record_identifier: Some(fixture_identifier("fixture-contradictory")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::MalformedMetadata
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloudMessageRecordKind {
+    EncryptedUpsert,
+    Tombstone,
+    UnsupportedRecordType,
+    MalformedMetadata,
+}
+
+#[derive(Debug)]
+pub struct CloudMessageRecordPageChange {
+    pub record_name: Option<String>,
+    pub record_type: Option<String>,
+    pub change_type: Option<i32>,
+    pub system_fields: Option<CloudMessageRecordSystemFields>,
+    /// The original server record. Message fields remain in their CloudKit/PCS
+    /// encrypted representation and can be durably journaled before apply.
+    pub encrypted_record: Option<Vec<u8>>,
+    /// The original change envelope for a deletion. This preserves Apple
+    /// tombstone metadata without inventing a local delete.
+    pub tombstone_payload: Option<Vec<u8>>,
+    pub kind: CloudMessageRecordKind,
+}
+
+pub struct CloudMessageRecordPage {
+    pub changes: Vec<CloudMessageRecordPageChange>,
+    pub next_token: Option<Vec<u8>>,
+    pub status: i32,
+}
+
+impl CloudMessageRecordPage {
+    pub fn is_complete(&self) -> bool {
+        self.status == 3
+    }
+}
+
+fn record_identifier_name(identifier: Option<&RecordIdentifier>) -> Option<&str> {
+    identifier
+        .and_then(|identifier| identifier.value.as_ref())
+        .and_then(|identifier| identifier.name.as_deref())
+        .filter(|name| !name.is_empty())
+}
+
+fn record_metadata_is_well_formed(
+    record: &Record,
+    change_record_name: Option<&str>,
+    change_record_type: Option<&str>,
+) -> bool {
+    let Some(change_record_name) = change_record_name else {
+        return false;
+    };
+    if record_identifier_name(record.record_identifier.as_ref()) != Some(change_record_name) {
+        return false;
+    }
+
+    let Some(record_type) = record
+        .r#type
+        .as_ref()
+        .and_then(|record_type| record_type.name.as_deref())
+        .filter(|record_type| !record_type.is_empty())
+    else {
+        return false;
+    };
+    if change_record_type.is_some_and(|change_record_type| change_record_type != record_type) {
+        return false;
+    }
+
+    record.record_field.iter().all(|field| {
+        field
+            .identifier
+            .as_ref()
+            .and_then(|identifier| identifier.name.as_deref())
+            .is_some_and(|name| !name.is_empty())
+    })
+}
+
+fn map_ordered_page_changes(
+    changes: Vec<RecordChange>,
+    expected_record_type: &str,
+) -> Vec<CloudMessageRecordPageChange> {
+    changes
+        .into_iter()
+        .map(|change| {
+            let record_name =
+                record_identifier_name(change.identifier.as_ref()).map(ToOwned::to_owned);
+            let record_type = change
+                .record_type
+                .as_ref()
+                .and_then(|record_type| record_type.name.clone())
+                .filter(|record_type| !record_type.is_empty())
+                .or_else(|| {
+                    change
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.r#type.as_ref())
+                        .and_then(|record_type| record_type.name.clone())
+                        .filter(|record_type| !record_type.is_empty())
+                });
+            let system_fields = change.record.as_ref().map(|record| {
+                CloudMessageRecordSystemFields::from_record(record, change.etag.as_deref())
+            });
+            let encrypted_record = change.record.as_ref().map(Message::encode_to_vec);
+            let tombstone_payload = change.record.is_none().then(|| change.encode_to_vec());
+
+            let change_shape_is_well_formed = match change.r#type {
+                Some(1) => change.record.is_some(),
+                Some(2) => change.record.is_none(),
+                Some(_) => false,
+                None => true,
+            };
+            let kind = if record_name.is_none() || !change_shape_is_well_formed {
+                CloudMessageRecordKind::MalformedMetadata
+            } else if let Some(record) = change.record.as_ref() {
+                if !record_metadata_is_well_formed(
+                    record,
+                    record_name.as_deref(),
+                    change
+                        .record_type
+                        .as_ref()
+                        .and_then(|record_type| record_type.name.as_deref()),
+                ) {
+                    CloudMessageRecordKind::MalformedMetadata
+                } else {
+                    match record_type.as_deref() {
+                        Some(record_type) if record_type == expected_record_type => {
+                            CloudMessageRecordKind::EncryptedUpsert
+                        }
+                        Some(_) => CloudMessageRecordKind::UnsupportedRecordType,
+                        None => CloudMessageRecordKind::MalformedMetadata,
+                    }
+                }
+            } else {
+                CloudMessageRecordKind::Tombstone
+            };
+
+            CloudMessageRecordPageChange {
+                record_name,
+                record_type,
+                change_type: change.r#type,
+                system_fields,
+                encrypted_record,
+                tombstone_payload,
+                kind,
+            }
+        })
+        .collect()
+}
+
 pub struct CloudMessagesClient<P: AnisetteProvider> {
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
     pub client: Arc<CloudKitClient<P>>,
@@ -491,53 +897,113 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
     }
 
+    /// Returns the active account identifier inside the native boundary.
+    /// Callers must immediately transform it with an application-secret keyed
+    /// function and must never expose it over FFI or logs.
+    pub async fn native_account_identifier(&self) -> String {
+        self.client
+            .state
+            .read()
+            .await
+            .account_identifier()
+            .to_owned()
+    }
+
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
         if let Some(container) = &*locked {
-            return Ok(container.clone())
+            return Ok(container.clone());
         }
-        *locked = Some(Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?));
-        return Ok(locked.clone().unwrap())
+        let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
+        *locked = Some(container.clone());
+        Ok(container)
     }
 
-    async fn sync_records<T: CloudKitRecord>(&self, zone: &str, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+    async fn sync_records_page(
+        &self,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        let container = self.get_container().await?;
+        let zone = container.private_zone(zone_name.to_string());
+        let page = FetchRecordChangesOperation::fetch_page_with_limit(
+            &container,
+            zone,
+            continuation_token,
+            &NO_ASSETS,
+            max_changes,
+        )
+        .await?;
+
+        let changes = map_ordered_page_changes(page.changes, expected_record_type);
+
+        Ok(CloudMessageRecordPage {
+            changes,
+            next_token: page.next_token,
+            status: page.status,
+        })
+    }
+
+    async fn sync_records<T: CloudKitRecord>(
+        &self,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
         info!("Getting records");
         let container = self.get_container().await?;
 
         let zone = container.private_zone(zone.to_string());
         info!("Getting encryption config");
-        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
         info!("Got encryption config");
-        let (_assets, response) = container.perform(&CloudKitSession::new(),
-            FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest { 
-                sync_continuation_token: continuation_token, 
-                zone_identifier: Some(zone.clone()), 
-                requested_changes_types: Some(3), // figure out 
-                assets_to_download: Some(NO_ASSETS.clone()), 
-                newest_first: Some(true),
-                ..Default::default()
-            })).await?;
+        let (_assets, response) = container
+            .perform(
+                &CloudKitSession::new(),
+                FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest {
+                    sync_continuation_token: continuation_token,
+                    zone_identifier: Some(zone.clone()),
+                    requested_changes_types: Some(3), // figure out
+                    assets_to_download: Some(NO_ASSETS.clone()),
+                    newest_first: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await?;
 
         let mut results = HashMap::new();
 
         info!("Getting response");
 
         for change in &response.change {
-            let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
+            let identifier = change
+                .identifier
+                .as_ref()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .name()
+                .to_string();
 
             let Some(record) = &change.record else {
                 results.insert(identifier, None);
                 continue;
             };
-            if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
+            if record.r#type.as_ref().unwrap().name() != T::record_type() {
+                continue;
+            }
 
             let pcskey = match pcs_keys_for_record(&record, &key) {
                 Ok(key) => key,
                 Err(PushError::PCSRecordKeyMissing) => {
                     container.clear_cache_zone_encryption_config(&zone).await;
-                    return Err(PushError::PCSRecordKeyMissing)
-                },
-                Err(e) => return Err(e)
+                    return Err(PushError::PCSRecordKeyMissing);
+                }
+                Err(e) => return Err(e),
             };
             let item = T::from_record_encrypted(&record.record_field, Some(&pcskey));
 
@@ -546,14 +1012,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
         info!("Getting finish");
 
-        Ok((response.sync_continuation_token().to_vec(), results, response.status()))
+        Ok((
+            response.sync_continuation_token().to_vec(),
+            results,
+            response.status(),
+        ))
     }
 
-    async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
+    async fn save_records<T: CloudKitRecord>(
+        &self,
+        zone: &str,
+        records: HashMap<String, T>,
+    ) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         let container = self.get_container().await?;
 
         let zone = container.private_zone(zone.to_string());
-        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
 
         let mut results = HashMap::new();
         let records = records.into_iter().collect::<Vec<_>>();
@@ -562,20 +1038,43 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             let mut operations = vec![];
             let mut ids = vec![];
             for (record_id, chat) in batch {
-                operations.push(SaveRecordOperation::new(record_identifier(zone.clone(), &record_id), chat, Some(&key), true));
+                operations.push(SaveRecordOperation::new(
+                    record_identifier(zone.clone(), &record_id),
+                    chat,
+                    Some(&key),
+                    true,
+                ));
                 ids.push(record_id.clone());
             }
 
-            let mut result: HashMap<usize, Result<(), PushError>> = match container.perform_operations(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await {
-                Ok(item) => item.into_iter().map(|i| i.map(|_| ())).enumerate().collect(),
+            let mut result: HashMap<usize, Result<(), PushError>> = match container
+                .perform_operations(
+                    &CloudKitSession::new(),
+                    &operations,
+                    IsolationLevel::Operation,
+                )
+                .await
+            {
+                Ok(item) => item
+                    .into_iter()
+                    .map(|i| i.map(|_| ()))
+                    .enumerate()
+                    .collect(),
                 Err(e) => {
                     let joined = Arc::new(e);
-                    results.extend(ids.into_iter().map(|r| (r, Err(PushError::BatchError(joined.clone())))));
+                    results.extend(
+                        ids.into_iter()
+                            .map(|r| (r, Err(PushError::BatchError(joined.clone())))),
+                    );
                     continue;
                 }
             };
 
-            results.extend(ids.into_iter().enumerate().map(|(idx, r)| (r, result.remove(&idx).unwrap())));
+            results.extend(
+                ids.into_iter()
+                    .enumerate()
+                    .map(|(idx, r)| (r, result.remove(&idx).unwrap())),
+            );
         }
 
         Ok(results)
@@ -589,11 +1088,26 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         for batch in records.chunks(256) {
             let mut operations = vec![];
             for record_id in batch {
-                operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
+                operations.push(DeleteRecordOperation::new(record_identifier(
+                    zone.clone(),
+                    record_id,
+                )));
             }
             (|| async {
-                container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await
-            }).retry(&ConstantBuilder::default().with_delay(Duration::from_secs(5)).with_max_times(3)).await?;
+                container
+                    .perform_operations_checked(
+                        &CloudKitSession::new(),
+                        &operations,
+                        IsolationLevel::Operation,
+                    )
+                    .await
+            })
+            .retry(
+                &ConstantBuilder::default()
+                    .with_delay(Duration::from_secs(5))
+                    .with_max_times(3),
+            )
+            .await?;
         }
 
         Ok(())
@@ -605,26 +1119,39 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let zone = container.private_zone(zone.to_string());
 
         let session = CloudKitSession::new();
-        let (mut results, _assets) = container.perform(&session, QueryRecordOperation::new(
-            &ALL_ASSETS,
-            zone,
-            cloudkit_proto::Query {
-                types: vec![crate::cloudkit_proto::record::Type { name: Some("MessagesSummary".to_string()) }],
-                filters: vec![],
-                sorts: vec![],
-                distinct: None,
-                query_operator: None,
-            }
-        )).await?;
+        let (mut results, _assets) = container
+            .perform(
+                &session,
+                QueryRecordOperation::new(
+                    &ALL_ASSETS,
+                    zone,
+                    cloudkit_proto::Query {
+                        types: vec![crate::cloudkit_proto::record::Type {
+                            name: Some("MessagesSummary".to_string()),
+                        }],
+                        filters: vec![],
+                        sorts: vec![],
+                        distinct: None,
+                        query_operator: None,
+                    },
+                ),
+            )
+            .await?;
 
         Ok(if !results.is_empty() {
             results.remove(0).result
-        } else { Default::default() })
+        } else {
+            Default::default()
+        })
     }
 
     pub async fn count_records(&self) -> Result<CloudMessageSummary, PushError> {
         let mut def = CloudMessageSummary::default();
-        for zone in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
+        for zone in [
+            "chatManateeZone",
+            "messageManateeZone",
+            "attachmentManateeZone",
+        ] {
             def = def.merge(self.count_zone_records(zone).await?);
         }
         Ok(def)
@@ -634,28 +1161,72 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = self.get_container().await?;
 
         container.keys.lock().await.clear();
-        
-        container.perform_operations_checked(&CloudKitSession::new(), &[
-            ZoneDeleteOperation::new(container.private_zone("chatManateeZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("messageManateeZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("attachmentManateeZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("chat1ManateeZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("messageUpdateZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("recoverableMessageDeleteZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("scheduledMessageZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("chatBotMessageZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("chatBotAttachmentZone".to_string())),
-            ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
 
-        ], IsolationLevel::Operation).await?;
+        container
+            .perform_operations_checked(
+                &CloudKitSession::new(),
+                &[
+                    ZoneDeleteOperation::new(container.private_zone("chatManateeZone".to_string())),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("messageManateeZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("attachmentManateeZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("chat1ManateeZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("messageUpdateZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("recoverableMessageDeleteZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("scheduledMessageZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("chatBotMessageZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("chatBotAttachmentZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("chatBotRecoverableMessageDeleteZone".to_string()),
+                    ),
+                ],
+                IsolationLevel::Operation,
+            )
+            .await?;
         Ok(())
     }
 
-    pub async fn sync_chats(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
-        self.sync_records("chatManateeZone", continuation_token).await
+    pub async fn sync_chats(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
+        self.sync_records("chatManateeZone", continuation_token)
+            .await
     }
 
-    pub async fn save_chats(&self, chats: HashMap<String, CloudChat>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
+    pub async fn sync_chats_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page(
+            "chatManateeZone",
+            CloudChat::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn save_chats(
+        &self,
+        chats: HashMap<String, CloudChat>,
+    ) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         self.save_records("chatManateeZone", chats).await
     }
 
@@ -663,11 +1234,32 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.delete_records("chatManateeZone", chats).await
     }
 
-    pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
-        self.sync_records("messageManateeZone", continuation_token).await
+    pub async fn sync_messages(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
+        self.sync_records("messageManateeZone", continuation_token)
+            .await
     }
 
-    pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
+    pub async fn sync_messages_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page(
+            "messageManateeZone",
+            CloudMessage::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn save_messages(
+        &self,
+        messages: HashMap<String, CloudMessage>,
+    ) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         self.save_records("messageManateeZone", messages).await
     }
 
@@ -675,75 +1267,185 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.delete_records("messageManateeZone", messages).await
     }
 
-    pub async fn sync_attachments(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>, i32), PushError> {
-        self.sync_records("attachmentManateeZone", continuation_token).await
+    pub async fn sync_attachments(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>, i32), PushError> {
+        self.sync_records("attachmentManateeZone", continuation_token)
+            .await
     }
 
-    pub async fn save_attachments(&self, attachments: HashMap<String, CloudAttachment>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
-        self.save_records("attachmentManateeZone", attachments).await
+    pub async fn sync_attachments_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page(
+            "attachmentManateeZone",
+            CloudAttachment::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn save_attachments(
+        &self,
+        attachments: HashMap<String, CloudAttachment>,
+    ) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
+        self.save_records("attachmentManateeZone", attachments)
+            .await
     }
 
     pub async fn delete_attachments(&self, attachments: &[String]) -> Result<(), PushError> {
-        self.delete_records("attachmentManateeZone", attachments).await
+        self.delete_records("attachmentManateeZone", attachments)
+            .await
     }
 
-    pub async fn prepare_file<T: Read + Send + Sync>(&self, file: T) -> Result<PreparedPut, PushError> {
-        Ok(prepare_put_v2(FileContainer::new(file), &get_boundary_key(&MESSAGES_SERVICE, &self.keychain).await?).await?)
+    pub async fn prepare_file<T: Read + Send + Sync>(
+        &self,
+        file: T,
+    ) -> Result<PreparedPut, PushError> {
+        Ok(prepare_put_v2(
+            FileContainer::new(file),
+            &get_boundary_key(&MESSAGES_SERVICE, &self.keychain).await?,
+        )
+        .await?)
     }
 
-    pub async fn download_attachment<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
+    pub async fn download_attachment<T: Write + Send + Sync>(
+        &self,
+        files: HashMap<String, T>,
+    ) -> Result<(), PushError> {
         let container = self.get_container().await?;
         let zone = container.private_zone("attachmentManateeZone".to_string());
-        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
 
-        let invoke = container.perform_operations(&CloudKitSession::new(), 
-            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(
+                    &ALL_ASSETS,
+                    &zone,
+                    &files.keys().cloned().collect::<Vec<_>>(),
+                ),
+                IsolationLevel::Operation,
+            )
+            .await?;
         let records = FetchedRecords::new(&invoke);
 
-        let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
+        let record: Vec<CloudAttachment> = files
+            .keys()
+            .map(|f| records.get_record(f, Some(&key)))
+            .collect::<Vec<_>>();
 
-        container.get_assets(&records.assets, record.iter().map(|i| &i.lqa).zip(files.into_values()).collect::<Vec<_>>()).await?;
+        container
+            .get_assets(
+                &records.assets,
+                record
+                    .iter()
+                    .map(|i| &i.lqa)
+                    .zip(files.into_values())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         Ok(())
     }
 
-    pub async fn download_group_photo<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
+    pub async fn download_group_photo<T: Write + Send + Sync>(
+        &self,
+        files: HashMap<String, T>,
+    ) -> Result<(), PushError> {
         let container = self.get_container().await?;
         let zone = container.private_zone("chatManateeZone".to_string());
-        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
 
-        let invoke = container.perform_operations(&CloudKitSession::new(), 
-            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(
+                    &ALL_ASSETS,
+                    &zone,
+                    &files.keys().cloned().collect::<Vec<_>>(),
+                ),
+                IsolationLevel::Operation,
+            )
+            .await?;
         let records = FetchedRecords::new(&invoke);
-        let record: Vec<CloudChat> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
+        let record: Vec<CloudChat> = files
+            .keys()
+            .map(|f| records.get_record(f, Some(&key)))
+            .collect::<Vec<_>>();
 
         if record.iter().any(|r| r.group_photo.is_none()) {
-            return Err(PushError::MissingGroupPhoto)
+            return Err(PushError::MissingGroupPhoto);
         }
 
-        container.get_assets(&records.assets, record.iter().map(|i| i.group_photo.as_ref().expect("No group photo!")).zip(files.into_values()).collect::<Vec<_>>()).await?;
+        container
+            .get_assets(
+                &records.assets,
+                record
+                    .iter()
+                    .map(|i| i.group_photo.as_ref().expect("No group photo!"))
+                    .zip(files.into_values())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         Ok(())
     }
 
     // files is (prepared, file, record_id)
-    pub async fn upload_attachments<T: Read + Send + Sync>(&self, files: Vec<(PreparedPut, T, String)>) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
+    pub async fn upload_attachments<T: Read + Send + Sync>(
+        &self,
+        files: Vec<(PreparedPut, T, String)>,
+    ) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
         let container = self.get_container().await?;
-        Ok(container.upload_asset(&CloudKitSession::new(), &container.private_zone("attachmentManateeZone".to_string()), files.into_iter().map(|f| CloudKitUploadRequest {
-            file: Some(f.1),
-            record_id: f.2,
-            field: "lqa",
-            record_type: CloudAttachment::record_type(),
-            prepared: f.0,
-        }).collect()).await?.remove("lqa").unwrap_or_default())
+        Ok(container
+            .upload_asset(
+                &CloudKitSession::new(),
+                &container.private_zone("attachmentManateeZone".to_string()),
+                files
+                    .into_iter()
+                    .map(|f| CloudKitUploadRequest {
+                        file: Some(f.1),
+                        record_id: f.2,
+                        field: "lqa",
+                        record_type: CloudAttachment::record_type(),
+                        prepared: f.0,
+                    })
+                    .collect(),
+            )
+            .await?
+            .remove("lqa")
+            .unwrap_or_default())
     }
 
-    pub async fn upload_group_photo<T: Read + Send + Sync>(&self, files: Vec<(PreparedPut, T, String)>) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
+    pub async fn upload_group_photo<T: Read + Send + Sync>(
+        &self,
+        files: Vec<(PreparedPut, T, String)>,
+    ) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
         let container = self.get_container().await?;
-        Ok(container.upload_asset(&CloudKitSession::new(), &container.private_zone("chatManateeZone".to_string()), files.into_iter().map(|f| CloudKitUploadRequest {
-            file: Some(f.1),
-            record_id: f.2,
-            field: "gp",
-            record_type: CloudChat::record_type(),
-            prepared: f.0,
-        }).collect()).await?.remove("gp").unwrap_or_default())
+        Ok(container
+            .upload_asset(
+                &CloudKitSession::new(),
+                &container.private_zone("chatManateeZone".to_string()),
+                files
+                    .into_iter()
+                    .map(|f| CloudKitUploadRequest {
+                        file: Some(f.1),
+                        record_id: f.2,
+                        field: "gp",
+                        record_type: CloudChat::record_type(),
+                        prepared: f.0,
+                    })
+                    .collect(),
+            )
+            .await?
+            .remove("gp")
+            .unwrap_or_default())
     }
 }

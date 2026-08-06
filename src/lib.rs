@@ -1,17 +1,16 @@
-
 mod activation;
 mod aps;
-mod util;
-mod imessage;
-mod error;
 mod auth;
-mod ids;
-pub mod sharedstreams;
-pub mod findmy;
+mod error;
 pub mod facetime;
+pub mod findmy;
 pub mod icloud;
-pub mod statuskit;
+mod ids;
+mod imessage;
 pub mod passwords;
+pub mod sharedstreams;
+pub mod statuskit;
+mod util;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
@@ -35,34 +34,59 @@ pub mod mmcsp {
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
+pub use icloud_auth::{
+    default_provider, AppleAccount, ArcAnisetteClient, DefaultAnisetteProvider,
+    GenerateVerificationTokenRequest, LoginClientInfo, LoginState, TrustedPhoneNumber, VerifyBody,
+};
 
-pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
-pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
+pub use aps::{APSConnection, APSConnectionResource, APSMessage, APSState};
 use async_trait::async_trait;
+pub use auth::{
+    authenticate_apple, authenticate_phone, authenticate_smsless, login_apple_delegates, AuthPhone,
+    CircleClientSession, LoginDelegate, TokenProvider,
+};
 pub use auth::{request_update_account, UpdateAccountFinish};
-pub use mmcs::{FileContainer, prepare_put};
-pub use omnisette::AnisetteProvider;
-pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
-pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
-use util::encode_hex;
-pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure, NSAttributedString, NSString, NSDictionaryTypedCoder, NSNumber, coder_encode_flattened, coder_decode_flattened, StCollapsedValue};
-pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
-pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
-pub use ids::CertifiedContext;
-pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
-pub use error::PushError;
-pub use cloudkit_proto;
 pub use cloudkit_derive;
+pub use cloudkit_proto;
+pub use error::{CloudKitProtocolError, PushError};
+pub use ids::identity_manager::{IdentityManager, KeyCache, MessageTarget, SendJob};
+pub use ids::user::{
+    register, IDSNGMIdentity, IDSUser, IDSUserIdentity, PrivateDeviceInfo, ReportMessage,
+    SupportAction, SupportAlert,
+};
+pub use ids::CertifiedContext;
+pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
+pub use imessage::messages::{
+    Attachment, AttachmentType, Balloon, BalloonLayout, ChangeParticipantMessage, ConversationData,
+    DeleteTarget, EditMessage, ErrorMessage, ExtensionApp, IconChangeMessage, IndexedMessagePart,
+    LPIconMetadata, LPImageMetadata, LPLinkMetadata, LPSpecializationMetadata, LinkMeta, MMCSFile,
+    Message, MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage,
+    NormalMessage, OperatedChat, PartExtension, PermanentDeleteMessage, ReactMessage,
+    ReactMessageType, Reaction, RenameMessage, RichLinkImageAttachmentSubstitute, ScheduleMode,
+    SetTranscriptBackgroundMessage, ShareProfileMessage, SharedPoster, TextEffect, TextFlags,
+    TextFormat, TypingApp, UnsendMessage, UpdateExtensionMessage, UpdateProfileMessage,
+    UpdateProfileSharingMessage,
+};
 pub use imessage::name_photo_sharing;
+pub use mmcs::{prepare_put, FileContainer};
+pub use omnisette::AnisetteProvider;
+use util::encode_hex;
+pub use util::{
+    coder_decode_flattened, coder_encode_flattened, EntitlementAuthState, EntitlementsResponse,
+    NSArray, NSArrayClass, NSAttributedString, NSDictionaryClass, NSDictionaryTypedCoder, NSNumber,
+    NSString, ResourceFailure, ResourceState, StCollapsedValue, NSURL,
+};
+pub use util::{DebugMutex, DebugRwLock};
 
-pub use auth::{IdmsAuthListener, IdmsMessage, IdmsRequestedSignIn, ApsData, ApsAlert, AkData, TeardownSignIn, CircleServerSession, IdmsCircleMessage};
+pub use auth::{
+    AkData, ApsAlert, ApsData, CircleServerSession, IdmsAuthListener, IdmsCircleMessage,
+    IdmsMessage, IdmsRequestedSignIn, TeardownSignIn,
+};
 
 use plist::Dictionary;
 pub use relay::RelayConfig;
 pub use util::get_gateways_for_mccmnc;
-
 
 pub struct RegisterMeta {
     pub hardware_version: String,
@@ -116,5 +140,5 @@ pub trait OSConfig: Sync + Send {
     }
 }
 
-extern crate pretty_env_logger;
 extern crate log;
+extern crate pretty_env_logger;

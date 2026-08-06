@@ -3,23 +3,44 @@ use std::{collections::HashMap, io::Cursor, sync::Arc};
 use cloudkit_derive::CloudKitRecord;
 use hkdf::Hkdf;
 use omnisette::AnisetteProvider;
-use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer, symm::{decrypt, encrypt, Cipher}};
+use openssl::{
+    hash::MessageDigest,
+    pkey::PKey,
+    sign::Signer,
+    symm::{decrypt, encrypt, Cipher},
+};
 use plist::Data;
 use serde::{Deserialize, Serialize};
 
-use cloudkit_proto::{request_operation::header::IsolationLevel, RecordIdentifier};
+use crate::{
+    cloudkit::{
+        public_zone, record_identifier, record_identifier_public, CloudKitUploadRequest,
+        DeleteRecordOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation,
+        SaveRecordOperation, ALL_ASSETS,
+    },
+    mmcsp::container,
+    util::{base64_decode, bin_deserialize, bin_serialize, encode_hex},
+    IMClient, Message,
+};
 use cloudkit_proto::CloudKitEncryptor;
-use tokio::sync::Mutex;
-use crate::{cloudkit::{public_zone, record_identifier, record_identifier_public, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ALL_ASSETS}, mmcsp::container, util::{base64_decode, bin_deserialize, bin_serialize, encode_hex}, IMClient, Message};
+use cloudkit_proto::{request_operation::header::IsolationLevel, RecordIdentifier};
 use std::io::Seek;
+use tokio::sync::Mutex;
 
-use crate::{cloudkit::{prepare_cloudkit_put, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, QueryResult}, util::{base64_encode, plist_to_bin}, PushError};
+use crate::{
+    cloudkit::{
+        prepare_cloudkit_put, CloudKitClient, CloudKitContainer, CloudKitOpenContainer,
+        CloudKitSession, QueryResult,
+    },
+    util::{base64_encode, plist_to_bin},
+    PushError,
+};
 use log::info;
 use sha2::Sha256;
 
-use cloudkit_proto::{record, AssetGetResponse, CloudKitRecord, CloudKitValue};
-use crate::pcs::PCSKey;
 use super::messages::{ShareProfileMessage, SharedPoster};
+use crate::pcs::PCSKey;
+use cloudkit_proto::{record, AssetGetResponse, CloudKitRecord, CloudKitValue};
 
 #[derive(CloudKitRecord, Default)]
 #[cloudkit_record(type = "imsgNicknamePublicv2")]
@@ -55,7 +76,7 @@ pub struct IMessageEncNicknameRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IMessageSharedImageMeta {
-    image_name: String
+    image_name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,11 +118,9 @@ impl IMessageEncryptedField {
         let cipher = encrypt(Cipher::aes_128_ctr(), &field_key, Some(&iv), data)?;
 
         let hmac = PKey::hmac(&tag_key)?;
-        let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&[
-            name.as_bytes().to_vec(),
-            iv.to_vec(),
-            cipher.clone(),
-        ].concat())?;
+        let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(
+            &[name.as_bytes().to_vec(), iv.to_vec(), cipher.clone()].concat(),
+        )?;
 
         Ok(IMessageEncryptedField {
             iv: iv.to_vec().into(),
@@ -112,17 +131,25 @@ impl IMessageEncryptedField {
 
     fn decrypt(&self, name: &str, field_key: &[u8], tag_key: &[u8]) -> Result<Vec<u8>, PushError> {
         let hmac = PKey::hmac(&tag_key)?;
-        let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&[
-            name.as_bytes().to_vec(),
-            self.iv.as_ref().to_vec(),
-            self.data.as_ref().to_vec(),
-        ].concat())?;
+        let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(
+            &[
+                name.as_bytes().to_vec(),
+                self.iv.as_ref().to_vec(),
+                self.data.as_ref().to_vec(),
+            ]
+            .concat(),
+        )?;
 
         if &signature != self.tag.as_ref() {
             return Err(PushError::NickNameCryptoError("HMAC mismatch!".to_string()));
         }
 
-        let result = decrypt(Cipher::aes_128_ctr(), &field_key, Some(self.iv.as_ref()), self.data.as_ref())?;
+        let result = decrypt(
+            Cipher::aes_128_ctr(),
+            &field_key,
+            Some(self.iv.as_ref()),
+            self.data.as_ref(),
+        )?;
         Ok(result)
     }
 }
@@ -137,62 +164,113 @@ impl IMessageNicknameEncryption {
         let hk = Hkdf::<Sha256>::new(Some(salt), &key);
         let mut key = [0u8; 48];
         hk.expand(salt, &mut key).expect("Failed to expand key!");
-        Self {
-            keys: key
-        }
+        Self { keys: key }
     }
 
-    fn decrypt_verify(&self, name: &'static str, field: &[u8], tag: &[u8]) -> Result<Vec<u8>, PushError> {
+    fn decrypt_verify(
+        &self,
+        name: &'static str,
+        field: &[u8],
+        tag: &[u8],
+    ) -> Result<Vec<u8>, PushError> {
         let field = plist::from_bytes::<IMessageEncryptedField>(field)?;
         if field.tag.as_ref() != tag {
-            return Err(PushError::NickNameCryptoError("Decrypt tag mismatch!".to_string()));
+            return Err(PushError::NickNameCryptoError(
+                "Decrypt tag mismatch!".to_string(),
+            ));
         }
 
         Ok(field.decrypt(name, &self.keys[..16], &self.keys[16..32])?)
     }
 
-    fn encrypt_single(&self, name: &'static str, field: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PushError> {
+    fn encrypt_single(
+        &self,
+        name: &'static str,
+        field: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), PushError> {
         let field = IMessageEncryptedField::new(name, &self.keys[..16], &self.keys[16..32], field)?;
 
         let tag: Vec<u8> = field.tag.clone().into();
         Ok((plist_to_bin(&field)?, tag))
     }
 
-    fn encrypt<'t>(&self, keys: &[(&'t str, Vec<u8>)]) -> Result<(HashMap<&'t str, Vec<u8>>, Vec<u8>), PushError> {
-        let mut encrypted = keys.iter().map(|(k, v)| Ok((*k, IMessageEncryptedField::new(k, &self.keys[..16], &self.keys[16..32], &v)?))).collect::<Result<Vec<(&str, IMessageEncryptedField)>, PushError>>()?;
+    fn encrypt<'t>(
+        &self,
+        keys: &[(&'t str, Vec<u8>)],
+    ) -> Result<(HashMap<&'t str, Vec<u8>>, Vec<u8>), PushError> {
+        let mut encrypted = keys
+            .iter()
+            .map(|(k, v)| {
+                Ok((
+                    *k,
+                    IMessageEncryptedField::new(k, &self.keys[..16], &self.keys[16..32], &v)?,
+                ))
+            })
+            .collect::<Result<Vec<(&str, IMessageEncryptedField)>, PushError>>()?;
         encrypted.sort_by_key(|k| k.0);
 
-        let tags = encrypted.iter().map(|k| k.1.tag.as_ref().to_vec()).collect::<Vec<_>>().concat();
+        let tags = encrypted
+            .iter()
+            .map(|k| k.1.tag.as_ref().to_vec())
+            .collect::<Vec<_>>()
+            .concat();
         let hmac = PKey::hmac(&self.keys[32..])?;
         let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&tags)?;
 
-        Ok((encrypted.into_iter().map(|(k, v)| Ok((k, plist_to_bin(&v)?))).collect::<Result<HashMap<&str, Vec<u8>>, PushError>>()?, signature))
+        Ok((
+            encrypted
+                .into_iter()
+                .map(|(k, v)| Ok((k, plist_to_bin(&v)?)))
+                .collect::<Result<HashMap<&str, Vec<u8>>, PushError>>()?,
+            signature,
+        ))
     }
 
-    fn decrypt<'t>(&self, keys: &[(&'t str, Vec<u8>)], sig: &[u8]) -> Result<HashMap<&'t str, Vec<u8>>, PushError> {
-        let mut keys_extracted = keys.iter().map(|(k, v)| 
-            Ok((*k, plist::from_bytes::<IMessageEncryptedField>(&v)?))).collect::<Result<Vec<(&str, IMessageEncryptedField)>, PushError>>()?;
+    fn decrypt<'t>(
+        &self,
+        keys: &[(&'t str, Vec<u8>)],
+        sig: &[u8],
+    ) -> Result<HashMap<&'t str, Vec<u8>>, PushError> {
+        let mut keys_extracted = keys
+            .iter()
+            .map(|(k, v)| Ok((*k, plist::from_bytes::<IMessageEncryptedField>(&v)?)))
+            .collect::<Result<Vec<(&str, IMessageEncryptedField)>, PushError>>()?;
         keys_extracted.sort_by_key(|k| k.0);
 
-        let tags = keys_extracted.iter().map(|k| k.1.tag.as_ref().to_vec()).collect::<Vec<_>>().concat();
+        let tags = keys_extracted
+            .iter()
+            .map(|k| k.1.tag.as_ref().to_vec())
+            .collect::<Vec<_>>()
+            .concat();
         let hmac = PKey::hmac(&self.keys[32..])?;
         let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&tags)?;
 
         if &signature[..sig.len()] != sig {
-            return Err(PushError::NickNameCryptoError("Bad total hmac!".to_string()));
+            return Err(PushError::NickNameCryptoError(
+                "Bad total hmac!".to_string(),
+            ));
         }
 
-        Ok(keys_extracted.into_iter().map(|(k, v)| Ok((k, v.decrypt(k, &self.keys[..16], &self.keys[16..32])?))).collect::<Result<HashMap<&str, Vec<u8>>, PushError>>()?)
+        Ok(keys_extracted
+            .into_iter()
+            .map(|(k, v)| Ok((k, v.decrypt(k, &self.keys[..16], &self.keys[16..32])?)))
+            .collect::<Result<HashMap<&str, Vec<u8>>, PushError>>()?)
     }
 }
 
 impl IMessageEncNicknameRecord {
-    fn new(record: &IMessageNicknameRecord, enc: &IMessageNicknameEncryption) -> Result<(Self, String), PushError> {
-        let mut keys = vec![
-            ("n", plist_to_bin(&record.name)?),
-        ];
+    fn new(
+        record: &IMessageNicknameRecord,
+        enc: &IMessageNicknameEncryption,
+    ) -> Result<(Self, String), PushError> {
+        let mut keys = vec![("n", plist_to_bin(&record.name)?)];
         if let Some(image) = &record.image {
-            keys.push(("am", plist_to_bin(&IMessageSharedImageMeta { image_name: "NickNameImage".to_string() })?));
+            keys.push((
+                "am",
+                plist_to_bin(&IMessageSharedImageMeta {
+                    image_name: "NickNameImage".to_string(),
+                })?,
+            ));
             keys.push(("ad", image.clone()));
         }
 
@@ -204,43 +282,58 @@ impl IMessageEncNicknameRecord {
             let (wd, wd_tag) = enc.encrypt_single("wd", &poster.package)?;
 
             Some(IMessageEncPosterRecord {
-                wd, lrwd, wm,
+                wd,
+                lrwd,
+                wm,
                 share_meta: SharedPoster {
                     low_res_wallpaper_tag: lrwd_tag,
                     wallpaper_tag: wd_tag,
                     message_tag: wm_tag,
-                }
+                },
             })
-        } else { None };
+        } else {
+            None
+        };
 
-        Ok((IMessageEncNicknameRecord {
-            n: results.remove("n").unwrap(),
-            am: results.remove("am"),
-            ad: results.remove("ad"),
-            poster,
-        }, (base64_encode(&key_result[..16]))))
+        Ok((
+            IMessageEncNicknameRecord {
+                n: results.remove("n").unwrap(),
+                am: results.remove("am"),
+                ad: results.remove("ad"),
+                poster,
+            },
+            (base64_encode(&key_result[..16])),
+        ))
     }
 
-    fn decrypt(self, enc: &IMessageNicknameEncryption, record_id: &str) -> Result<IMessageNicknameRecord, PushError> {
-        let mut keys = vec![
-            ("n", self.n),
-        ];
+    fn decrypt(
+        self,
+        enc: &IMessageNicknameEncryption,
+        record_id: &str,
+    ) -> Result<IMessageNicknameRecord, PushError> {
+        let mut keys = vec![("n", self.n)];
         if let Some(meta) = self.am {
             keys.push(("am", meta));
         }
         if let Some(image) = self.ad {
             keys.push(("ad", image));
-        } 
+        }
 
         let mut results = enc.decrypt(&keys, &base64_decode(record_id)[..16])?;
 
         let poster = if let Some(poster) = self.poster {
             Some(IMessagePosterRecord {
                 meta: enc.decrypt_verify("wm", &poster.wm, &poster.share_meta.message_tag)?,
-                low_res_poster: enc.decrypt_verify("lrwd", &poster.lrwd, &poster.share_meta.low_res_wallpaper_tag)?,
+                low_res_poster: enc.decrypt_verify(
+                    "lrwd",
+                    &poster.lrwd,
+                    &poster.share_meta.low_res_wallpaper_tag,
+                )?,
                 package: enc.decrypt_verify("wd", &poster.wd, &poster.share_meta.wallpaper_tag)?,
             })
-        } else { None };
+        } else {
+            None
+        };
 
         Ok(IMessageNicknameRecord {
             name: plist::from_bytes(&results.remove("n").unwrap())?,
@@ -273,13 +366,18 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
         if let Some(container) = &*locked {
-            return Ok(container.clone())
+            return Ok(container.clone());
         }
-        *locked = Some(Arc::new(PROFILES_CONTAINER.init(self.client.clone()).await?));
-        return Ok(locked.clone().unwrap())
+        *locked = Some(Arc::new(
+            PROFILES_CONTAINER.init(self.client.clone()).await?,
+        ));
+        return Ok(locked.clone().unwrap());
     }
 
-    pub async fn get_record(&self, message: &ShareProfileMessage) -> Result<IMessageNicknameRecord, PushError> {
+    pub async fn get_record(
+        &self,
+        message: &ShareProfileMessage,
+    ) -> Result<IMessageNicknameRecord, PushError> {
         let container = self.get_container().await?;
         let session = CloudKitSession::new();
         let poster_id = format!("{}-wp", message.cloud_kit_record_key);
@@ -289,21 +387,30 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             records.push(poster_id.clone());
         }
 
-        let records = FetchedRecords::new(&container.perform_operations(&session, &FetchRecordOperation::many(
-            &ALL_ASSETS,
-            &public_zone(),
-            &records
-        ), IsolationLevel::Zone).await?);
-        let record = records.get_record::<IMessageRawNicknameRecord>(&message.cloud_kit_record_key, None);
+        let records = FetchedRecords::new(
+            &container
+                .perform_operations(
+                    &session,
+                    &FetchRecordOperation::many(&ALL_ASSETS, &public_zone(), &records),
+                    IsolationLevel::Zone,
+                )
+                .await?,
+        );
+        let record =
+            records.get_record::<IMessageRawNicknameRecord>(&message.cloud_kit_record_key, None);
         let mut result_ad: Vec<u8> = vec![];
         let mut cursor_ad = Cursor::new(&mut result_ad);
         let mut assets = vec![];
         if let Some(ad) = &record.ad {
             assets.push((ad, &mut cursor_ad));
         }
-        
+
         // optional poster stuff
-        let raw_poster = if message.poster.is_some() { Some(records.get_record::<IMessageRawPosterRecord>(&poster_id, None)) } else { None };
+        let raw_poster = if message.poster.is_some() {
+            Some(records.get_record::<IMessageRawPosterRecord>(&poster_id, None))
+        } else {
+            None
+        };
         let mut data_wd: Vec<u8> = vec![];
         let mut data_lrwp: Vec<u8> = vec![];
         let mut cursor = Cursor::new(&mut data_wd);
@@ -316,12 +423,15 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             container.get_assets(&records.assets, assets).await?;
         }
 
-
         let key = IMessageNicknameEncryption::new(&message.cloud_kit_decryption_record_key);
         Ok(IMessageEncNicknameRecord {
             n: record.n,
             am: record.am,
-            ad: if record.ad.is_some() { Some(result_ad) } else { None },
+            ad: if record.ad.is_some() {
+                Some(result_ad)
+            } else {
+                None
+            },
             poster: if let (Some(poster), Some(raw_poster)) = (&message.poster, raw_poster) {
                 Some(IMessageEncPosterRecord {
                     wd: data_wd,
@@ -329,19 +439,27 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
                     wm: raw_poster.wm,
                     share_meta: poster.clone(),
                 })
-            } else { None },
-        }.decrypt(&key, &message.cloud_kit_record_key)?)
+            } else {
+                None
+            },
+        }
+        .decrypt(&key, &message.cloud_kit_record_key)?)
     }
 
-    pub async fn set_record(&self, record: IMessageNicknameRecord, existing: &mut Option<ShareProfileMessage>) -> Result<(), PushError> {
+    pub async fn set_record(
+        &self,
+        record: IMessageNicknameRecord,
+        existing: &mut Option<ShareProfileMessage>,
+    ) -> Result<(), PushError> {
         let container = self.get_container().await?;
         if let Some(record) = &existing {
-            let _ = self.delete_my_record(&record.cloud_kit_record_key).await; // if this fails, we'll catch it later 
+            let _ = self.delete_my_record(&record.cloud_kit_record_key).await; // if this fails, we'll catch it later
             *existing = None;
         }
-        
+
         let key: [u8; 16] = rand::random();
-        let (record, record_id) = IMessageEncNicknameRecord::new(&record, &IMessageNicknameEncryption::new(&key))?;
+        let (record, record_id) =
+            IMessageEncNicknameRecord::new(&record, &IMessageNicknameEncryption::new(&key))?;
 
         let mut upload_requests = vec![];
         if let Some(ad) = &record.ad {
@@ -353,7 +471,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
                 record_id: record_id.clone(),
                 record_type: IMessageRawNicknameRecord::record_type(),
                 field: "ad",
-                prepared
+                prepared,
             });
         }
 
@@ -371,7 +489,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
                     record_id: poster_id.clone(),
                     record_type: IMessageRawNicknameRecord::record_type(),
                     field: "wd",
-                    prepared: prepared_wd
+                    prepared: prepared_wd,
                 },
                 CloudKitUploadRequest {
                     file: Some(cursor_lrwd),
@@ -384,32 +502,47 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
         }
 
         let session = CloudKitSession::new();
-        let mut asset = container.upload_asset(&session, &public_zone(), upload_requests).await?;
+        let mut asset = container
+            .upload_asset(&session, &public_zone(), upload_requests)
+            .await?;
 
-        let mut raw_ops = vec![
-            SaveRecordOperation::new(record_identifier_public(&record_id), &IMessageRawNicknameRecord {
+        let mut raw_ops = vec![SaveRecordOperation::new(
+            record_identifier_public(&record_id),
+            &IMessageRawNicknameRecord {
                 n: record.n,
                 am: record.am,
                 ad: asset.remove("ad").map(|mut i| i.remove(0)),
-            }, None, false)
-        ];
+            },
+            None,
+            false,
+        )];
 
         if let Some(poster) = &record.poster {
-            raw_ops.push(SaveRecordOperation::new(record_identifier_public(&poster_id), &IMessageRawPosterRecord {
-                pr: cloudkit_proto::record::Reference {
-                    r#type: Some(cloudkit_proto::record::reference::Type::Owning as i32),
-                    record_identifier: Some(record_identifier_public(&container.user_id))
+            raw_ops.push(SaveRecordOperation::new(
+                record_identifier_public(&poster_id),
+                &IMessageRawPosterRecord {
+                    pr: cloudkit_proto::record::Reference {
+                        r#type: Some(cloudkit_proto::record::reference::Type::Owning as i32),
+                        record_identifier: Some(record_identifier_public(&container.user_id)),
+                    },
+                    wm: poster.wm.clone(),
+                    lrwd: asset.remove("lrwd").unwrap().remove(0),
+                    wd: asset.remove("wd").unwrap().remove(0),
                 },
-                wm: poster.wm.clone(),
-                lrwd: asset.remove("lrwd").unwrap().remove(0),
-                wd: asset.remove("wd").unwrap().remove(0),
-            }, None, false));
+                None,
+                false,
+            ));
         }
 
-        if let Err(e) = container.perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone).await {
+        if let Err(e) = container
+            .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
+            .await
+        {
             if let Some((record, _)) = self.get_my_record().await? {
                 self.delete_my_record(&record.record_id).await?;
-                container.perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone).await?;
+                container
+                    .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
+                    .await?;
             } else {
                 return Err(e);
             }
@@ -418,46 +551,73 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
         *existing = Some(ShareProfileMessage {
             cloud_kit_record_key: record_id,
             cloud_kit_decryption_record_key: key.to_vec(),
-            poster: record.poster.map(|p| p.share_meta)
+            poster: record.poster.map(|p| p.share_meta),
         });
         Ok(())
     }
 
     async fn delete_my_record(&self, record_id: &str) -> Result<(), PushError> {
         let session = CloudKitSession::new();
-        self.get_container().await?.perform(&session, DeleteRecordOperation::new(record_identifier_public(&record_id))).await?;
+        self.get_container()
+            .await?
+            .perform(
+                &session,
+                DeleteRecordOperation::new(record_identifier_public(&record_id)),
+            )
+            .await?;
         Ok(())
     }
 
-    async fn get_my_record(&self) -> Result<Option<(QueryResult<IMessageRawNicknameRecord>, Vec<AssetGetResponse>)>, PushError> {
+    async fn get_my_record(
+        &self,
+    ) -> Result<
+        Option<(
+            QueryResult<IMessageRawNicknameRecord>,
+            Vec<AssetGetResponse>,
+        )>,
+        PushError,
+    > {
         let container = self.get_container().await?;
         let session = CloudKitSession::new();
-        let (mut results, assets) = container.perform(&session, QueryRecordOperation::new(
-            &ALL_ASSETS,
-            public_zone(),
-            cloudkit_proto::Query {
-                types: vec![record::Type { name: Some(IMessageRawNicknameRecord::record_type().to_string()) }],
-                filters: vec![
-                    cloudkit_proto::query::Filter {
-                        field_name: Some(cloudkit_proto::record::field::Identifier {
-                            name: Some("___createdBy".to_string())
-                        }),
-                        field_value: Some(cloudkit_proto::record::Reference {
-                            r#type: None,
-                            record_identifier: Some(record_identifier_public(&container.user_id))
-                        }.to_value().unwrap()),
-                        bounds: None,
-                        r#type: Some(cloudkit_proto::query::filter::Type::Equals as i32),
-                    }
-                ],
-                sorts: vec![],
-                distinct: None,
-                query_operator: None,
-            }
-        )).await?;
-    
+        let (mut results, assets) = container
+            .perform(
+                &session,
+                QueryRecordOperation::new(
+                    &ALL_ASSETS,
+                    public_zone(),
+                    cloudkit_proto::Query {
+                        types: vec![record::Type {
+                            name: Some(IMessageRawNicknameRecord::record_type().to_string()),
+                        }],
+                        filters: vec![cloudkit_proto::query::Filter {
+                            field_name: Some(cloudkit_proto::record::field::Identifier {
+                                name: Some("___createdBy".to_string()),
+                            }),
+                            field_value: Some(
+                                cloudkit_proto::record::Reference {
+                                    r#type: None,
+                                    record_identifier: Some(record_identifier_public(
+                                        &container.user_id,
+                                    )),
+                                }
+                                .to_value()
+                                .unwrap(),
+                            ),
+                            bounds: None,
+                            r#type: Some(cloudkit_proto::query::filter::Type::Equals as i32),
+                        }],
+                        sorts: vec![],
+                        distinct: None,
+                        query_operator: None,
+                    },
+                ),
+            )
+            .await?;
+
         Ok(if !results.is_empty() {
             Some((results.remove(0), assets))
-        } else { None })
+        } else {
+            None
+        })
     }
 }

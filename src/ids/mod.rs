@@ -1,14 +1,27 @@
-use std::{fmt::Debug, ops::{Deref, DerefMut}};
+use std::{
+    fmt::Debug,
+    ops::{Deref, DerefMut},
+};
 
-use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, sign::{Signer, Verifier}};
+use crate::{
+    util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip},
+    PushError,
+};
+use num_bigint::{BigInt, Sign};
+use openssl::{
+    bn::{BigNum, BigNumContext},
+    ec::{EcGroup, EcKey, EcPoint},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{HasPublic, PKey, Private, Public},
+    sign::{Signer, Verifier},
+};
 use plist::Value;
 use rasn::{types::Integer, AsnType, Decode, Encode};
 use serde::{de::DeserializeOwned, Deserialize};
-use crate::{util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, PushError};
-use num_bigint::{BigInt, Sign};
 
-pub mod user;
 pub mod identity_manager;
+pub mod user;
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
@@ -26,7 +39,9 @@ impl MessageBody {
     }
 
     pub fn bytes(self) -> Result<Vec<u8>, PushError> {
-        let Self::Bytes(bytes) = self else { return Err(PushError::BadMsg) };
+        let Self::Bytes(bytes) = self else {
+            return Err(PushError::BadMsg);
+        };
         Ok(bytes)
     }
 }
@@ -98,7 +113,6 @@ pub struct CertifiedContext {
     pub uuid: Vec<u8>,
     pub token: Vec<u8>,
 }
-
 
 pub mod idsp {
     include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
