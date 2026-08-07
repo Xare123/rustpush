@@ -1806,7 +1806,17 @@ impl FTClient {
                     })
                 }
                 _type => {
-                    warn!("Couldn't handle message type {_type:?}");
+                    // `r#type()` is prost's accessor, which maps any wire value
+                    // outside ConversationMessageType back to the default
+                    // variant. That makes every unrecognised type log
+                    // identically as `Unknown` and discards the one piece of
+                    // information needed to identify it. 17, 18 and everything
+                    // above 30 are absent from the enum, so a real type Apple
+                    // sends is indistinguishable here from a genuine zero.
+                    warn!(
+                        "Couldn't handle message type {_type:?} (wire value {})",
+                        decoded.r#type
+                    );
                     None
                 }
             }
