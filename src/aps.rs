@@ -2101,8 +2101,6 @@ impl APSConnectionResource {
         let my_id = id.unwrap_or_else(|| new_aps_id());
         // Subscribe before writing. APNs can acknowledge a small payload before
         // a receiver created after `send` is attached to the broadcast channel.
-        // Missing that ACK turns a successful send into a 15-second timeout and
-        // an unnecessary connection reload.
         let receiver = self.subscribe().await;
         self.send(APSMessage::Notification {
             id: my_id,
@@ -2169,18 +2167,21 @@ impl APSConnectionResource {
         Err(PushError::SendTimedOut)
     }
 
-    async fn get_manager(&self) -> APSConnection {
+    async fn get_manager(&self) -> Option<APSConnection> {
         self.manager
             .lock()
             .await
             .as_ref()
-            .unwrap()
-            .upgrade()
-            .unwrap()
+            .and_then(|manager| manager.upgrade())
     }
 
     async fn do_reload(&self) {
-        self.get_manager().await.request_update().await;
+        // Initial connection setup happens before ResourceManager is attached.
+        // In that phase the caller already owns generation and should surface
+        // the connection error normally.
+        if let Some(manager) = self.get_manager().await {
+            manager.request_update_now().await;
+        }
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {
