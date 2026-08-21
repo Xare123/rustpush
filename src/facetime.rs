@@ -49,6 +49,18 @@ pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
 }
 
+const FACETIME_VIDEO_AV_MODE: i32 = 2;
+
+fn configure_video_invitation(
+    message: &mut ConversationMessage,
+    context: &mut ConversationParticipantDidJoinContext,
+) {
+    message.av_mode = Some(FACETIME_VIDEO_AV_MODE);
+    context.video = Some(true);
+    context.video_enabled = Some(true);
+    context.av_mode = Some(FACETIME_VIDEO_AV_MODE as u32);
+}
+
 pub const FACETIME_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.facetime.multi",
     sub_services: &[],
@@ -1091,15 +1103,12 @@ impl FTClient {
                             },
                         ];
 
+                        configure_video_invitation(&mut message, &mut update_context);
                         update_context.message = Some(message);
                         update_context.is_moments_available = true;
                         update_context.provider_identifier =
                             "com.apple.telephonyutilities.callservicesd.FaceTimeProvider"
                                 .to_string();
-                        // maybe make these optional/forced
-                        update_context.video = Some(true);
-                        update_context.video_enabled = Some(false);
-
                         update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
                         update_context.is_u_plus_n_downgrade_available = Some(false);
                         update_context.is_u_plus_one_av_less_available = Some(false);
@@ -2065,5 +2074,23 @@ impl FTClient {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_video_invitation_sets_consistent_av_metadata() {
+        let mut message = ConversationMessage::default();
+        let mut context = ConversationParticipantDidJoinContext::default();
+
+        configure_video_invitation(&mut message, &mut context);
+
+        assert_eq!(message.av_mode, Some(FACETIME_VIDEO_AV_MODE));
+        assert_eq!(context.video, Some(true));
+        assert_eq!(context.video_enabled, Some(true));
+        assert_eq!(context.av_mode, Some(FACETIME_VIDEO_AV_MODE as u32));
     }
 }
