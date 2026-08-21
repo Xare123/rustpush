@@ -39,8 +39,8 @@ use crate::{
     },
     util::{
         base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact,
-        ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt,
-        CompactECKey, DebugMutex, DebugRwLock,
+        ec_serialize_priv, plist_to_bin, proto_deserialize_opt, proto_serialize_opt, CompactECKey,
+        DebugMutex, DebugRwLock,
     },
     APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError,
 };
@@ -138,6 +138,21 @@ fn handle_to_ids(handle: &Handle) -> String {
         HandleType::PhoneNumber => format!("tel:{}", handle.value),
         HandleType::None => "NONETYPEHANDLE".to_string(),
     }
+}
+
+fn canonicalize_ids_handle(handle: &str) -> String {
+    if handle.starts_with("mailto:") || handle.starts_with("tel:") || handle.starts_with("temp:") {
+        return handle.to_owned();
+    }
+    if handle.contains('@') {
+        return format!("mailto:{handle}");
+    }
+    if handle.starts_with('+')
+        || (!handle.is_empty() && handle.chars().all(|character| character.is_ascii_digit()))
+    {
+        return format!("tel:{handle}");
+    }
+    handle.to_owned()
 }
 
 const NONCE_COUNT: usize = 12;
@@ -276,6 +291,13 @@ impl FTSession {
     fn unpack_members(&mut self, members: &[ConversationMember]) -> Vec<FTMember> {
         self.prune_recent_members();
 
+        // Apple can send a partial participant-state update with no member
+        // snapshot. A missing/empty snapshot is not proof that every member
+        // left; explicit RemoveMember and command 208 events own removal.
+        if members.is_empty() {
+            return Vec::new();
+        }
+
         let stand_up_for = self
             .members
             .iter()
@@ -288,12 +310,9 @@ impl FTSession {
             .cloned()
             .collect::<Vec<_>>();
 
-        // don't remove members that were recently added
-        self.members.retain(|a| stand_up_for.contains(a));
+        // Participant-state payloads can be partial subsets. Merge what was
+        // observed and let typed RemoveMember messages own member deletion.
         self.new_members(&members);
-        // remove extraneous participants
-        self.participants
-            .retain(|a, p| self.members.iter().any(|member| member.handle == p.handle));
         stand_up_for
     }
 
@@ -339,9 +358,13 @@ impl FTSession {
     }
 
     fn unpack_participants(&mut self, participants: &[ConversationParticipant], token: &[u8]) {
-        for participant in self.participants.values_mut() {
-            participant.active = None;
+        // An empty partial snapshot is not a definitive all-participants-left
+        // signal. Command 208 is the authoritative participant leave event.
+        if participants.is_empty() {
+            return;
         }
+        // A non-empty participant list may still be a partial subset. Merge
+        // listed participants and let command 208 own active-state removal.
         for participant in participants {
             let ftparticipant = self
                 .participants
@@ -355,6 +378,153 @@ impl FTSession {
             }
         }
     }
+
+    fn apply_participant_join(
+        &mut self,
+        participant: ParticipantID,
+        token: &[u8],
+        sender: &str,
+        avc_data: Vec<u8>,
+        context: &ConversationParticipantDidJoinContext,
+        joined_ms: u64,
+    ) -> ConversationMessageType {
+        let message = context.message.as_ref();
+        let message_type = apply_conversation_message_metadata(self, message);
+
+        self.is_ringing_inaccurate = message_type == ConversationMessageType::Invitation;
+        self.unpack_members(&context.members);
+        let sender = canonicalize_ids_handle(sender);
+        self.participants.insert(
+            participant.to_string(),
+            FTParticipant {
+                token: Some(base64_encode(token)),
+                participant_id: participant.into(),
+                last_join_date: Some(joined_ms),
+                handle: sender.clone(),
+                active: Some(ConversationParticipant {
+                    version: context.version,
+                    identifier: participant.into(),
+                    handle: Some(handle_from_ids(&sender)),
+                    avc_data,
+                    is_moments_available: Some(context.is_moments_available),
+                    is_screen_sharing_available: Some(context.is_screen_sharing_available),
+                    is_gondola_calling_available: Some(context.is_gondola_calling_available),
+                    is_mirage_available: Some(context.is_mirage_available),
+                    is_lightweight: Some(context.is_lightweight),
+                    share_play_protocol_version: context.share_play_protocol_version,
+                    options: 0,
+                    is_gft_downgrade_to_one_to_one_available: context
+                        .is_gft_downgrade_to_one_to_one_available,
+                    guest_mode_enabled: message.map(|value| value.guest_mode_enabled),
+                    association: context.participant_association.clone(),
+                    is_u_plus_n_downgrade_available: context.is_u_plus_n_downgrade_available,
+                }),
+            },
+        );
+
+        message_type
+    }
+
+    fn apply_participant_join_wire(
+        &mut self,
+        participant: ParticipantID,
+        token: &[u8],
+        sender: &str,
+        avc_data: Option<Data>,
+        context: Option<Data>,
+        joined_ms: u64,
+    ) -> Result<Option<ParticipantJoinOutcome>, PushError> {
+        let Some(context) = context else {
+            return Ok(None);
+        };
+        let decoded_context =
+            ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
+        let nested_message = decoded_context.message.is_some();
+        let message_type = self.apply_participant_join(
+            participant,
+            token,
+            sender,
+            avc_data.map_or_else(Vec::new, Into::into),
+            &decoded_context,
+            joined_ms,
+        );
+        Ok(Some(ParticipantJoinOutcome {
+            message_type,
+            nested_message,
+        }))
+    }
+
+    fn resolve_participant_leave_id(
+        &self,
+        announced: ParticipantID,
+        uri_map: Option<&HashMap<String, Vec<ParticipantID>>>,
+    ) -> ParticipantID {
+        if self.participants.contains_key(&announced.to_string()) {
+            return announced;
+        }
+        let Some((handle, _)) = uri_map.and_then(|map| {
+            map.iter().find(|(_, ids)| {
+                ids.iter()
+                    .any(|candidate| candidate.to_string() == announced.to_string())
+            })
+        }) else {
+            return announced;
+        };
+        let canonical_handle = canonicalize_ids_handle(handle);
+        self.participants
+            .values()
+            .find(|participant| participant.handle == canonical_handle)
+            .map(|participant| ParticipantID::Unsigned(participant.participant_id))
+            .unwrap_or(announced)
+    }
+
+    fn apply_participant_leave(
+        &mut self,
+        participant: ParticipantID,
+        event_ms: u64,
+    ) -> ParticipantLeaveOutcome {
+        let key = participant.to_string();
+        let Some(current) = self.participants.get_mut(&key) else {
+            return ParticipantLeaveOutcome::Unknown;
+        };
+        if current
+            .last_join_date
+            .is_some_and(|last_join_date| event_ms < last_join_date)
+        {
+            return ParticipantLeaveOutcome::Stale;
+        }
+
+        current.active = None;
+        let handle = current.handle.clone();
+        if handle.starts_with("temp:") {
+            self.members.retain(|member| member.handle != handle);
+            self.participants.remove(&key);
+        }
+
+        ParticipantLeaveOutcome::Applied {
+            handle,
+            no_active_participants: self
+                .participants
+                .values()
+                .all(|participant| participant.active.is_none()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParticipantLeaveOutcome {
+    Unknown,
+    Stale,
+    Applied {
+        handle: String,
+        no_active_participants: bool,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParticipantJoinOutcome {
+    message_type: ConversationMessageType,
+    nested_message: bool,
 }
 
 const UNIX_TO_2001: Duration = Duration::from_millis(978307200000);
@@ -364,6 +534,14 @@ const UNIX_TO_2001: Duration = Duration::from_millis(978307200000);
 enum ParticipantID {
     Signed(i64),
     Unsigned(u64),
+}
+impl ParticipantID {
+    fn encoding(self) -> &'static str {
+        match self {
+            Self::Signed(_) => "signed",
+            Self::Unsigned(_) => "unsigned",
+        }
+    }
 }
 impl Into<u64> for ParticipantID {
     fn into(self) -> u64 {
@@ -1485,7 +1663,10 @@ impl FTClient {
             .decrypt(Nonce::from_slice(nonce), body)
             .map_err(|_| PushError::AESGCMError)?;
 
-        info!("Decrypted {}", encode_hex(&decrypted));
+        info!(
+            "Decrypted FaceTime admission request bytes={}",
+            decrypted.len()
+        );
         let decoded = ConversationMessage::decode(&mut Cursor::new(&decrypted))?;
 
         let mut request = LetMeInRequest {
@@ -1739,9 +1920,13 @@ impl FTClient {
         Ok(if command == 242 {
             // NiceData
             let bytes = message.bytes()?;
-            debug!("Facetime IDS message came in as {}", encode_hex(&bytes));
+            debug!("FaceTime IDS conversation message bytes={}", bytes.len());
             let decoded = ConversationMessage::decode(&mut Cursor::new(&bytes))?;
-            debug!("Decoded {:#?}", decoded);
+            debug!(
+                "Decoded FaceTime conversation message type={} active_participants={}",
+                decoded.r#type,
+                decoded.active_participants.len(),
+            );
 
             match decoded.r#type() {
                 ConversationMessageType::LinkChanged | ConversationMessageType::LinkCreated => {
@@ -1852,7 +2037,6 @@ impl FTClient {
             }
         } else {
             let received: Value = message.plist()?;
-            info!("recieved {:?}", received);
             let mut received: FTWireMessage = plist::from_value(&received)?;
             let mut state = self.state.write().await;
             let session = state.sessions.entry(received.session.clone()).or_default();
@@ -1865,8 +2049,8 @@ impl FTClient {
             match (command, context, participant_meta, &received) {
                 (
                     207,
-                    Some(context),
-                    Some(avc_data),
+                    context,
+                    avc_data,
                     FTWireMessage {
                         participant_id_key: Some(participant),
                         ..
@@ -1874,68 +2058,66 @@ impl FTClient {
                 ) => {
                     info!("Someone joined!");
                     let participant = *participant;
-                    let decoded_context =
-                        ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
-                    let message = decoded_context.message.as_ref();
-                    if message.is_none() {
+                    let participant_key = participant.to_string();
+                    let known_before = session.participants.contains_key(&participant_key);
+                    let context_present = context.is_some();
+                    let avc_data_present = avc_data.is_some();
+                    let canonical_sender = canonicalize_ids_handle(&sender);
+                    let Some(join) = session.apply_participant_join_wire(
+                        participant,
+                        &token,
+                        &canonical_sender,
+                        avc_data,
+                        context,
+                        ns_since_epoch / 1000000,
+                    )?
+                    else {
+                        warn!(
+                            "FaceTime signal command=207 outcome=ignored_missing_context id_encoding={} avc_data={} participants={} active={}",
+                            participant.encoding(),
+                            avc_data_present,
+                            session.participants.len(),
+                            session
+                                .participants
+                                .values()
+                                .filter(|participant| participant.active.is_some())
+                                .count(),
+                        );
+                        return Ok(None);
+                    };
+                    let message_type = join.message_type;
+                    if !join.nested_message {
                         // Apple may omit the nested ConversationMessage from a
                         // participant-state update. The participant and AVC
                         // metadata are still usable, so do not discard the
                         // entire join event.
                         warn!("FaceTime command 207 omitted conversation metadata");
                     }
-                    let message_type = apply_conversation_message_metadata(session, message);
-
-                    session.is_ringing_inaccurate =
-                        message_type == ConversationMessageType::Invitation;
-
-                    session.unpack_members(&decoded_context.members);
-                    // warn active_participants IS EMPTY HERE
-
-                    session.participants.insert(
-                        participant.to_string(),
-                        FTParticipant {
-                            token: Some(base64_encode(&token)),
-                            participant_id: participant.into(),
-                            last_join_date: Some(ns_since_epoch / 1000000),
-                            handle: sender.clone(),
-                            active: Some(ConversationParticipant {
-                                version: decoded_context.version,
-                                identifier: participant.into(),
-                                handle: Some(handle_from_ids(&sender)),
-                                avc_data: avc_data.into(),
-                                is_moments_available: Some(decoded_context.is_moments_available),
-                                is_screen_sharing_available: Some(
-                                    decoded_context.is_screen_sharing_available,
-                                ),
-                                is_gondola_calling_available: Some(
-                                    decoded_context.is_gondola_calling_available,
-                                ),
-                                is_mirage_available: Some(decoded_context.is_mirage_available),
-                                is_lightweight: Some(decoded_context.is_lightweight),
-                                share_play_protocol_version: decoded_context
-                                    .share_play_protocol_version,
-                                // options: 1,
-                                options: 0, // default (missing)
-                                is_gft_downgrade_to_one_to_one_available: decoded_context
-                                    .is_gft_downgrade_to_one_to_one_available,
-                                guest_mode_enabled: message.map(|value| value.guest_mode_enabled),
-                                association: decoded_context.participant_association.clone(),
-                                is_u_plus_n_downgrade_available: decoded_context
-                                    .is_u_plus_n_downgrade_available,
-                            }),
-                        },
+                    warn!(
+                        "FaceTime signal command=207 id_encoding={} known_before={} known_after=true context={} avc_data={} nested_message={} message_type={} participants={} active={}",
+                        participant.encoding(),
+                        known_before,
+                        context_present,
+                        avc_data_present,
+                        join.nested_message,
+                        message_type as i32,
+                        session.participants.len(),
+                        session
+                            .participants
+                            .values()
+                            .filter(|participant| participant.active.is_some())
+                            .count(),
                     );
 
                     // if we propped it up for a join, someone else (or us) have joined
                     // so we don't need to prop it anymore
                     // make sure web client to not hang up on people who are picking up for us
-                    if session.is_propped && sender.starts_with("temp:") {
+                    if session.is_propped && canonical_sender.starts_with("temp:") {
                         self.unprop_conv(session).await?;
                     }
 
                     if message_type == ConversationMessageType::Invitation {
-                        if sender != target {
+                        if canonical_sender != canonicalize_ids_handle(&target) {
                             session.mode = Some(FTMode::Incoming)
                         } else {
                             session.mode = Some(FTMode::Outgoing)
@@ -1945,16 +2127,15 @@ impl FTClient {
                     let guid = session.group_id.clone();
                     (self.update_state)(&state);
 
-                    info!("Context {:#?} {:#?}", decoded_context, received);
                     Some(FTMessage::JoinEvent {
                         guid,
                         participant: participant.into(),
-                        handle: sender.clone(),
+                        handle: canonical_sender.clone(),
                         ring: message_type == ConversationMessageType::Invitation
-                            && sender != target,
+                            && canonical_sender != canonicalize_ids_handle(&target),
                     })
                 }
-                (209, Some(context), meta, _) => {
+                (209, Some(context), _meta, _) => {
                     info!("Group Updated!");
                     let decoded_context = ConversationParticipantDidJoinContext::decode(
                         &mut Cursor::new(context.as_ref()),
@@ -1976,6 +2157,18 @@ impl FTClient {
                             &self.conn.get_token().await,
                         );
                     }
+                    warn!(
+                        "FaceTime signal command=209 nested_message={} message_type={} snapshot_participants={} participants={} active={}",
+                        message.is_some(),
+                        message_type as i32,
+                        message.map_or(0, |value| value.active_participants.len()),
+                        session.participants.len(),
+                        session
+                            .participants
+                            .values()
+                            .filter(|participant| participant.active.is_some())
+                            .count(),
+                    );
                     let result: Option<FTMessage> = match (message_type, message) {
                         (ConversationMessageType::AddMember, Some(message)) => {
                             info!("Added a member!");
@@ -2014,12 +2207,6 @@ impl FTClient {
                     };
                     (self.update_state)(&state);
 
-                    info!(
-                        "Context {:#?} {:?} {:#?}",
-                        decoded_context,
-                        meta.map(|a| encode_hex(a.as_ref())),
-                        received
-                    );
                     result
                 }
                 (210, _, _, _) => {
@@ -2030,42 +2217,61 @@ impl FTClient {
                 }
                 (
                     208,
-                    a,
-                    b,
+                    _a,
+                    _b,
                     FTWireMessage {
                         participant_id_key: Some(participant),
+                        uri_to_participant_id_key: participant_map,
                         ..
                     },
                 ) => {
-                    let id = *participant;
+                    let announced_id = *participant;
+                    let id = session
+                        .resolve_participant_leave_id(announced_id, participant_map.as_ref());
+                    let fallback_used = id.to_string() != announced_id.to_string();
                     info!("Group member left!");
-                    let Some(participant) = session.participants.get_mut(&id.to_string()) else {
-                        // Leave notifications can race a reconnect or a newer
-                        // participant snapshot. An unknown stale participant is
-                        // not grounds to reject the complete APS message.
-                        warn!("Ignoring FaceTime leave for an unknown participant");
-                        return Ok(None);
-                    };
-                    if let Some(last_join_date) = participant.last_join_date {
-                        if (ns_since_epoch / 1000000) < last_join_date {
-                            // ignore if we've joined sent
+                    let leave = session.apply_participant_leave(id, ns_since_epoch / 1000000);
+                    let (handle_left, no_active_participants) = match leave {
+                        ParticipantLeaveOutcome::Unknown => {
+                            warn!(
+                                "FaceTime signal command=208 outcome=unknown id_encoding={} fallback_used={} participants={} active={}",
+                                id.encoding(),
+                                fallback_used,
+                                session.participants.len(),
+                                session
+                                    .participants
+                                    .values()
+                                    .filter(|participant| participant.active.is_some())
+                                    .count(),
+                            );
                             return Ok(None);
                         }
-                    }
-                    participant.active = None;
-                    let handle_left = participant.handle.clone();
-
-                    if handle_left.starts_with("temp:") {
-                        // remove us from the group list too cause we can't join back
-                        session.members.retain(|a| a.handle != handle_left);
-                        session.participants.remove(&id.to_string());
-                    }
+                        ParticipantLeaveOutcome::Stale => {
+                            warn!(
+                                "FaceTime signal command=208 outcome=stale id_encoding={} fallback_used={} participants={} active={}",
+                                id.encoding(),
+                                fallback_used,
+                                session.participants.len(),
+                                session
+                                    .participants
+                                    .values()
+                                    .filter(|participant| participant.active.is_some())
+                                    .count(),
+                            );
+                            return Ok(None);
+                        }
+                        ParticipantLeaveOutcome::Applied {
+                            handle,
+                            no_active_participants,
+                        } => (handle, no_active_participants),
+                    };
 
                     let guid = session.group_id.clone();
 
-                    if session.participants.values().all(|a| a.active.is_none()) {
+                    if no_active_participants {
                         if session.is_ringing_inaccurate {
-                            if sender == target {
+                            if canonicalize_ids_handle(&sender) == canonicalize_ids_handle(&target)
+                            {
                                 session.mode = Some(FTMode::MissedOutgoing);
                             } else {
                                 session.mode = Some(FTMode::Missed);
@@ -2073,19 +2279,58 @@ impl FTClient {
                         }
                         session.is_ringing_inaccurate = false;
                     }
+                    warn!(
+                        "FaceTime signal command=208 outcome=applied id_encoding={} fallback_used={} participants={} active={}",
+                        id.encoding(),
+                        fallback_used,
+                        session.participants.len(),
+                        session
+                            .participants
+                            .values()
+                            .filter(|participant| participant.active.is_some())
+                            .count(),
+                    );
                     (self.update_state)(&state);
-                    info!("Context {:#?} {:?} {:#?}", a, b, received);
                     Some(FTMessage::LeaveEvent {
                         guid,
                         participant: id.into(),
                         handle: handle_left,
                     })
                 }
+                (207, context, avc_data, _) => {
+                    warn!(
+                        "FaceTime signal command=207 outcome=ignored_missing_participant_id context={} avc_data={} participants={} active={}",
+                        context.is_some(),
+                        avc_data.is_some(),
+                        session.participants.len(),
+                        session
+                            .participants
+                            .values()
+                            .filter(|participant| participant.active.is_some())
+                            .count(),
+                    );
+                    None
+                }
+                (209, None, _, _) => {
+                    warn!(
+                        "FaceTime signal command=209 outcome=ignored_missing_context participants={} active={}",
+                        session.participants.len(),
+                        session
+                            .participants
+                            .values()
+                            .filter(|participant| participant.active.is_some())
+                            .count(),
+                    );
+                    None
+                }
                 (_c, a, b, _) => {
                     info!(
-                        "Received unknown command {_c} {} \n {} {received:#?}",
-                        encode_hex(a.unwrap_or(Data::new(vec![])).as_ref()),
-                        encode_hex(b.unwrap_or(Data::new(vec![])).as_ref())
+                        "Received unknown FaceTime command={} context_bytes={} avc_bytes={} participant_id={} members={}",
+                        _c,
+                        a.as_ref().map_or(0, |data| data.as_ref().len()),
+                        b.as_ref().map_or(0, |data| data.as_ref().len()),
+                        received.participant_id_key.is_some(),
+                        received.fanout_groupmembers.as_ref().map_or(0, Vec::len),
                     );
                     None
                 }
@@ -2141,6 +2386,365 @@ mod tests {
         assert_eq!(
             ConversationMessageType::try_from(37),
             Ok(ConversationMessageType::SharePlayAvailable)
+        );
+    }
+
+    fn context_with_message(
+        message_type: ConversationMessageType,
+    ) -> ConversationParticipantDidJoinContext {
+        let mut message = ConversationMessage::default();
+        message.set_type(message_type);
+        ConversationParticipantDidJoinContext {
+            version: 1,
+            message: Some(message),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn participant_ids_normalize_across_signed_and_unsigned_plists() {
+        assert_eq!(
+            ParticipantID::Signed(-1).to_string(),
+            ParticipantID::Unsigned(u64::MAX).to_string(),
+        );
+        assert_eq!(
+            ParticipantID::Signed(42).to_string(),
+            ParticipantID::Unsigned(42).to_string(),
+        );
+    }
+
+    #[test]
+    fn replays_join_snapshot_and_leave_without_orphaning_participant() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        let token = [7_u8; 32];
+
+        let message_type = session.apply_participant_join(
+            ParticipantID::Unsigned(42),
+            &token,
+            "mailto:guest@example.invalid",
+            vec![1, 2, 3],
+            &context,
+            1_000,
+        );
+        assert_eq!(message_type, ConversationMessageType::Invitation);
+        assert!(session.participants["42"].active.is_some());
+
+        let snapshot = session.participants["42"].active.clone().unwrap();
+        session.unpack_participants(&[snapshot], &[9_u8; 32]);
+        assert!(session.participants["42"].active.is_some());
+
+        assert_eq!(
+            session.apply_participant_leave(ParticipantID::Signed(42), 1_001),
+            ParticipantLeaveOutcome::Applied {
+                handle: "mailto:guest@example.invalid".to_string(),
+                no_active_participants: true,
+            },
+        );
+        assert!(session.participants["42"].active.is_none());
+    }
+
+    #[test]
+    fn join_context_without_nested_message_still_establishes_participant() {
+        let mut session = FTSession::default();
+        let context = ConversationParticipantDidJoinContext::default();
+
+        let message_type = session.apply_participant_join(
+            ParticipantID::Unsigned(7),
+            &[1_u8; 32],
+            "temp:guest",
+            vec![4, 5, 6],
+            &context,
+            500,
+        );
+
+        assert_eq!(message_type, ConversationMessageType::Unknown);
+        assert!(session.participants["7"].active.is_some());
+        assert_eq!(
+            session.apply_participant_leave(ParticipantID::Unsigned(7), 501),
+            ParticipantLeaveOutcome::Applied {
+                handle: "temp:guest".to_string(),
+                no_active_participants: true,
+            },
+        );
+        assert!(!session.participants.contains_key("7"));
+    }
+
+    #[test]
+    fn wire_join_requires_context_but_accepts_missing_avc_metadata() {
+        let mut session = FTSession::default();
+        let participant = ParticipantID::Unsigned(8);
+        let token = [2_u8; 32];
+
+        let ignored = session
+            .apply_participant_join_wire(
+                participant,
+                &token,
+                "guest@example.invalid",
+                None,
+                None,
+                500,
+            )
+            .expect("missing context should be handled without a decode failure");
+        assert!(ignored.is_none());
+        assert!(!session.participants.contains_key("8"));
+
+        let context = context_with_message(ConversationMessageType::Invitation);
+        let applied = session
+            .apply_participant_join_wire(
+                participant,
+                &token,
+                "guest@example.invalid",
+                None,
+                Some(context.encode_to_vec().into()),
+                501,
+            )
+            .expect("valid context should decode")
+            .expect("valid context should establish the participant");
+
+        assert_eq!(applied.message_type, ConversationMessageType::Invitation);
+        assert!(applied.nested_message);
+        assert_eq!(
+            session.participants["8"].handle,
+            "mailto:guest@example.invalid",
+        );
+        assert_eq!(
+            session.participants["8"]
+                .active
+                .as_ref()
+                .expect("participant should be active")
+                .avc_data,
+            Vec::<u8>::new(),
+        );
+    }
+
+    #[test]
+    fn stale_leave_after_rejoin_does_not_clear_active_participant() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(9),
+            &[2_u8; 32],
+            "mailto:guest@example.invalid",
+            vec![],
+            &context,
+            2_000,
+        );
+
+        assert_eq!(
+            session.apply_participant_leave(ParticipantID::Unsigned(9), 1_999),
+            ParticipantLeaveOutcome::Stale,
+        );
+        assert!(session.participants["9"].active.is_some());
+    }
+
+    #[test]
+    fn unknown_leave_does_not_corrupt_known_participants() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(11),
+            &[3_u8; 32],
+            "mailto:guest@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+
+        assert_eq!(
+            session.apply_participant_leave(ParticipantID::Unsigned(12), 101),
+            ParticipantLeaveOutcome::Unknown,
+        );
+        assert!(session.participants["11"].active.is_some());
+    }
+
+    #[test]
+    fn empty_partial_membership_snapshot_preserves_joined_participant() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(13),
+            &[4_u8; 32],
+            "mailto:guest@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+
+        let stood_up = session.unpack_members(&[]);
+
+        assert!(stood_up.is_empty());
+        assert!(session.participants.contains_key("13"));
+        assert!(session.participants["13"].active.is_some());
+    }
+
+    #[test]
+    fn empty_partial_active_snapshot_does_not_end_call() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(14),
+            &[5_u8; 32],
+            "mailto:guest@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+
+        session.unpack_participants(&[], &[6_u8; 32]);
+
+        assert!(session.participants["14"].active.is_some());
+    }
+
+    #[test]
+    fn nonempty_partial_snapshots_preserve_omitted_member_and_participant() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        let first_member = FTMember {
+            nickname: None,
+            handle: "mailto:first@example.invalid".to_string(),
+        }
+        .to_conversation();
+        let second_member = FTMember {
+            nickname: None,
+            handle: "mailto:second@example.invalid".to_string(),
+        }
+        .to_conversation();
+        session.new_members(&[first_member.clone(), second_member]);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(21),
+            &[1_u8; 32],
+            "first@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+        session.apply_participant_join(
+            ParticipantID::Unsigned(22),
+            &[2_u8; 32],
+            "second@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+
+        session.unpack_members(&[first_member]);
+        let first_participant = session.participants["21"].active.clone().unwrap();
+        session.unpack_participants(&[first_participant], &[9_u8; 32]);
+
+        assert!(session
+            .members
+            .iter()
+            .any(|member| member.handle == "mailto:second@example.invalid"));
+        assert!(session.participants["21"].active.is_some());
+        assert!(session.participants["22"].active.is_some());
+    }
+
+    #[test]
+    fn unknown_leave_id_resolves_through_uri_participant_map() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+        session.apply_participant_join(
+            ParticipantID::Unsigned(42),
+            &[3_u8; 32],
+            "guest@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+        let uri_map = HashMap::from([(
+            "guest@example.invalid".to_string(),
+            vec![ParticipantID::Unsigned(99)],
+        )]);
+
+        let resolved =
+            session.resolve_participant_leave_id(ParticipantID::Unsigned(99), Some(&uri_map));
+
+        assert_eq!(resolved.to_string(), "42");
+        assert_eq!(
+            session.apply_participant_leave(resolved, 101),
+            ParticipantLeaveOutcome::Applied {
+                handle: "mailto:guest@example.invalid".to_string(),
+                no_active_participants: true,
+            },
+        );
+    }
+
+    #[test]
+    fn raw_email_sender_is_canonicalized_before_snapshot_cleanup() {
+        let mut session = FTSession::default();
+        let mut context = context_with_message(ConversationMessageType::Invitation);
+        context.members.push(
+            FTMember {
+                nickname: None,
+                handle: "mailto:guest@example.invalid".to_string(),
+            }
+            .to_conversation(),
+        );
+
+        session.apply_participant_join(
+            ParticipantID::Unsigned(15),
+            &[7_u8; 32],
+            "guest@example.invalid",
+            vec![],
+            &context,
+            100,
+        );
+        session.unpack_members(&context.members);
+
+        assert_eq!(
+            session.participants["15"].handle,
+            "mailto:guest@example.invalid",
+        );
+        assert!(session.participants.contains_key("15"));
+    }
+
+    #[test]
+    fn duplicate_join_replaces_same_participant_without_duplication() {
+        let mut session = FTSession::default();
+        let context = context_with_message(ConversationMessageType::Invitation);
+
+        for joined_ms in [100, 200] {
+            session.apply_participant_join(
+                ParticipantID::Unsigned(16),
+                &[8_u8; 32],
+                "mailto:guest@example.invalid",
+                vec![],
+                &context,
+                joined_ms,
+            );
+        }
+
+        assert_eq!(session.participants.len(), 1);
+        assert_eq!(session.participants["16"].last_join_date, Some(200));
+    }
+
+    #[test]
+    fn plist_round_trip_preserves_partial_join_and_signed_participant_id() {
+        let wire = FTWireMessage {
+            session: "fixture-session".to_string(),
+            prekey: None,
+            prekey_wrap_mode: None,
+            fanout_groupid: "fixture-session".to_string(),
+            client_context_data_key: None,
+            participant_data_key: None,
+            is_initiator_key: Some(false),
+            fanout_groupmembers: None,
+            is_u_plus_one_key: None,
+            join_notification_key: Some(1),
+            participant_id_key: Some(ParticipantID::Signed(-1)),
+            uri_to_participant_id_key: None,
+        };
+
+        let encoded = plist_to_bin(&wire).expect("fixture should serialize");
+        let decoded: FTWireMessage =
+            plist::from_bytes(&encoded).expect("fixture should deserialize");
+
+        assert!(decoded.client_context_data_key.is_none());
+        assert!(decoded.participant_data_key.is_none());
+        assert_eq!(
+            decoded.participant_id_key.unwrap().to_string(),
+            u64::MAX.to_string(),
         );
     }
 }
