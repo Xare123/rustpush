@@ -32,6 +32,13 @@ enum ConversationMessageType {
     GuestModeUpdated = 28;
     Endorse = 29;
     AddHighlight = 30;
+    RemoveHighlight = 31;
+    UpdateJoinedMetadata = 32;
+    ParticipantUpdated = 33;
+    RegisterMessagesGroupUUID = 34;
+    ScreenShareRequest = 35;
+    ScreenShareResponse = 36;
+    SharePlayAvailable = 37;
 }
 
 enum HandleType {

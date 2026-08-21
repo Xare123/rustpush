@@ -51,6 +51,27 @@ pub mod facetimep {
 
 const FACETIME_VIDEO_AV_MODE: i32 = 2;
 
+fn apply_conversation_message_metadata(
+    session: &mut FTSession,
+    message: Option<&ConversationMessage>,
+) -> ConversationMessageType {
+    let Some(message) = message else {
+        return ConversationMessageType::Unknown;
+    };
+
+    if let Some(link) = &message.link {
+        session.link = Some(link.clone());
+    }
+
+    if let Some(report) = &message.report_data {
+        session.report_id = report.conversation_id.clone();
+        session.start_time =
+            Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
+    }
+
+    message.r#type()
+}
+
 fn configure_video_invitation(
     message: &mut ConversationMessage,
     context: &mut ConversationParticipantDidJoinContext,
@@ -1855,22 +1876,18 @@ impl FTClient {
                     let participant = *participant;
                     let decoded_context =
                         ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
-                    let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
-
-                    if let Some(link) = &message.link {
-                        session.link = Some(link.clone());
+                    let message = decoded_context.message.as_ref();
+                    if message.is_none() {
+                        // Apple may omit the nested ConversationMessage from a
+                        // participant-state update. The participant and AVC
+                        // metadata are still usable, so do not discard the
+                        // entire join event.
+                        warn!("FaceTime command 207 omitted conversation metadata");
                     }
-
-                    if let Some(report) = &message.report_data {
-                        session.report_id = report.conversation_id.clone();
-                        session.start_time = Some(
-                            (UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis()
-                                as u64,
-                        );
-                    }
+                    let message_type = apply_conversation_message_metadata(session, message);
 
                     session.is_ringing_inaccurate =
-                        message.r#type() == ConversationMessageType::Invitation;
+                        message_type == ConversationMessageType::Invitation;
 
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
@@ -1902,7 +1919,7 @@ impl FTClient {
                                 options: 0, // default (missing)
                                 is_gft_downgrade_to_one_to_one_available: decoded_context
                                     .is_gft_downgrade_to_one_to_one_available,
-                                guest_mode_enabled: Some(message.guest_mode_enabled),
+                                guest_mode_enabled: message.map(|value| value.guest_mode_enabled),
                                 association: decoded_context.participant_association.clone(),
                                 is_u_plus_n_downgrade_available: decoded_context
                                     .is_u_plus_n_downgrade_available,
@@ -1917,7 +1934,7 @@ impl FTClient {
                         self.unprop_conv(session).await?;
                     }
 
-                    if message.r#type() == ConversationMessageType::Invitation {
+                    if message_type == ConversationMessageType::Invitation {
                         if sender != target {
                             session.mode = Some(FTMode::Incoming)
                         } else {
@@ -1933,7 +1950,7 @@ impl FTClient {
                         guid,
                         participant: participant.into(),
                         handle: sender.clone(),
-                        ring: message.r#type() == ConversationMessageType::Invitation
+                        ring: message_type == ConversationMessageType::Invitation
                             && sender != target,
                     })
                 }
@@ -1944,23 +1961,23 @@ impl FTClient {
                     )?;
                     let stand_up_for = session.unpack_members(&decoded_context.members);
 
-                    let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
-                    if let Some(link) = &message.link {
-                        session.link = Some(link.clone());
+                    let message = decoded_context.message.as_ref();
+                    if message.is_none() {
+                        // A membership snapshot without a nested message is a
+                        // valid partial update. Keep the member state and wait
+                        // for a later typed update instead of surfacing the
+                        // generic BadMsg error and losing the snapshot.
+                        warn!("FaceTime command 209 omitted conversation metadata");
                     }
-                    if let Some(report) = &message.report_data {
-                        session.report_id = report.conversation_id.clone();
-                        session.start_time = Some(
-                            (UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis()
-                                as u64,
+                    let message_type = apply_conversation_message_metadata(session, message);
+                    if let Some(message) = message {
+                        session.unpack_participants(
+                            &message.active_participants,
+                            &self.conn.get_token().await,
                         );
                     }
-                    session.unpack_participants(
-                        &message.active_participants,
-                        &self.conn.get_token().await,
-                    );
-                    let result: Option<FTMessage> = match message.r#type() {
-                        ConversationMessageType::AddMember => {
+                    let result: Option<FTMessage> = match (message_type, message) {
+                        (ConversationMessageType::AddMember, Some(message)) => {
                             info!("Added a member!");
                             let new = session.new_members(&message.added_members);
 
@@ -1986,7 +2003,7 @@ impl FTClient {
                                 ring,
                             })
                         }
-                        ConversationMessageType::RemoveMember => {
+                        (ConversationMessageType::RemoveMember, Some(message)) => {
                             info!("Removed a member!");
                             Some(FTMessage::RemoveMembers {
                                 guid: session.group_id.clone(),
@@ -2022,10 +2039,13 @@ impl FTClient {
                 ) => {
                     let id = *participant;
                     info!("Group member left!");
-                    let participant = session
-                        .participants
-                        .get_mut(&id.to_string())
-                        .ok_or(PushError::BadMsg)?;
+                    let Some(participant) = session.participants.get_mut(&id.to_string()) else {
+                        // Leave notifications can race a reconnect or a newer
+                        // participant snapshot. An unknown stale participant is
+                        // not grounds to reject the complete APS message.
+                        warn!("Ignoring FaceTime leave for an unknown participant");
+                        return Ok(None);
+                    };
                     if let Some(last_join_date) = participant.last_join_date {
                         if (ns_since_epoch / 1000000) < last_join_date {
                             // ignore if we've joined sent
@@ -2038,10 +2058,7 @@ impl FTClient {
                     if handle_left.starts_with("temp:") {
                         // remove us from the group list too cause we can't join back
                         session.members.retain(|a| a.handle != handle_left);
-                        session
-                            .participants
-                            .remove(&id.to_string())
-                            .ok_or(PushError::BadMsg)?;
+                        session.participants.remove(&id.to_string());
                     }
 
                     let guid = session.group_id.clone();
@@ -2100,5 +2117,30 @@ mod tests {
         assert_eq!(decoded.video, Some(true));
         assert_eq!(decoded.video_enabled, Some(true));
         assert_eq!(decoded.av_mode, Some(FACETIME_VIDEO_AV_MODE as u32));
+    }
+
+    #[test]
+    fn omitted_conversation_metadata_is_a_nonfatal_partial_update() {
+        let mut session = FTSession {
+            group_id: "test-session".to_string(),
+            report_id: "existing-report".to_string(),
+            start_time: Some(42),
+            ..Default::default()
+        };
+
+        let message_type = apply_conversation_message_metadata(&mut session, None);
+
+        assert_eq!(message_type, ConversationMessageType::Unknown);
+        assert_eq!(session.report_id, "existing-report");
+        assert_eq!(session.start_time, Some(42));
+        assert!(session.link.is_none());
+    }
+
+    #[test]
+    fn current_shareplay_wire_value_is_known() {
+        assert_eq!(
+            ConversationMessageType::try_from(37),
+            Ok(ConversationMessageType::SharePlayAvailable)
+        );
     }
 }
