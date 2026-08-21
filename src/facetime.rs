@@ -2087,10 +2087,18 @@ mod tests {
         let mut context = ConversationParticipantDidJoinContext::default();
 
         configure_video_invitation(&mut message, &mut context);
+        context.message = Some(message);
 
-        assert_eq!(message.av_mode, Some(FACETIME_VIDEO_AV_MODE));
-        assert_eq!(context.video, Some(true));
-        assert_eq!(context.video_enabled, Some(true));
-        assert_eq!(context.av_mode, Some(FACETIME_VIDEO_AV_MODE as u32));
+        let wire = context.encode_to_vec();
+        let decoded = ConversationParticipantDidJoinContext::decode(wire.as_slice())
+            .expect("video invitation context should round-trip through protobuf");
+        let decoded_message = decoded
+            .message
+            .expect("video invitation should carry a conversation message");
+
+        assert_eq!(decoded_message.av_mode, Some(FACETIME_VIDEO_AV_MODE));
+        assert_eq!(decoded.video, Some(true));
+        assert_eq!(decoded.video_enabled, Some(true));
+        assert_eq!(decoded.av_mode, Some(FACETIME_VIDEO_AV_MODE as u32));
     }
 }
