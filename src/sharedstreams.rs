@@ -767,7 +767,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
         let parsed: Vec<ResponseAsset> = plist::from_value(&response)?;
         if parsed.iter().any(|val| &val.success != "1") {
-            info!("delete failed for some asset {response:?}");
+            info!("Shared-stream delete failed for one or more assets");
             // return Err(PushError::SSFailed(response))
         }
 
@@ -971,8 +971,11 @@ where
         let (mut watcher, rx) = async_watcher().expect("Wather not created?");
 
         for item in states.values() {
-            if let Err(e) = watcher.watch(&item.folder, RecursiveMode::NonRecursive) {
-                warn!("Failed to watch folder! {e}");
+            if watcher
+                .watch(&item.folder, RecursiveMode::NonRecursive)
+                .is_err()
+            {
+                warn!("Failed to watch a shared-stream folder");
             }
         }
 
@@ -1038,8 +1041,11 @@ where
         debug!("af");
         // disable on android because it tends to stall indefinitiley
         #[cfg(not(target_os = "android"))]
-        if let Err(e) = lock_item.watch(&folder, RecursiveMode::NonRecursive) {
-            warn!("Failed to watch folder! {e}");
+        if lock_item
+            .watch(&folder, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            warn!("Failed to watch a shared-stream folder");
         }
         debug!("afd");
         self.manager().await.request_update().await;
@@ -1060,8 +1066,8 @@ where
         debug!("af");
         // disable on android because it tends to stall indefinitiley
         #[cfg(not(target_os = "android"))]
-        if let Err(e) = lock_item.unwatch(&state.folder) {
-            warn!("Failed to watch folder! {e}");
+        if lock_item.unwatch(&state.folder).is_err() {
+            warn!("Failed to unwatch a shared-stream folder");
         }
         debug!("ac");
         self.dirty_map.lock().await.remove(&guid);
@@ -1097,7 +1103,6 @@ where
         )
         .await
         {
-            println!("what {:?}", res);
             match res {
                 Ok(Event {
                     kind:
@@ -1114,7 +1119,7 @@ where
                         }) else {
                             continue;
                         };
-                        debug!("Marking path as dirty {:?}", state.folder);
+                        debug!("Marking shared-stream path as dirty");
                         self.mark_dirty(state.album_guid.clone()).await;
                         // if we're generating or failed we will already take care of it
                         if matches!(
@@ -1125,7 +1130,7 @@ where
                         }
                     }
                 }
-                Err(e) => error!("watch error: {:?}", e),
+                Err(_) => error!("Shared-stream filesystem watch failed"),
                 _ => {}
             }
         }
@@ -1291,7 +1296,7 @@ impl SyncState {
     ) -> Result<DeltaState, PushError> {
         let album_assets = client.get_album_summary(&self.album_guid).await?;
 
-        debug!("Computing deltas for folder {:?}", self.folder);
+        debug!("Computing shared-stream folder deltas");
         let mut local_assets = vec![];
         for item in std::fs::read_dir(&self.folder)? {
             local_assets.push(
@@ -1358,17 +1363,13 @@ impl SyncState {
 
         progress(SyncStatus::Syncing);
 
-        info!("Local removed assets {:?}", deltas.deleted_local);
-        info!("Remote deleted assets {:?}", deltas.deleted_remote);
         info!(
-            "Remote added assets {:?}",
-            deltas
-                .new_remote
-                .iter()
-                .map(|i| &i.assetguid)
-                .collect::<Vec<_>>()
+            "Shared-stream delta counts: local_removed={}, remote_removed={}, remote_added={}, local_added={}",
+            deltas.deleted_local.len(),
+            deltas.deleted_remote.len(),
+            deltas.new_remote.len(),
+            deltas.new_local.len(),
         );
-        info!("Local added assets {:?}", deltas.new_local);
 
         info!("Syncing remote deletions");
         // STEP 1. Sync deletions to iCloud
@@ -1387,14 +1388,13 @@ impl SyncState {
                 continue;
             };
             let path = self.folder.join(path);
-            info!("Deleting path {path:?}");
             if !std::fs::exists(&path)? {
                 continue;
             }
-            info!("Deleting file {path:?}");
+            info!("Deleting one shared-stream file");
             // for android because we can't delete photos we don't "own" (Scoped Storage)
-            if let Err(e) = std::fs::remove_file(path) {
-                warn!("Sync failed to delete file: {e}");
+            if std::fs::remove_file(path).is_err() {
+                warn!("Shared-stream sync failed to delete one local file");
             }
             self.asset_map.remove(deleted);
         }
@@ -1426,7 +1426,7 @@ impl SyncState {
                         warn!("Failed to create asset");
                         return Err(e.into());
                     }
-                    warn!("Failed to sync file, marking as synced {e}");
+                    warn!("Failed to sync one file, marking it as synced");
                     self.asset_map
                         .insert(asset.assetguid.clone(), asset.filename.clone());
                 }

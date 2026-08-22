@@ -100,6 +100,8 @@ const MESSAGES_CONTAINER: CloudKitContainer = CloudKitContainer {
     env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
 };
 
+const RAW_ONLY_RECORD_TYPE: &str = "__cloud_sync_raw_only__";
+
 bitflags! {
     #[derive(Debug, Clone, Copy, Default)]
     pub struct MessageFlags: i64 {
@@ -1287,6 +1289,61 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
         )
         .await
+    }
+
+    async fn sync_raw_only_records_page(
+        &self,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page(
+            zone,
+            RAW_ONLY_RECORD_TYPE,
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn sync_message_update_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page("messageUpdateZone", continuation_token, max_changes)
+            .await
+    }
+
+    pub async fn sync_recoverable_message_delete_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page(
+            "recoverableMessageDeleteZone",
+            continuation_token,
+            max_changes,
+        )
+        .await
+    }
+
+    pub async fn sync_scheduled_message_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page("scheduledMessageZone", continuation_token, max_changes)
+            .await
+    }
+
+    pub async fn sync_chat1_page(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page("chat1ManateeZone", continuation_token, max_changes)
+            .await
     }
 
     pub async fn save_attachments(

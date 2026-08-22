@@ -849,7 +849,7 @@ fn read_file<T: Read + Seek, R: DeserializeOwned>(
 ) -> Result<R, PushError> {
     let mut manifest = vec![];
     if let Err(_) = archive.by_name(path) {
-        warn!("Error reading file {path}");
+        warn!("Error reading poster archive entry");
     }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_bytes(&manifest)?)
@@ -861,7 +861,7 @@ fn read_archive<T: Read + Seek, R: DeserializeOwned>(
 ) -> Result<R, PushError> {
     let mut manifest = vec![];
     if let Err(_) = archive.by_name(path) {
-        warn!("Error reading file {path}");
+        warn!("Error reading poster archive entry");
     }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_value(&KeyedArchive::expand_root(&manifest)?)?)
