@@ -7,6 +7,7 @@ edition = "2021"
 remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]
+aps-proxy-test = []
 default = ["macos-validation-data"]
 
 [dependencies]

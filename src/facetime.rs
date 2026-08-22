@@ -509,6 +509,54 @@ enum DirectAdmissionClaim {
     Completed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DelegatedAdmissionClaim {
+    Start,
+    InFlight,
+    Completed,
+}
+
+fn claim_delegated_admission(
+    requests: &HashMap<String, LetMeInRequest>,
+    in_flight: &mut HashSet<String>,
+    delegation: &str,
+) -> DelegatedAdmissionClaim {
+    if !requests.contains_key(delegation) {
+        return DelegatedAdmissionClaim::Completed;
+    }
+    if !in_flight.insert(delegation.to_owned()) {
+        return DelegatedAdmissionClaim::InFlight;
+    }
+    DelegatedAdmissionClaim::Start
+}
+
+fn finish_delegated_admission(
+    requests: &mut HashMap<String, LetMeInRequest>,
+    in_flight: &mut HashSet<String>,
+    delegation: &str,
+    succeeded: bool,
+) {
+    in_flight.remove(delegation);
+    if succeeded {
+        requests.remove(delegation);
+    }
+}
+
+fn encrypted_letmein_parts(
+    encrypted: &EncryptedConversationMessage,
+) -> Result<([u8; 32], &[u8], &[u8]), PushError> {
+    let public_key = encrypted
+        .public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| PushError::BadMsg)?;
+    if encrypted.conversation_message_bytes.len() <= NONCE_COUNT {
+        return Err(PushError::BadMsg);
+    }
+    let (nonce, body) = encrypted.conversation_message_bytes.split_at(NONCE_COUNT);
+    Ok((public_key, nonce, body))
+}
+
 fn direct_admission_key(letmein: &LetMeInRequest, approved_group: Option<&str>) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for value in [
@@ -602,6 +650,7 @@ pub struct FTClient {
     pub state: DebugRwLock<FTState>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
+    delegated_admissions: DebugMutex<HashSet<String>>,
     direct_admissions: DebugMutex<HashMap<[u8; 32], DirectAdmissionRecord>>,
 }
 
@@ -629,6 +678,7 @@ impl FTClient {
             state: DebugRwLock::new(state),
             update_state,
             delegated_requests: DebugMutex::new(HashMap::new()),
+            delegated_admissions: DebugMutex::new(HashSet::new()),
             direct_admissions: DebugMutex::new(HashMap::new()),
         }
     }
@@ -1624,8 +1674,8 @@ impl FTClient {
             return Err(PushError::BadMsg);
         };
 
-        let other_pubkey =
-            CompactECKey::decompress(encrypted.public_key.try_into().expect("Bad pubkey length!"));
+        let (public_key, nonce, body) = encrypted_letmein_parts(&encrypted)?;
+        let other_pubkey = CompactECKey::decompress(public_key);
         debug!("FaceTime letmein key derivation stage=peer_key");
 
         let a = link.key.get_pkey();
@@ -1641,9 +1691,6 @@ impl FTClient {
         hk.expand("FT-LMI-RequestKey".as_bytes(), &mut key)
             .expect("Failed to expand key!");
         debug!("FaceTime letmein key derivation stage=request_key");
-
-        let nonce = &encrypted.conversation_message_bytes[..NONCE_COUNT];
-        let body = &encrypted.conversation_message_bytes[NONCE_COUNT..];
 
         let cipher = Aes256Gcm::new(&key.into());
         let decrypted = cipher
@@ -1680,7 +1727,7 @@ impl FTClient {
             delegate.conversation_group_uuid_string = session.group_id.clone();
             delegate.let_me_in_delegation_handle = request.requestor.clone();
             delegate.let_me_in_delegation_uuid = delegate_uuid.clone();
-            let my_handle = session.my_handles.first().expect("No Handle??");
+            let my_handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
             // context if missing is
             //  6045   0    callservicesd: [com.apple.calls.callservicesd:Default] [WARN] Dropping let me in delegation request or response because it has the wrong intent {publicIntentAction: (null)}
             self.message_session(my_handle.clone(), delegate, session, Some(20001))
@@ -1700,8 +1747,29 @@ impl FTClient {
         letmein: LetMeInRequest,
         approved_group: Option<&str>,
     ) -> Result<(), PushError> {
-        if letmein.delegation_uuid.is_some() {
-            return self.respond_letmein_inner(letmein, approved_group).await;
+        if let Some(delegation) = letmein.delegation_uuid.clone() {
+            let claim = {
+                let requests = self.delegated_requests.lock().await;
+                let mut admissions = self.delegated_admissions.lock().await;
+                claim_delegated_admission(&requests, &mut admissions, &delegation)
+            };
+            match claim {
+                DelegatedAdmissionClaim::Completed => {
+                    info!("FaceTime delegated admission retry suppressed: completed");
+                    return Ok(());
+                }
+                DelegatedAdmissionClaim::InFlight => {
+                    warn!("FaceTime delegated admission retry rejected: in_flight");
+                    return Err(PushError::BadMsg);
+                }
+                DelegatedAdmissionClaim::Start => {}
+            }
+
+            let result = self.respond_letmein_inner(letmein, approved_group).await;
+            let mut requests = self.delegated_requests.lock().await;
+            let mut admissions = self.delegated_admissions.lock().await;
+            finish_delegated_admission(&mut requests, &mut admissions, &delegation, result.is_ok());
+            return result;
         }
 
         let key = direct_admission_key(&letmein, approved_group);
@@ -1733,23 +1801,12 @@ impl FTClient {
         approved_group: Option<&str>,
     ) -> Result<(), PushError> {
         let approved_group = approved_group.map(str::to_owned);
-        if let Some(delegation) = letmein.delegation_uuid {
-            let mut shared_lock = self.delegated_requests.lock().await;
-            let removed = shared_lock.remove(&delegation);
-            if removed.is_none() {
-                warn!("FaceTime letmein response ignored: already_handled");
-                return Ok(()); // already responded
-            }
-        }
         let mut approved_session = if let Some(approved) = approved_group.as_deref() {
             let state = self.state.read().await;
-            Some(
-                state
-                    .sessions
-                    .get(approved)
-                    .cloned()
-                    .expect("Approved session not found!"),
-            )
+            Some(state.sessions.get(approved).cloned().ok_or_else(|| {
+                warn!("FaceTime admission rejected: approved_session_missing");
+                PushError::BadMsg
+            })?)
         } else {
             None
         };
@@ -1857,9 +1914,7 @@ impl FTClient {
         // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
         // but we don't currently assign our link to the conversation. FT Web doesn't care
 
-        let session = approved_session
-            .as_mut()
-            .expect("Approved session not found!");
+        let session = approved_session.as_mut().ok_or(PushError::BadMsg)?;
         let post_admission_baseline = session.clone();
         let member = FTMember {
             handle: letmein.requestor.clone(),
@@ -2444,6 +2499,62 @@ mod tests {
             claim_direct_admission(&mut admissions, first, now),
             DirectAdmissionClaim::Start
         );
+    }
+
+    #[test]
+    fn delegated_admission_is_consumed_only_after_success() {
+        let delegation = "delegation".to_string();
+        let mut request = direct_request();
+        request.delegation_uuid = Some(delegation.clone());
+        let mut requests = HashMap::from([(delegation.clone(), request)]);
+        let mut in_flight = HashSet::new();
+
+        assert_eq!(
+            claim_delegated_admission(&requests, &mut in_flight, &delegation),
+            DelegatedAdmissionClaim::Start
+        );
+        assert_eq!(
+            claim_delegated_admission(&requests, &mut in_flight, &delegation),
+            DelegatedAdmissionClaim::InFlight
+        );
+
+        finish_delegated_admission(&mut requests, &mut in_flight, &delegation, false);
+        assert!(requests.contains_key(&delegation));
+        assert_eq!(
+            claim_delegated_admission(&requests, &mut in_flight, &delegation),
+            DelegatedAdmissionClaim::Start
+        );
+
+        finish_delegated_admission(&mut requests, &mut in_flight, &delegation, true);
+        assert!(!requests.contains_key(&delegation));
+        assert_eq!(
+            claim_delegated_admission(&requests, &mut in_flight, &delegation),
+            DelegatedAdmissionClaim::Completed
+        );
+    }
+
+    #[test]
+    fn malformed_encrypted_letmein_is_rejected_without_slicing_or_key_panics() {
+        let mut encrypted = EncryptedConversationMessage {
+            public_key: vec![0; 31],
+            conversation_message_bytes: vec![0; NONCE_COUNT + 1],
+        };
+        assert!(matches!(
+            encrypted_letmein_parts(&encrypted),
+            Err(PushError::BadMsg)
+        ));
+
+        encrypted.public_key = vec![0; 32];
+        encrypted.conversation_message_bytes = vec![0; NONCE_COUNT];
+        assert!(matches!(
+            encrypted_letmein_parts(&encrypted),
+            Err(PushError::BadMsg)
+        ));
+
+        encrypted.conversation_message_bytes = vec![0; NONCE_COUNT + 1];
+        let (_, nonce, body) = encrypted_letmein_parts(&encrypted).expect("valid framing");
+        assert_eq!(nonce.len(), NONCE_COUNT);
+        assert_eq!(body.len(), 1);
     }
 
     #[test]

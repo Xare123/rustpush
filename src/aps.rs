@@ -1463,6 +1463,10 @@ impl APSMessage {
     }
 }
 
+// Interactive developer harness: requires private proxy TLS material, binds
+// port 5223, and waits for an external APS client. It must never be part of the
+// ordinary offline unit suite or CI will either fail at compile time or hang.
+#[cfg(feature = "aps-proxy-test")]
 #[tokio::test]
 async fn proxy() {
     if let Err(_) = std::env::var("RUST_LOG") {
