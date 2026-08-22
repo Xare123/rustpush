@@ -1261,6 +1261,14 @@ impl KeychainKeyStore {
             .find(|k| k.zone_name == zone && k.keyclass == class)
     }
 
+    fn require_key(&self, zone: &str, class: &str) -> Result<&CloudKey, PushError> {
+        self.get_key(zone, class)
+            .ok_or_else(|| PushError::CloudKeyNotFound {
+                zone: zone.to_string(),
+                class: class.to_string(),
+            })
+    }
+
     pub fn get_key_id(&self, uuid: &str) -> Option<&CloudKey> {
         self.0.iter().find(|k| k.uuid == uuid)
     }
@@ -1637,10 +1645,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
-        let key = state
-            .keystore
-            .get_key(zone, class)
-            .expect("Insert class key not found");
+        let key = state.keystore.require_key(zone, class)?;
 
         let record_zone = security_container.private_zone(zone.to_string());
 
@@ -3214,5 +3219,26 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         )?;
 
         Ok(dec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeychainKeyStore;
+    use crate::PushError;
+
+    #[test]
+    fn missing_insert_class_key_is_a_typed_error_instead_of_a_panic() {
+        let store = KeychainKeyStore(Vec::new());
+
+        let Err(error) = store.require_key("ProtectedCloudStorage", "classC") else {
+            panic!("an empty key store must reject the lookup");
+        };
+
+        assert!(matches!(
+            error,
+            PushError::CloudKeyNotFound { ref zone, ref class }
+                if zone == "ProtectedCloudStorage" && class == "classC"
+        ));
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Cursor, ErrorKind, Read, Write},
     marker::PhantomData,
     ops::{ControlFlow, Deref},
@@ -88,6 +88,8 @@ use uuid::Uuid;
 
 const CLOUDKIT_MAX_RESPONSE_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const CLOUDKIT_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
+const CLOUDKIT_MAX_RECORD_CHANGE_BYTES: usize = 8 * 1024 * 1024;
+const CLOUDKIT_MAX_RECORD_CHANGE_PAGE_BYTES: usize = 24 * 1024 * 1024;
 
 fn cloudkit_protocol_error(message: &'static str) -> PushError {
     PushError::IoError(std::io::Error::new(ErrorKind::InvalidData, message))
@@ -102,8 +104,62 @@ fn ensure_cloudkit_continuation_progress(
     requested_token: Option<&[u8]>,
     next_token: Option<&[u8]>,
 ) -> Result<(), PushError> {
-    if !complete && next_token == requested_token {
+    if !complete {
+        let Some(next_token) = next_token else {
+            return Err(CloudKitProtocolError::ContinuationTokenNoProgress.into());
+        };
+        if Some(next_token) == requested_token {
+            return Err(CloudKitProtocolError::ContinuationTokenNoProgress.into());
+        }
+    }
+    Ok(())
+}
+
+fn remember_incomplete_continuation_token(
+    complete: bool,
+    next_token: Option<&[u8]>,
+    seen_token_digests: &mut HashSet<[u8; 32]>,
+) -> Result<(), PushError> {
+    if complete {
+        return Ok(());
+    }
+    let Some(next_token) = next_token else {
         return Err(CloudKitProtocolError::ContinuationTokenNoProgress.into());
+    };
+    if !seen_token_digests.insert(sha256(next_token)) {
+        return Err(CloudKitProtocolError::ContinuationTokenNoProgress.into());
+    }
+    Ok(())
+}
+
+fn validate_record_change_page_size(
+    changes: &[RecordChange],
+    requested_max_changes: u32,
+) -> Result<(), PushError> {
+    let maximum_changes = requested_max_changes.clamp(1, CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE);
+    if changes.len() > maximum_changes as usize {
+        return Err(cloudkit_protocol_error(
+            "CloudKit record page exceeded the requested change limit",
+        ));
+    }
+
+    let mut aggregate_bytes = 0usize;
+    for change in changes {
+        let encoded_bytes = change.encoded_len();
+        if encoded_bytes > CLOUDKIT_MAX_RECORD_CHANGE_BYTES {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record change exceeded the safety limit",
+            ));
+        }
+        aggregate_bytes = aggregate_bytes
+            .checked_add(encoded_bytes)
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record page size overflow"))?;
+        if aggregate_bytes > CLOUDKIT_MAX_RECORD_CHANGE_PAGE_BYTES {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record page exceeded the safety limit",
+            ));
+        }
     }
     Ok(())
 }
@@ -320,6 +376,11 @@ pub enum CloudKitRetrySafety {
 
 pub const CLOUDKIT_MAX_OPERATIONS_PER_REQUEST: usize = 256;
 pub const CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE: u32 = 200;
+// Private CloudKit wire values observed in Apple-compatible responses. These
+// are empirical protocol constants, not values documented by public CloudKit.
+const CLOUDKIT_RECORD_CHANGES_REQUEST_ALL: i32 = 3;
+const CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE: i32 = 3;
+const CLOUDKIT_ZONE_CHANGES_STATUS_COMPLETE: i32 = 2;
 const CLOUDKIT_MAX_LEGACY_SYNC_PAGES: usize = 4096;
 
 #[derive(Clone, Debug)]
@@ -715,6 +776,7 @@ impl SaveRecordOperation {
                     ..Default::default()
                 }),
                 merge: Some(true),
+                fields_to_delete_if_exist_on_merge: Vec::new(),
                 save_semantics: Some(if update.is_some() { 3 } else { 2 }),
                 record_protection_info_tag: update,
                 zone_protection_info_tag: key.zone_protection_tag.clone(),
@@ -753,6 +815,7 @@ impl SaveRecordOperation {
                 ..Default::default()
             }),
             merge: Some(true),
+            fields_to_delete_if_exist_on_merge: Vec::new(),
             save_semantics: Some(if update { 3 } else { 2 }),
             record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
             zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
@@ -834,9 +897,9 @@ impl CloudKitOp for FetchRecordOperation {
         }
         Ok(FetchedRecord {
             assets: clonedresponse
-                .bundled
+                .header
                 .take()
-                .map(|b| b.requests)
+                .map(|header| header.bundled)
                 .unwrap_or_default(),
             response: clonedresponse,
         })
@@ -1044,9 +1107,9 @@ impl<R: CloudKitRecord> CloudKitOp for QueryRecordOperation<R> {
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError> {
         let extras = response
-            .bundled
+            .header
             .clone()
-            .map(|a| a.requests)
+            .map(|header| header.bundled)
             .unwrap_or_default();
         let retrieve = response
             .query_retrieve_response
@@ -1144,9 +1207,9 @@ impl CloudKitOp for FetchRecordChangesOperation {
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError> {
         let extras = response
-            .bundled
+            .header
             .clone()
-            .map(|a| a.requests)
+            .map(|header| header.bundled)
             .unwrap_or_default();
         Ok((
             extras,
@@ -1181,7 +1244,7 @@ pub struct CloudKitRecordChangePage {
 
 impl CloudKitRecordChangePage {
     pub fn is_complete(&self) -> bool {
-        self.status == 3
+        self.status == CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE
     }
 }
 
@@ -1314,7 +1377,7 @@ impl FetchRecordChangesOperation {
             zone_identifier: Some(zone),
             requested_fields: None,
             max_changes: Some(max_changes.clamp(1, CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE)),
-            requested_changes_types: Some(3), // figure out
+            requested_changes_types: Some(CLOUDKIT_RECORD_CHANGES_REQUEST_ALL),
             assets_to_download: Some(assets.clone()),
             newest_first: Some(false),
             ignore_calling_device_changes: None,
@@ -1353,6 +1416,7 @@ impl FetchRecordChangesOperation {
             )
             .await?;
         let status = response.status();
+        validate_record_change_page_size(&response.change, max_changes)?;
         let page = CloudKitRecordChangePage {
             assets,
             changes: response.change,
@@ -1378,6 +1442,16 @@ impl FetchRecordChangesOperation {
             .collect::<Vec<_>>();
 
         let mut finished_zones = vec![];
+        let mut seen_token_digests = zones
+            .iter()
+            .map(|zone| {
+                zone.1
+                    .as_deref()
+                    .map(sha256)
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut pages = 0usize;
         while finished_zones.len() != zones.len() {
             pages += 1;
@@ -1412,7 +1486,11 @@ impl FetchRecordChangesOperation {
                 let previous_token = responses[*zone_idx].2.clone();
                 let status = result.1.status();
                 let next_token = result.1.sync_continuation_token.clone();
-                if status == 3 {
+                validate_record_change_page_size(
+                    &result.1.change,
+                    CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE,
+                )?;
+                if status == CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE {
                     // done syncing
                     finished_zones.push(zone.0.clone());
                 }
@@ -1420,9 +1498,14 @@ impl FetchRecordChangesOperation {
                 responses[*zone_idx].1.extend(result.1.change);
                 responses[*zone_idx].2 = next_token;
                 ensure_cloudkit_continuation_progress(
-                    status == 3,
+                    status == CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE,
                     previous_token.as_deref(),
                     responses[*zone_idx].2.as_deref(),
+                )?;
+                remember_incomplete_continuation_token(
+                    status == CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE,
+                    responses[*zone_idx].2.as_deref(),
+                    &mut seen_token_digests[*zone_idx],
                 )?;
             }
         }
@@ -1473,7 +1556,7 @@ pub struct CloudKitZoneChangePage {
 
 impl CloudKitZoneChangePage {
     pub fn is_complete(&self) -> bool {
-        self.status == 2
+        self.status == CLOUDKIT_ZONE_CHANGES_STATUS_COMPLETE
     }
 }
 
@@ -1511,6 +1594,11 @@ impl FetchZoneChangesOperation {
         mut sync_token: Option<Vec<u8>>,
     ) -> Result<(Vec<ChangedZone>, Option<Vec<u8>>), PushError> {
         let mut responses = vec![];
+        let mut seen_token_digests = sync_token
+            .as_deref()
+            .map(sha256)
+            .into_iter()
+            .collect::<HashSet<_>>();
         for _ in 0..CLOUDKIT_MAX_LEGACY_SYNC_PAGES {
             let page = Self::fetch_page(container, sync_token).await?;
             let is_complete = page.is_complete();
@@ -1520,6 +1608,11 @@ impl FetchZoneChangesOperation {
                 // done syncing
                 return Ok((responses, sync_token));
             }
+            remember_incomplete_continuation_token(
+                false,
+                sync_token.as_deref(),
+                &mut seen_token_digests,
+            )?;
         }
         Err(cloudkit_protocol_error(
             "CloudKit zone sync exceeded the page limit",
@@ -2173,13 +2266,11 @@ impl CloudKitShare {
     }
 
     pub fn find_participant_by_handle(&self, handle: &str) -> Option<&Participant> {
-        info!("finding {handle}");
         let contact_information = handle_to_contact(handle);
         self.share_info.participants.iter().find(|p| {
             let Some(i) = &p.contact_information else {
                 return false;
             };
-            info!("finding {i:?} {contact_information:?}");
             if i.email_address.is_some() && i.email_address == contact_information.email_address {
                 return true;
             };
@@ -2483,11 +2574,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                         )
                         .await?;
 
-                        info!(
-                            "Creating zone {} with service key {}",
-                            zone_name,
-                            encode_hex(&service.key().compress())
-                        );
+                        info!("Creating CloudKit zone");
 
                         let request = ZoneSaveOperation::new(
                             zone_id.clone(),
@@ -2806,7 +2893,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     ) -> Result<(), PushError> {
         let invitation = Invitation::decode(&mut Cursor::new(invitation))?;
 
-        info!("Prot info {}", encode_hex(&invitation.protection_info()));
         let parsed_invitation: PCSShareProtection =
             rasn::der::decode(invitation.protection_info()).expect("Bad accept protection?");
         let data = client.state.read().await;
@@ -3271,26 +3357,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     } else {
                         None
                     },
-                    tags: if Op::tags() {
-                        vec![
-                            "MisDenyListQueryBlockDev3".to_string(),
-                            "MisDenyListQueryBlockDev5".to_string(),
-                            "MisDenyListSyncBlockTest1".to_string(),
-                            "MisDenyListSyncBlockTest2".to_string(),
-                            "MisDenyListSyncBlockDev1".to_string(),
-                            "MisDenyListQueryBlockDev1".to_string(),
-                            "MisDenyListQueryBlockTest1".to_string(),
-                            "MisDenyListQueryBlockTest2".to_string(),
-                            "MisDenyListQueryBlockDev2".to_string(),
-                            "MisDenyListSyncBlockDev2".to_string(),
-                            "MisDenyListSyncBlockDev5".to_string(),
-                            "MisDenyListSyncBlockDev4".to_string(),
-                            "MisDenyListSyncBlockDev3".to_string(),
-                            "MisDenyListQueryBlockDev4".to_string(),
-                        ]
-                    } else {
-                        vec![]
-                    },
+                    active_throttling_labels: Vec::new(),
                     unk2: if Op::is_fetch() {
                         None
                     } else {
@@ -3855,6 +3922,51 @@ mod cloud_sync_transport_tests {
     }
 
     #[test]
+    fn incomplete_page_rejects_multi_token_cycle() {
+        let token_a = [1, 2, 3];
+        let token_b = [4, 5, 6];
+        let mut seen = HashSet::from([sha256(&token_a)]);
+
+        remember_incomplete_continuation_token(false, Some(&token_b), &mut seen).unwrap();
+        let error =
+            remember_incomplete_continuation_token(false, Some(&token_a), &mut seen).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PushError::CloudKitProtocolError(CloudKitProtocolError::ContinuationTokenNoProgress)
+        ));
+    }
+
+    #[test]
+    fn record_change_page_rejects_server_count_overrun() {
+        let changes = vec![RecordChange::default(); 201];
+
+        assert!(validate_record_change_page_size(&changes, 200).is_err());
+    }
+
+    #[test]
+    fn record_change_page_rejects_oversized_record_before_mapping() {
+        let changes = vec![RecordChange {
+            etag: Some("x".repeat(CLOUDKIT_MAX_RECORD_CHANGE_BYTES + 1)),
+            ..Default::default()
+        }];
+
+        assert!(validate_record_change_page_size(&changes, 1).is_err());
+    }
+
+    #[test]
+    fn record_change_page_rejects_oversized_aggregate_before_mapping() {
+        let changes = (0..4)
+            .map(|_| RecordChange {
+                etag: Some("x".repeat(6 * 1024 * 1024)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(validate_record_change_page_size(&changes, 4).is_err());
+    }
+
+    #[test]
     fn complete_or_advancing_page_passes_continuation_guard() {
         let previous = [1, 2, 3];
         let next = [4, 5, 6];
@@ -3871,6 +3983,74 @@ mod cloud_sync_transport_tests {
             Some(next.as_slice()),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn empirical_record_and_zone_completion_statuses_are_explicit() {
+        assert!(CloudKitRecordChangePage {
+            assets: Vec::new(),
+            changes: Vec::new(),
+            next_token: None,
+            status: CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE,
+        }
+        .is_complete());
+        assert!(!CloudKitRecordChangePage {
+            assets: Vec::new(),
+            changes: Vec::new(),
+            next_token: None,
+            status: CLOUDKIT_ZONE_CHANGES_STATUS_COMPLETE,
+        }
+        .is_complete());
+
+        assert!(CloudKitZoneChangePage {
+            changes: Vec::new(),
+            next_token: None,
+            status: CLOUDKIT_ZONE_CHANGES_STATUS_COMPLETE,
+        }
+        .is_complete());
+        assert!(!CloudKitZoneChangePage {
+            changes: Vec::new(),
+            next_token: None,
+            status: CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE,
+        }
+        .is_complete());
+    }
+
+    #[test]
+    fn record_change_request_preserves_token_and_empirical_change_selector() {
+        let token = vec![7, 8, 9];
+        let request = FetchRecordChangesOperation::new_with_limit(
+            cloudkit_proto::RecordZoneIdentifier::default(),
+            Some(token.clone()),
+            &NO_ASSETS,
+            0,
+        );
+
+        assert_eq!(request.0.sync_continuation_token, Some(token));
+        assert_eq!(
+            request.0.requested_changes_types,
+            Some(CLOUDKIT_RECORD_CHANGES_REQUEST_ALL)
+        );
+        assert_eq!(request.0.max_changes, Some(1));
+    }
+
+    #[test]
+    fn response_header_preserves_bundled_assets_across_wire_roundtrip() {
+        let mut response = ResponseOperation::default();
+        let mut header = cloudkit_proto::request_operation::ResponseOperationHeader::default();
+        header.bundled.push(AssetGetResponse {
+            asset_id: Some("asset-fixture".to_string()),
+            ..Default::default()
+        });
+        response.header = Some(header);
+        response.retrieve_changes_response = Some(Default::default());
+
+        let encoded = response.encode_to_vec();
+        let decoded = ResponseOperation::decode(encoded.as_slice()).unwrap();
+        let (assets, _) = FetchRecordChangesOperation::retrieve_response(&decoded).unwrap();
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].asset_id.as_deref(), Some("asset-fixture"));
     }
 
     #[test]

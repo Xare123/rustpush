@@ -199,6 +199,8 @@ pub enum PushError {
     WrongStep(u32),
     #[error("Decryption Key not found {0}")]
     DecryptionKeyNotFound(String),
+    #[error("Cloud key not found for zone {zone} and class {class}")]
+    CloudKeyNotFound { zone: String, class: String },
     #[error("Not in clique!")]
     NotInClique,
     #[error("Missing group photo!")]
