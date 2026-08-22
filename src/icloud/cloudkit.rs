@@ -35,6 +35,7 @@ use crate::{
     util::{
         base64_decode, base64_encode, base64_encode_url, decode_hex, decode_uleb128, encode_hex,
         encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key, CompactECKey, REQWEST,
+        REQWEST_NO_REDIRECT,
     },
     CloudKitProtocolError, FileContainer, OSConfig, PushError,
 };
@@ -417,14 +418,155 @@ pub enum CloudKitFailureClass {
     Unknown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitRequestIdentity {
+    http_request_uuid: String,
+    operation_uuids: Vec<String>,
+}
+
+impl CloudKitRequestIdentity {
+    pub fn new(http_request_uuid: String, operation_uuids: Vec<String>) -> Result<Self, PushError> {
+        let identity = Self {
+            http_request_uuid,
+            operation_uuids,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn generated(operation_count: usize) -> Self {
+        Self {
+            http_request_uuid: Uuid::new_v4().to_string().to_uppercase(),
+            operation_uuids: (0..operation_count)
+                .map(|_| Uuid::new_v4().to_string().to_uppercase())
+                .collect(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), PushError> {
+        fn is_canonical_uuid(value: &str) -> bool {
+            Uuid::parse_str(value)
+                .map(|uuid| uuid.to_string().to_uppercase() == value)
+                .unwrap_or(false)
+        }
+
+        if !is_canonical_uuid(&self.http_request_uuid)
+            || self
+                .operation_uuids
+                .iter()
+                .any(|value| !is_canonical_uuid(value))
+            || self.operation_uuids.iter().collect::<HashSet<_>>().len()
+                != self.operation_uuids.len()
+        {
+            return Err(cloudkit_invalid_input(
+                "CloudKit request identity was malformed or duplicated",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_operation_count(&self, operation_count: usize) -> Result<(), PushError> {
+        self.validate()?;
+        if self.operation_uuids.len() != operation_count {
+            return Err(cloudkit_invalid_input(
+                "CloudKit request identity count did not match operations",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn http_request_uuid(&self) -> &str {
+        &self.http_request_uuid
+    }
+
+    pub fn operation_uuids(&self) -> &[String] {
+        &self.operation_uuids
+    }
+}
+
+/// Ephemeral credentials prepared before a durable writer records that remote
+/// submission has started. This value is intentionally neither serializable
+/// nor cloneable and must never cross the protected native boundary.
+pub struct CloudKitPreparedAuthentication<T: AnisetteProvider> {
+    client: Arc<CloudKitClient<T>>,
+    user_id: String,
+    bundle_id: String,
+    container_id: String,
+    database_type: Database,
+    cloudkit_token: String,
+    anisette_headers: HeaderMap,
+}
+
+fn cloudkit_anisette_header_map(
+    base_headers: &HashMap<String, String>,
+) -> Result<HeaderMap, PushError> {
+    let mut headers = HeaderMap::with_capacity(base_headers.len());
+    for (name, value) in base_headers {
+        let name = HeaderName::from_str(name)
+            .map_err(|_| cloudkit_protocol_error("CloudKit Anisette header name was malformed"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| cloudkit_protocol_error("CloudKit Anisette header value was malformed"))?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
+}
+
+fn validate_cloudkit_response_identities(
+    request_identity: &CloudKitRequestIdentity,
+    response: &[ResponseOperation],
+) -> Result<(), PushError> {
+    let requested = request_identity
+        .operation_uuids()
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::with_capacity(response.len());
+    for operation_response in response {
+        let response_uuid = operation_response
+            .response
+            .as_ref()
+            .and_then(|operation| operation.operation_uuid.as_deref())
+            .ok_or_else(|| {
+                cloudkit_protocol_error("CloudKit operation response identity was missing")
+            })?;
+        if !requested.contains(response_uuid) {
+            return Err(cloudkit_protocol_error(
+                "CloudKit operation response identity was unexpected",
+            ));
+        }
+        if !seen.insert(response_uuid) {
+            return Err(cloudkit_protocol_error(
+                "CloudKit operation response identity was duplicated",
+            ));
+        }
+    }
+    if seen.len() != requested.len() {
+        return Err(cloudkit_protocol_error(
+            "CloudKit operation response identity was missing",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cloudkit_operation_headers(headers: &HeaderMap) -> Result<(), PushError> {
+    if headers.contains_key("x-apple-request-uuid") {
+        return Err(cloudkit_invalid_input(
+            "CloudKit operation attempted to override request identity",
+        ));
+    }
+    Ok(())
+}
+
 pub struct CloudKitOperationOutcome<T> {
     pub request_index: usize,
+    pub operation_uuid: String,
     pub result: Result<T, PushError>,
     pub retry_after: Option<Duration>,
     pub failure_class: Option<CloudKitFailureClass>,
 }
 
 pub struct CloudKitBatchResponse<T> {
+    pub request_identity: CloudKitRequestIdentity,
     pub outcomes: Vec<CloudKitOperationOutcome<T>>,
 }
 
@@ -433,6 +575,7 @@ pub struct CloudKitRequestFailure {
     pub error: PushError,
     pub retry_after: Option<Duration>,
     pub failure_class: Option<CloudKitFailureClass>,
+    pub request_identity: Option<CloudKitRequestIdentity>,
 }
 
 impl From<PushError> for CloudKitRequestFailure {
@@ -441,6 +584,7 @@ impl From<PushError> for CloudKitRequestFailure {
             error,
             retry_after: None,
             failure_class: None,
+            request_identity: None,
         }
     }
 }
@@ -2310,13 +2454,17 @@ impl<'t> CloudKitContainer<'t> {
         builder: RequestBuilder,
         session: &CloudKitSession,
         r#type: &Database,
+        request_uuid: &str,
+        prepared_anisette_headers: Option<&HeaderMap>,
     ) -> Result<RequestBuilder, PushError> {
-        let mut locked = client.anisette.lock().await;
-        let base_headers = locked.get_headers().await?;
-        let anisette_headers: HeaderMap = base_headers
-            .into_iter()
-            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
-            .collect();
+        let mut anisette_headers = match prepared_anisette_headers {
+            Some(headers) => headers.clone(),
+            None => {
+                let mut locked = client.anisette.lock().await;
+                cloudkit_anisette_header_map(locked.get_headers().await?)?
+            }
+        };
+        anisette_headers.remove("x-apple-request-uuid");
 
         Ok(builder.header("accept", "application/x-protobuf")
             .header("accept-encoding", "gzip")
@@ -2328,7 +2476,7 @@ impl<'t> CloudKitContainer<'t> {
             .header("x-apple-c2-metric-triggers", "0")
             .header("x-apple-operation-group-id", encode_hex(&session.op_group_id).to_uppercase())
             .header("x-apple-operation-id", encode_hex(&session.op_id).to_uppercase())
-            .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
+            .header("x-apple-request-uuid", request_uuid)
             .header("x-cloudkit-bundleid", self.bundleid)
             .header("x-cloudkit-containerid", self.containerid)
             .header("x-cloudkit-databasescope", r#type.ck_type())
@@ -2363,6 +2511,7 @@ impl<'t> CloudKitContainer<'t> {
         }
 
         let mme_token = client.token_provider.get_mme_token("mmeAuthToken").await?;
+        let init_request_uuid = Uuid::new_v4().to_string().to_uppercase();
 
         let response = self
             .headers(
@@ -2370,6 +2519,8 @@ impl<'t> CloudKitContainer<'t> {
                 REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"),
                 &session,
                 &self.database_type,
+                &init_request_uuid,
+                None,
             )
             .await?
             .query(&[("container", &self.containerid)])
@@ -3391,10 +3542,12 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
     fn parse_operation_responses<Op: CloudKitOp>(
         &self,
-        request_uuids: &[String],
+        request_identity: &CloudKitRequestIdentity,
         response: &[ResponseOperation],
-    ) -> CloudKitBatchResponse<Op::Response> {
-        let outcomes = request_uuids
+    ) -> Result<CloudKitBatchResponse<Op::Response>, PushError> {
+        validate_cloudkit_response_identities(request_identity, response)?;
+        let outcomes = request_identity
+            .operation_uuids()
             .iter()
             .enumerate()
             .map(|(request_index, request_uuid)| {
@@ -3408,6 +3561,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 let Some(operation_response) = matching.next() else {
                     return CloudKitOperationOutcome {
                         request_index,
+                        operation_uuid: request_uuid.clone(),
                         result: Err(cloudkit_protocol_error(
                             "CloudKit operation response was missing",
                         )),
@@ -3418,6 +3572,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 if matching.next().is_some() {
                     return CloudKitOperationOutcome {
                         request_index,
+                        operation_uuid: request_uuid.clone(),
                         result: Err(cloudkit_protocol_error(
                             "CloudKit operation response was duplicated",
                         )),
@@ -3429,6 +3584,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 let Some(result) = operation_response.result.as_ref() else {
                     return CloudKitOperationOutcome {
                         request_index,
+                        operation_uuid: request_uuid.clone(),
                         result: Err(cloudkit_protocol_error(
                             "CloudKit operation result was missing",
                         )),
@@ -3447,6 +3603,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     );
                     return CloudKitOperationOutcome {
                         request_index,
+                        operation_uuid: request_uuid.clone(),
                         result: Err(PushError::CloudKitError(redact_cloudkit_result(
                             result.clone(),
                         ))),
@@ -3457,6 +3614,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
                 CloudKitOperationOutcome {
                     request_index,
+                    operation_uuid: request_uuid.clone(),
                     result: Op::retrieve_response(operation_response),
                     retry_after: None,
                     failure_class: None,
@@ -3464,7 +3622,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             })
             .collect();
 
-        CloudKitBatchResponse { outcomes }
+        Ok(CloudKitBatchResponse {
+            request_identity: request_identity.clone(),
+            outcomes,
+        })
     }
 
     pub async fn perform_operations_detailed<Op: CloudKitOp>(
@@ -3489,8 +3650,107 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         isolation_level: IsolationLevel,
         retry_policy: &CloudKitRetryPolicy,
     ) -> Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> {
+        let request_identity = CloudKitRequestIdentity::generated(ops.len());
+        self.perform_operations_detailed_with_identity_internal(
+            session,
+            ops,
+            isolation_level,
+            retry_policy,
+            request_identity,
+            true,
+            None,
+        )
+        .await
+    }
+
+    /// Performs one identified request without any automatic network or
+    /// authentication replay. This is the only safe primitive for a durable
+    /// caller that must classify a missing response as an unknown outcome.
+    pub async fn perform_operations_detailed_once_with_identity<Op: CloudKitOp>(
+        &self,
+        session: &CloudKitSession,
+        ops: &[Op],
+        isolation_level: IsolationLevel,
+        retry_policy: &CloudKitRetryPolicy,
+        request_identity: CloudKitRequestIdentity,
+        prepared_authentication: CloudKitPreparedAuthentication<T>,
+    ) -> Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> {
+        self.perform_operations_detailed_with_identity_internal(
+            session,
+            ops,
+            isolation_level,
+            retry_policy,
+            request_identity,
+            false,
+            Some(prepared_authentication),
+        )
+        .await
+    }
+
+    /// Refreshes CloudKit authentication, if required, before a durable caller
+    /// crosses its remote-submission ambiguity boundary.
+    pub async fn prepare_operations_authentication(
+        &self,
+    ) -> Result<CloudKitPreparedAuthentication<T>, PushError> {
+        let cloudkit_token = self
+            .client
+            .token_provider
+            .get_mme_token("cloudKitToken")
+            .await?;
+        let anisette_headers = {
+            let mut locked = self.client.anisette.lock().await;
+            cloudkit_anisette_header_map(locked.get_headers().await?)?
+        };
+        Ok(CloudKitPreparedAuthentication {
+            client: self.client.clone(),
+            user_id: self.user_id.clone(),
+            bundle_id: self.bundleid.to_owned(),
+            container_id: self.containerid.to_owned(),
+            database_type: self.database_type,
+            cloudkit_token,
+            anisette_headers,
+        })
+    }
+
+    async fn perform_operations_detailed_with_identity_internal<Op: CloudKitOp>(
+        &self,
+        session: &CloudKitSession,
+        ops: &[Op],
+        isolation_level: IsolationLevel,
+        retry_policy: &CloudKitRetryPolicy,
+        request_identity: CloudKitRequestIdentity,
+        allow_automatic_replay: bool,
+        prepared_authentication: Option<CloudKitPreparedAuthentication<T>>,
+    ) -> Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> {
+        if let Err(error) = request_identity.validate_operation_count(ops.len()) {
+            return Err(error.into());
+        }
+        if allow_automatic_replay == prepared_authentication.is_some() {
+            return Err(cloudkit_invalid_input(
+                "CloudKit authentication mode did not match replay policy",
+            )
+            .into());
+        }
+        if let Some(prepared) = prepared_authentication.as_ref() {
+            if !Arc::ptr_eq(&prepared.client, &self.client)
+                || prepared.user_id != self.user_id
+                || prepared.bundle_id != self.bundleid
+                || prepared.container_id != self.containerid
+                || prepared.database_type != self.database_type
+            {
+                return Err(cloudkit_invalid_input(
+                    "CloudKit prepared authentication scope did not match request",
+                )
+                .into());
+            }
+        }
+        let failure_identity = request_identity.clone();
+        let result: Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> = async {
         if ops.is_empty() {
-            return Ok(CloudKitBatchResponse { outcomes: vec![] });
+            return Ok(CloudKitBatchResponse {
+                request_identity: request_identity.clone(),
+                outcomes: vec![],
+            });
         }
         if ops.len() > CLOUDKIT_MAX_OPERATIONS_PER_REQUEST {
             return Err(cloudkit_invalid_input(
@@ -3499,9 +3759,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .into());
         }
 
-        let request_uuids = (0..ops.len())
-            .map(|_| Uuid::new_v4().to_string().to_uppercase())
-            .collect::<Vec<_>>();
         let request = ops
             .iter()
             .enumerate()
@@ -3511,40 +3768,59 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     self.client.config.as_ref(),
                     idx == 0,
                     idx == ops.len() - 1,
-                    request_uuids[idx].clone(),
+                    request_identity.operation_uuids()[idx].clone(),
                     isolation_level,
                 )
             })
             .collect::<Vec<_>>()
             .concat();
         let compressed_request = gzip_normal(&request).map_err(PushError::from)?;
-        let http_request_uuid = Uuid::new_v4().to_string().to_uppercase();
-        let automatic_retry_safe = ops
-            .iter()
-            .all(|op| op.retry_safety() != CloudKitRetrySafety::Never);
+        let custom_headers = ops[0].custom_headers();
+        validate_cloudkit_operation_headers(&custom_headers)?;
+        let automatic_retry_safe = allow_automatic_replay
+            && ops
+                .iter()
+                .all(|op| op.retry_safety() != CloudKitRetrySafety::Never);
         let max_attempts = retry_policy.max_attempts.max(1);
         let mut authentication_refreshed = false;
 
         let mut attempt = 1usize;
         loop {
-            let token = self
-                .client
-                .token_provider
-                .get_mme_token("cloudKitToken")
-                .await?;
+            let token = if allow_automatic_replay {
+                self.client
+                    .token_provider
+                    .get_mme_token("cloudKitToken")
+                    .await?
+            } else {
+                prepared_authentication
+                    .as_ref()
+                    .ok_or_else(|| {
+                        cloudkit_invalid_input("CloudKit prepared authentication was missing")
+                    })?
+                    .cloudkit_token
+                    .clone()
+            };
 
+            let request_client = if allow_automatic_replay {
+                &*REQWEST
+            } else {
+                &*REQWEST_NO_REDIRECT
+            };
             let request = self
                 .headers(
                     &self.client,
-                    REQWEST.post(Op::link()),
+                    request_client.post(Op::link()),
                     session,
                     &self.database_type,
+                    request_identity.http_request_uuid(),
+                    prepared_authentication
+                        .as_ref()
+                        .map(|prepared| &prepared.anisette_headers),
                 )
                 .await?
-                .header("x-apple-request-uuid", &http_request_uuid)
                 .header("x-cloudkit-userid", &self.user_id)
                 .header("x-cloudkit-authtoken", &token)
-                .headers(ops[0].custom_headers())
+                .headers(custom_headers.clone())
                 .body(compressed_request.clone());
 
             let response = match tokio::time::timeout(retry_policy.request_timeout, request.send())
@@ -3592,7 +3868,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             let status = response.status();
             let retry_after =
                 parse_retry_after(response.headers().get(reqwest::header::RETRY_AFTER));
-            if status == reqwest::StatusCode::UNAUTHORIZED && !authentication_refreshed {
+            if allow_automatic_replay
+                && status == reqwest::StatusCode::UNAUTHORIZED
+                && !authentication_refreshed
+            {
                 self.client.token_provider.refresh_mme().await?;
                 authentication_refreshed = true;
                 continue;
@@ -3623,6 +3902,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     },
                     retry_after,
                     failure_class: Some(failure_class),
+                    request_identity: None,
                 });
             }
 
@@ -3647,8 +3927,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 .map(|frame| Ok(ResponseOperation::decode(&mut Cursor::new(frame))?))
                 .collect::<Result<Vec<ResponseOperation>, PushError>>()?;
 
-            return Ok(self.parse_operation_responses::<Op>(&request_uuids, &response));
+            return Ok(self.parse_operation_responses::<Op>(&request_identity, &response)?);
         }
+        }
+        .await;
+        result.map_err(|mut failure| {
+            failure.request_identity = Some(failure_identity);
+            failure
+        })
     }
 
     pub async fn perform_operations_checked<Op: CloudKitOp>(
@@ -3875,6 +4161,174 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 #[cfg(test)]
 mod cloud_sync_transport_tests {
     use super::*;
+
+    const HTTP_REQUEST_UUID: &str = "11111111-2222-4ABC-8DEF-555555555555";
+    const OPERATION_UUID_A: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+    const OPERATION_UUID_B: &str = "01234567-89AB-4CDE-8F01-23456789ABCD";
+
+    #[test]
+    fn persisted_request_identity_preserves_canonical_uuids() {
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned(), OPERATION_UUID_B.to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(identity.http_request_uuid(), HTTP_REQUEST_UUID);
+        assert_eq!(
+            identity.operation_uuids(),
+            [OPERATION_UUID_A.to_owned(), OPERATION_UUID_B.to_owned()]
+        );
+    }
+
+    #[test]
+    fn persisted_request_identity_rejects_noncanonical_or_malformed_uuids() {
+        assert!(CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_ascii_lowercase(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .is_err());
+        assert!(CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec!["not-a-uuid".to_owned()],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn persisted_request_identity_rejects_duplicate_operation_uuids() {
+        assert!(CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned(), OPERATION_UUID_A.to_owned()],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn persisted_request_identity_rejects_operation_count_mismatch() {
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+
+        assert!(identity.validate_operation_count(2).is_err());
+    }
+
+    fn response_with_operation_uuid(operation_uuid: Option<&str>) -> ResponseOperation {
+        ResponseOperation {
+            response: Some(cloudkit_proto::Operation {
+                operation_uuid: operation_uuid.map(str::to_owned),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn response_identity_validation_accepts_only_requested_operation_uuids() {
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned(), OPERATION_UUID_B.to_owned()],
+        )
+        .unwrap();
+        let responses = [
+            response_with_operation_uuid(Some(OPERATION_UUID_B)),
+            response_with_operation_uuid(Some(OPERATION_UUID_A)),
+        ];
+
+        assert!(validate_cloudkit_response_identities(&identity, &responses).is_ok());
+    }
+
+    #[test]
+    fn response_identity_validation_rejects_missing_or_unexpected_uuids() {
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+
+        assert!(validate_cloudkit_response_identities(
+            &identity,
+            &[response_with_operation_uuid(None)],
+        )
+        .is_err());
+        assert!(validate_cloudkit_response_identities(
+            &identity,
+            &[response_with_operation_uuid(Some(OPERATION_UUID_B))],
+        )
+        .is_err());
+        assert!(validate_cloudkit_response_identities(&identity, &[]).is_err());
+        assert!(validate_cloudkit_response_identities(
+            &identity,
+            &[
+                response_with_operation_uuid(Some(OPERATION_UUID_A)),
+                response_with_operation_uuid(Some(OPERATION_UUID_A)),
+            ],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn operation_headers_cannot_override_persisted_request_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cloudkit-partition",
+            HeaderValue::from_static("production"),
+        );
+        assert!(validate_cloudkit_operation_headers(&headers).is_ok());
+
+        headers.insert(
+            "x-apple-request-uuid",
+            HeaderValue::from_static(HTTP_REQUEST_UUID),
+        );
+        assert!(validate_cloudkit_operation_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn anisette_header_conversion_rejects_malformed_names_and_values() {
+        assert!(cloudkit_anisette_header_map(&HashMap::from([(
+            "bad header".to_owned(),
+            "value".to_owned(),
+        )]))
+        .is_err());
+        assert!(cloudkit_anisette_header_map(&HashMap::from([(
+            "x-test".to_owned(),
+            "bad\nvalue".to_owned(),
+        )]))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn one_shot_http_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let response = REQWEST_NO_REDIRECT
+            .post(format!("http://{address}/first"))
+            .body("fixture")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.await.unwrap();
+    }
 
     #[test]
     fn record_name_allocation_is_random_and_reuses_a_durable_mapping() {

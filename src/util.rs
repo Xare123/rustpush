@@ -32,7 +32,7 @@ use plist::{Data, Date, Dictionary, Error, Uid, Value};
 use prost::Message;
 use rasn::{AsnType, Decode, Encode};
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Certificate, Client, Proxy};
+use reqwest::{Certificate, Client, ClientBuilder, Proxy};
 use serde::de::{value, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
@@ -225,8 +225,7 @@ fn build_proxy() -> Client {
         .unwrap()
 }
 
-pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
-    // return build_proxy();
+fn apple_reqwest_client_builder() -> ClientBuilder {
     let certificates = vec![
         Certificate::from_pem(include_bytes!(
             "../certs/root/profileidentity.ess.apple.com.cert"
@@ -249,7 +248,20 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
         builder = builder.add_root_certificate(certificate);
     }
 
-    builder.build().unwrap()
+    builder
+}
+
+pub static REQWEST: LazyLock<Client> =
+    LazyLock::new(|| apple_reqwest_client_builder().build().unwrap());
+
+/// Client for durable one-shot POSTs. Redirects are surfaced to the caller so
+/// reqwest cannot automatically replay a request body or forward private
+/// headers to a redirect target.
+pub static REQWEST_NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| {
+    apple_reqwest_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
 });
 
 pub static CARRIER_REQWEST: LazyLock<Client> = LazyLock::new(|| {
