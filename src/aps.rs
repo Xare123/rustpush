@@ -1533,7 +1533,7 @@ async fn proxy() {
                 .await
                 .unwrap();
 
-            info!("C -> S {read:?}");
+            info!("C -> S APS message (contents redacted)");
 
             let mut buf = vec![];
             encoder.encode_message(read, Cursor::new(&mut buf)).unwrap();
@@ -1546,7 +1546,7 @@ async fn proxy() {
     loop {
         let read = decoder.read_from_stream(&mut upstream_read).await.unwrap();
 
-        info!("S -> C {read:?}");
+        info!("S -> C APS message (contents redacted)");
 
         let mut buf = vec![];
         encoder.encode_message(read, Cursor::new(&mut buf)).unwrap();
