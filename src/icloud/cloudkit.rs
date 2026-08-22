@@ -4037,12 +4037,14 @@ mod cloud_sync_transport_tests {
     #[test]
     fn response_header_preserves_bundled_assets_across_wire_roundtrip() {
         let mut response = ResponseOperation::default();
-        let mut header = cloudkit_proto::request_operation::ResponseOperationHeader::default();
-        header.bundled.push(AssetGetResponse {
-            asset_id: Some("asset-fixture".to_string()),
-            ..Default::default()
-        });
-        response.header = Some(header);
+        response
+            .header
+            .get_or_insert_default()
+            .bundled
+            .push(AssetGetResponse {
+                asset_id: Some("asset-fixture".to_string()),
+                ..Default::default()
+            });
         response.retrieve_changes_response = Some(Default::default());
 
         let encoded = response.encode_to_vec();
