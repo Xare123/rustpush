@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     io::{Cursor, ErrorKind, Read, Write},
     marker::PhantomData,
     ops::{ControlFlow, Deref},
@@ -253,49 +254,51 @@ pub struct FetchedRecords {
 }
 
 impl FetchedRecords {
-    pub fn get_record<R: CloudKitRecord>(&self, record_id: &str, key: Option<&PCSZoneConfig>) -> R {
-        self.responses
-            .iter()
-            .find_map(|response| {
-                let r = response
-                    .record_retrieve_response
-                    .as_ref()
-                    .expect("No retrieve response?")
-                    .record
-                    .as_ref()
-                    .expect("No record?");
-                if r.record_identifier
-                    .as_ref()
-                    .expect("No record id?")
-                    .value
-                    .as_ref()
-                    .expect("No identifier")
-                    .name
-                    .as_ref()
-                    .expect("No name?")
-                    == record_id
-                {
-                    let got_type = r
-                        .r#type
-                        .as_ref()
-                        .expect("no TYpe")
-                        .name
-                        .as_ref()
-                        .expect("No ta");
-                    if got_type.as_str() != R::record_type() {
-                        panic!(
-                            "Wrong record type, got {} expected {}",
-                            got_type,
-                            R::record_type()
-                        );
-                    }
-                    let key = key.map(|k| pcs_keys_for_record(r, k).expect("PCS key failed"));
-                    Some(R::from_record_encrypted(&r.record_field, key.as_ref()))
-                } else {
-                    None
-                }
-            })
-            .expect("No record found?")
+    pub fn get_record<R: CloudKitRecord>(
+        &self,
+        record_id: &str,
+        key: Option<&PCSZoneConfig>,
+    ) -> Result<R, PushError> {
+        for response in &self.responses {
+            let record = response
+                .record_retrieve_response
+                .as_ref()
+                .and_then(|response| response.record.as_ref())
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit record response was missing"))?;
+            let response_record_id = record
+                .record_identifier
+                .as_ref()
+                .and_then(|identifier| identifier.value.as_ref())
+                .and_then(|identifier| identifier.name.as_deref())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit record identity was missing"))?;
+            if response_record_id != record_id {
+                continue;
+            }
+
+            let record_type = record
+                .r#type
+                .as_ref()
+                .and_then(|record_type| record_type.name.as_deref())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit record type was missing"))?;
+            if record_type != R::record_type() {
+                return Err(cloudkit_protocol_error(
+                    "CloudKit record type did not match the requested type",
+                ));
+            }
+            let decryptor = key
+                .map(|keys| pcs_keys_for_record(record, keys))
+                .transpose()?;
+            return Ok(R::from_record_encrypted(
+                &record.record_field,
+                decryptor.as_ref(),
+            ));
+        }
+
+        Err(cloudkit_protocol_error(
+            "CloudKit response did not contain the requested record",
+        ))
     }
 
     pub fn new(records: &[Result<FetchedRecord, PushError>]) -> Self {
@@ -376,6 +379,7 @@ pub enum CloudKitRetrySafety {
 }
 
 pub const CLOUDKIT_MAX_OPERATIONS_PER_REQUEST: usize = 256;
+pub const CLOUDKIT_MAX_ONE_SHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE: u32 = 200;
 // Private CloudKit wire values observed in Apple-compatible responses. These
 // are empirical protocol constants, not values documented by public CloudKit.
@@ -549,9 +553,24 @@ fn validate_cloudkit_response_identities(
 }
 
 fn validate_cloudkit_operation_headers(headers: &HeaderMap) -> Result<(), PushError> {
-    if headers.contains_key("x-apple-request-uuid") {
+    const RESERVED_HEADERS: &[&str] = &[
+        "x-apple-request-uuid",
+        "x-apple-operation-group-id",
+        "x-apple-operation-id",
+        "x-cloudkit-userid",
+        "x-cloudkit-authtoken",
+        "x-cloudkit-bundleid",
+        "x-cloudkit-containerid",
+        "x-cloudkit-databasescope",
+        "x-cloudkit-environment",
+        "x-mme-client-info",
+    ];
+    if RESERVED_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
         return Err(cloudkit_invalid_input(
-            "CloudKit operation attempted to override request identity",
+            "CloudKit operation attempted to override reserved request metadata",
         ));
     }
     Ok(())
@@ -576,6 +595,11 @@ pub struct CloudKitRequestFailure {
     pub retry_after: Option<Duration>,
     pub failure_class: Option<CloudKitFailureClass>,
     pub request_identity: Option<CloudKitRequestIdentity>,
+    /// True once the one-shot request has entered `reqwest::send`. At that
+    /// point a missing or malformed response cannot prove that Apple did not
+    /// commit the mutation, so a durable caller must reconcile rather than
+    /// replay it as an ordinary failure.
+    pub outcome_may_be_committed: bool,
 }
 
 impl From<PushError> for CloudKitRequestFailure {
@@ -585,6 +609,7 @@ impl From<PushError> for CloudKitRequestFailure {
             retry_after: None,
             failure_class: None,
             request_identity: None,
+            outcome_may_be_committed: false,
         }
     }
 }
@@ -750,19 +775,49 @@ async fn read_cloudkit_response_body(
     Ok(body)
 }
 
+fn decode_cloudkit_response_body(body: Vec<u8>) -> Result<Vec<ResponseOperation>, PushError> {
+    undelimit_response(&body)?
+        .into_iter()
+        .map(|frame| Ok(ResponseOperation::decode(&mut Cursor::new(frame))?))
+        .collect()
+}
+
+/// Awaits one phase of a protected one-shot CloudKit request without extending
+/// its total network budget. Callers must reuse the same deadline for every
+/// phase after the ambiguity boundary.
+async fn within_cloudkit_one_shot_deadline<T, F>(
+    deadline: tokio::time::Instant,
+    future: F,
+    timeout_message: &'static str,
+) -> Result<T, PushError>
+where
+    F: Future<Output = Result<T, PushError>>,
+{
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| {
+            PushError::IoError(std::io::Error::new(ErrorKind::TimedOut, timeout_message))
+        })?
+}
+
 pub fn pcs_keys_for_record(
     record: &Record,
     keys: &PCSZoneConfig,
 ) -> Result<PCSEncryptor, PushError> {
-    let record_id = record.record_identifier.clone().expect("No Record iden?");
+    let record_id = record
+        .record_identifier
+        .clone()
+        .ok_or_else(|| cloudkit_protocol_error("CloudKit PCS record identity was missing"))?;
     let Some(protection) = &record.protection_info else {
-        let Some(pcskey) = &record.pcs_key else {
-            panic!("No PCS Key??")
-        };
+        let pcskey = record
+            .pcs_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .ok_or(PushError::PCSRecordKeyMissing)?;
         if !keys.default_record_keys.iter().any(|i| {
             i.key_id()
                 .ok()
-                .map(|id| pcskey == &id[..pcskey.len()])
+                .and_then(|id| id.get(..pcskey.len()).map(|prefix| prefix == pcskey))
                 .unwrap_or(false)
         }) {
             return Err(PushError::PCSRecordKeyMissing);
@@ -929,13 +984,32 @@ impl SaveRecordOperation {
         )
     }
 
-    pub fn new<R: CloudKitRecord>(
+    /// Builds a save operation after validating the PCS material needed by
+    /// the generated record. New fail-closed callers should use this method so
+    /// a missing default record key becomes a typed error instead of a panic.
+    pub fn try_new<R: CloudKitRecord>(
         id: RecordIdentifier,
         record: R,
         key: Option<&PCSZoneConfig>,
         update: bool,
-    ) -> Self {
-        Self(cloudkit_proto::RecordSaveRequest {
+    ) -> Result<Self, PushError> {
+        let pcs_key = match key {
+            Some(key) => {
+                let default_key = key.default_record_keys.first().ok_or_else(|| {
+                    cloudkit_invalid_input("CloudKit PCS default record key was missing")
+                })?;
+                let key_id = default_key.key_id()?;
+                if key_id.len() < 4 {
+                    return Err(cloudkit_invalid_input(
+                        "CloudKit PCS default record key identifier was malformed",
+                    ));
+                }
+                Some(key_id[..4].to_vec())
+            }
+            None => None,
+        };
+
+        Ok(Self(cloudkit_proto::RecordSaveRequest {
             record: Some(cloudkit_proto::Record {
                 record_identifier: Some(id.clone()),
                 r#type: Some(cloudkit_proto::record::Type {
@@ -948,14 +1022,7 @@ impl SaveRecordOperation {
                     })
                     .as_ref(),
                 ),
-                pcs_key: key.map(|k| {
-                    k.default_record_keys
-                        .first()
-                        .expect("No default record key?")
-                        .key_id()
-                        .unwrap()[..4]
-                        .to_vec()
-                }),
+                pcs_key,
                 ..Default::default()
             }),
             merge: Some(true),
@@ -963,7 +1030,20 @@ impl SaveRecordOperation {
             save_semantics: Some(if update { 3 } else { 2 }),
             record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
             zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
-        })
+        }))
+    }
+
+    /// Compatibility spelling retained for callers that have not adopted the
+    /// explicit `try_new` name. It is fallible as well; malformed PCS material
+    /// must never terminate the process.
+    #[deprecated(note = "use SaveRecordOperation::try_new")]
+    pub fn new<R: CloudKitRecord>(
+        id: RecordIdentifier,
+        record: R,
+        key: Option<&PCSZoneConfig>,
+        update: bool,
+    ) -> Result<Self, PushError> {
+        Self::try_new(id, record, key, update)
     }
 }
 
@@ -973,49 +1053,62 @@ pub struct FetchedRecord {
 }
 
 impl FetchedRecord {
-    pub fn get_raw_record(&self) -> &Record {
+    pub fn get_raw_record(&self) -> Result<&Record, PushError> {
         self.response
             .record_retrieve_response
             .as_ref()
-            .expect("No retrieve response?")
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit retrieve response was missing"))?
             .record
             .as_ref()
-            .expect("No record?")
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit retrieved record was missing"))
     }
 
-    pub fn get_record<R: CloudKitRecord>(&self, key: Option<&PCSZoneConfig>) -> R {
-        let r = self.get_raw_record();
+    pub fn get_record<R: CloudKitRecord>(
+        &self,
+        key: Option<&PCSZoneConfig>,
+    ) -> Result<R, PushError> {
+        let record = self.get_raw_record()?;
 
-        let got_type = r
+        let record_type = record
             .r#type
             .as_ref()
-            .expect("no TYpe")
-            .name
-            .as_ref()
-            .expect("No ta");
-        if got_type.as_str() != R::record_type() {
-            panic!(
-                "Wrong record type, got {} expected {}",
-                got_type,
-                R::record_type()
-            );
+            .and_then(|record_type| record_type.name.as_deref())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record type was missing"))?;
+        if record_type != R::record_type() {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record type did not match the requested type",
+            ));
         }
-        let key = key.map(|k| pcs_keys_for_record(r, k).expect("no PCS key"));
-        R::from_record_encrypted(&r.record_field, key.as_ref())
+        let decryptor = key
+            .map(|keys| pcs_keys_for_record(record, keys))
+            .transpose()?;
+        Ok(R::from_record_encrypted(
+            &record.record_field,
+            decryptor.as_ref(),
+        ))
     }
 
-    pub fn get_id(&self) -> String {
-        let r = self.get_raw_record();
-        r.record_identifier
+    pub fn get_id(&self) -> Result<String, PushError> {
+        self.get_raw_record()?
+            .record_identifier
             .as_ref()
-            .expect("No record id?")
-            .value
-            .as_ref()
-            .expect("No identifier")
-            .name
-            .as_ref()
-            .expect("No name?")
-            .to_string()
+            .and_then(|identifier| identifier.value.as_ref())
+            .and_then(|identifier| identifier.name.as_deref())
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record identity was missing"))
+    }
+
+    /// Proves that a retrieve response belongs to the exact stable record
+    /// requested by the caller before any decoded payload is trusted.
+    pub fn verify_id(&self, expected_record_id: &str) -> Result<(), PushError> {
+        if self.get_id()?.as_str() != expected_record_id {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record identity did not match the request",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2762,12 +2855,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     if zone.1.is_some() {
                         continue;
                     }
-                    let share_info = shares
-                        .remove(0)
-                        .get_raw_record()
-                        .share_info
-                        .clone()
-                        .expect("Zone share has no share info??");
+                    let share = shares.first().ok_or_else(|| {
+                        cloudkit_protocol_error("CloudKit zone share response was missing")
+                    })?;
+                    let share_info =
+                        share.get_raw_record()?.share_info.clone().ok_or_else(|| {
+                            cloudkit_protocol_error("CloudKit zone share metadata was missing")
+                        })?;
+                    shares.remove(0);
                     zone.1 = Some(share_info);
                 }
             }
@@ -2938,7 +3033,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             )
             .await?;
 
-        let raw = record.get_raw_record();
+        let raw = record.get_raw_record()?;
 
         Ok(CloudKitShare::from_record(raw, config))
     }
@@ -3398,7 +3493,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         }
 
         let mut saved =
-            SaveRecordOperation::new(share_record_id, share.clone(), Some(&config), true);
+            SaveRecordOperation::try_new(share_record_id, share.clone(), Some(&config), true)?;
         let record = saved.0.record.as_mut().unwrap();
         record.share_info = Some(share.share_info.clone());
         record.stable_url = share.url.clone();
@@ -3659,6 +3754,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             request_identity,
             true,
             None,
+            None,
         )
         .await
     }
@@ -3675,6 +3771,29 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         request_identity: CloudKitRequestIdentity,
         prepared_authentication: CloudKitPreparedAuthentication<T>,
     ) -> Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> {
+        if retry_policy.request_timeout.is_zero()
+            || retry_policy.request_timeout > CLOUDKIT_MAX_ONE_SHOT_REQUEST_TIMEOUT
+        {
+            return Err(CloudKitRequestFailure {
+                error: cloudkit_invalid_input(
+                    "CloudKit one-shot request timeout was outside the supported range",
+                ),
+                retry_after: None,
+                failure_class: None,
+                request_identity: Some(request_identity),
+                outcome_may_be_committed: false,
+            });
+        }
+        let Some(deadline) = tokio::time::Instant::now().checked_add(retry_policy.request_timeout)
+        else {
+            return Err(CloudKitRequestFailure {
+                error: cloudkit_invalid_input("CloudKit one-shot request deadline overflowed"),
+                retry_after: None,
+                failure_class: None,
+                request_identity: Some(request_identity),
+                outcome_may_be_committed: false,
+            });
+        };
         self.perform_operations_detailed_with_identity_internal(
             session,
             ops,
@@ -3683,6 +3802,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             request_identity,
             false,
             Some(prepared_authentication),
+            Some(deadline),
         )
         .await
     }
@@ -3721,6 +3841,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         request_identity: CloudKitRequestIdentity,
         allow_automatic_replay: bool,
         prepared_authentication: Option<CloudKitPreparedAuthentication<T>>,
+        one_shot_deadline: Option<tokio::time::Instant>,
     ) -> Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> {
         if let Err(error) = request_identity.validate_operation_count(ops.len()) {
             return Err(error.into());
@@ -3728,6 +3849,12 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         if allow_automatic_replay == prepared_authentication.is_some() {
             return Err(cloudkit_invalid_input(
                 "CloudKit authentication mode did not match replay policy",
+            )
+            .into());
+        }
+        if allow_automatic_replay == one_shot_deadline.is_some() {
+            return Err(cloudkit_invalid_input(
+                "CloudKit deadline mode did not match replay policy",
             )
             .into());
         }
@@ -3745,6 +3872,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             }
         }
         let failure_identity = request_identity.clone();
+        let mut submission_started = false;
         let result: Result<CloudKitBatchResponse<Op::Response>, CloudKitRequestFailure> = async {
         if ops.is_empty() {
             return Ok(CloudKitBatchResponse {
@@ -3823,45 +3951,65 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 .headers(custom_headers.clone())
                 .body(compressed_request.clone());
 
-            let response = match tokio::time::timeout(retry_policy.request_timeout, request.send())
-                .await
+            if one_shot_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
             {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    if automatic_retry_safe && attempt < max_attempts {
-                        let delay =
-                            retry_delay(retry_policy, attempt, None).unwrap_or(Duration::ZERO);
-                        warn!(
-                            "CloudKit {:?} request transport failed; retrying attempt {} after {:?}",
-                            Op::operation(),
-                            attempt + 1,
-                            delay,
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
+                return Err(PushError::IoError(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "CloudKit one-shot operation timed out before remote submission",
+                ))
+                .into());
+            }
+            // Conservatively cross the ambiguity boundary before entering
+            // reqwest. A transport error after this point cannot prove that no
+            // request bytes reached Apple.
+            submission_started = true;
+            let response = if let Some(deadline) = one_shot_deadline {
+                within_cloudkit_one_shot_deadline(
+                    deadline,
+                    async { request.send().await.map_err(PushError::from) },
+                    "CloudKit one-shot operation timed out before receiving response headers",
+                )
+                .await?
+            } else {
+                match tokio::time::timeout(retry_policy.request_timeout, request.send()).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        if automatic_retry_safe && attempt < max_attempts {
+                            let delay = retry_delay(retry_policy, attempt, None)
+                                .unwrap_or(Duration::ZERO);
+                            warn!(
+                                "CloudKit {:?} request transport failed; retrying attempt {} after {:?}",
+                                Op::operation(),
+                                attempt + 1,
+                                delay,
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(PushError::RequestError(error).into());
                     }
-                    return Err(PushError::RequestError(error).into());
-                }
-                Err(_) => {
-                    if automatic_retry_safe && attempt < max_attempts {
-                        let delay =
-                            retry_delay(retry_policy, attempt, None).unwrap_or(Duration::ZERO);
-                        warn!(
-                            "CloudKit {:?} request timed out; retrying attempt {} after {:?}",
-                            Op::operation(),
-                            attempt + 1,
-                            delay,
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
+                    Err(_) => {
+                        if automatic_retry_safe && attempt < max_attempts {
+                            let delay = retry_delay(retry_policy, attempt, None)
+                                .unwrap_or(Duration::ZERO);
+                            warn!(
+                                "CloudKit {:?} request timed out; retrying attempt {} after {:?}",
+                                Op::operation(),
+                                attempt + 1,
+                                delay,
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(PushError::IoError(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "CloudKit request timed out",
+                        ))
+                        .into());
                     }
-                    return Err(PushError::IoError(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        "CloudKit request timed out",
-                    ))
-                    .into());
                 }
             };
 
@@ -3903,29 +4051,53 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     retry_after,
                     failure_class: Some(failure_class),
                     request_identity: None,
+                    outcome_may_be_committed: false,
                 });
             }
 
-            let body = match tokio::time::timeout(
-                retry_policy.request_timeout,
-                read_cloudkit_response_body(response),
-            )
-            .await
-            {
-                Ok(Ok(body)) => body,
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => {
-                    return Err(PushError::IoError(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        "CloudKit response body timed out",
-                    ))
-                    .into())
+            let body = if let Some(deadline) = one_shot_deadline {
+                within_cloudkit_one_shot_deadline(
+                    deadline,
+                    read_cloudkit_response_body(response),
+                    "CloudKit one-shot operation timed out while reading response body",
+                )
+                .await?
+            } else {
+                match tokio::time::timeout(
+                    retry_policy.request_timeout,
+                    read_cloudkit_response_body(response),
+                )
+                .await
+                {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => {
+                        return Err(PushError::IoError(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "CloudKit response body timed out",
+                        ))
+                        .into())
+                    }
                 }
             };
-            let response = undelimit_response(&body)?
-                .into_iter()
-                .map(|frame| Ok(ResponseOperation::decode(&mut Cursor::new(frame))?))
-                .collect::<Result<Vec<ResponseOperation>, PushError>>()?;
+            let response = if let Some(deadline) = one_shot_deadline {
+                within_cloudkit_one_shot_deadline(
+                    deadline,
+                    async move {
+                        tokio::task::spawn_blocking(move || decode_cloudkit_response_body(body))
+                            .await
+                            .map_err(|_| {
+                                cloudkit_protocol_error(
+                                    "CloudKit response decoder task failed unexpectedly",
+                                )
+                            })?
+                    },
+                    "CloudKit one-shot operation timed out while decoding response body",
+                )
+                .await?
+            } else {
+                decode_cloudkit_response_body(body)?
+            };
 
             return Ok(self.parse_operation_responses::<Op>(&request_identity, &response)?);
         }
@@ -3933,6 +4105,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         .await;
         result.map_err(|mut failure| {
             failure.request_identity = Some(failure_identity);
+            failure.outcome_may_be_committed |= submission_started;
             failure
         })
     }
@@ -4161,10 +4334,294 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 #[cfg(test)]
 mod cloud_sync_transport_tests {
     use super::*;
+    use icloud_auth::AppleAccount;
+    use omnisette::{AnisetteClient, AnisetteError, LoginClientInfo};
+    use std::sync::OnceLock;
 
     const HTTP_REQUEST_UUID: &str = "11111111-2222-4ABC-8DEF-555555555555";
     const OPERATION_UUID_A: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
     const OPERATION_UUID_B: &str = "01234567-89AB-4CDE-8F01-23456789ABCD";
+
+    struct OneShotTestAnisette;
+
+    impl AnisetteProvider for OneShotTestAnisette {
+        fn get_anisette_headers(
+            &mut self,
+        ) -> impl Future<Output = Result<HashMap<String, String>, AnisetteError>> + Send {
+            async { Ok(HashMap::new()) }
+        }
+    }
+
+    struct OneShotTestConfig;
+
+    #[async_trait::async_trait]
+    impl OSConfig for OneShotTestConfig {
+        fn build_activation_info(&self, _csr: Vec<u8>) -> crate::activation::ActivationInfo {
+            unreachable!("one-shot loopback tests do not activate a device")
+        }
+
+        fn get_activation_device(&self) -> String {
+            "test-device".to_owned()
+        }
+
+        async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
+            unreachable!("one-shot loopback tests use prepared authentication")
+        }
+
+        fn get_protocol_version(&self) -> u32 {
+            1
+        }
+
+        fn get_register_meta(&self) -> crate::RegisterMeta {
+            crate::RegisterMeta {
+                hardware_version: "test-hardware".to_owned(),
+                os_version: "test-os".to_owned(),
+                software_version: "test-software".to_owned(),
+            }
+        }
+
+        fn get_normal_ua(&self, item: &str) -> String {
+            item.to_owned()
+        }
+
+        fn get_mme_clientinfo(&self, item: &str) -> String {
+            item.to_owned()
+        }
+
+        fn get_version_ua(&self) -> String {
+            "test-version".to_owned()
+        }
+
+        fn get_device_name(&self) -> String {
+            "test-device".to_owned()
+        }
+
+        fn get_device_uuid(&self) -> String {
+            "test-device-uuid".to_owned()
+        }
+
+        fn get_private_data(&self) -> plist::Dictionary {
+            plist::Dictionary::new()
+        }
+
+        fn get_debug_meta(&self) -> crate::DebugMeta {
+            crate::DebugMeta {
+                user_version: "test-user-version".to_owned(),
+                hardware_version: "test-hardware".to_owned(),
+                serial_number: "test-serial".to_owned(),
+            }
+        }
+
+        fn get_login_url(&self) -> &'static str {
+            "http://127.0.0.1/unused"
+        }
+
+        fn get_serial_number(&self) -> String {
+            "test-serial".to_owned()
+        }
+
+        fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+
+        fn get_aoskit_version(&self) -> String {
+            "test-aoskit".to_owned()
+        }
+
+        fn get_udid(&self) -> String {
+            "test-udid".to_owned()
+        }
+    }
+
+    static BEFORE_HEADERS_ENDPOINT: OnceLock<String> = OnceLock::new();
+    static SHARED_BUDGET_ENDPOINT: OnceLock<String> = OnceLock::new();
+    static DROPPED_RESPONSE_ENDPOINT: OnceLock<String> = OnceLock::new();
+    static REDIRECT_ENDPOINT: OnceLock<String> = OnceLock::new();
+    static UNAUTHORIZED_ENDPOINT: OnceLock<String> = OnceLock::new();
+    static SERVER_ERROR_ENDPOINT: OnceLock<String> = OnceLock::new();
+
+    macro_rules! one_shot_loopback_operation {
+        ($name:ident, $endpoint:ident) => {
+            struct $name;
+
+            impl CloudKitOp for $name {
+                type Response = ();
+
+                fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
+                    output.zone_retrieve_request = Some(Default::default());
+                }
+
+                fn retrieve_response(
+                    _response: &cloudkit_proto::ResponseOperation,
+                ) -> Result<Self::Response, PushError> {
+                    Ok(())
+                }
+
+                fn flow_control_key() -> &'static str {
+                    "OneShotDeadlineLoopback"
+                }
+
+                fn operation() -> cloudkit_proto::operation::Type {
+                    cloudkit_proto::operation::Type::ZoneRetrieveType
+                }
+
+                fn is_fetch() -> bool {
+                    true
+                }
+
+                fn link() -> &'static str {
+                    $endpoint
+                        .get()
+                        .expect("loopback endpoint must be initialized")
+                }
+
+                fn retry_safety(&self) -> CloudKitRetrySafety {
+                    CloudKitRetrySafety::ReadOnly
+                }
+            }
+        };
+    }
+
+    one_shot_loopback_operation!(BeforeHeadersOperation, BEFORE_HEADERS_ENDPOINT);
+    one_shot_loopback_operation!(SharedBudgetOperation, SHARED_BUDGET_ENDPOINT);
+    one_shot_loopback_operation!(DroppedResponseOperation, DROPPED_RESPONSE_ENDPOINT);
+    one_shot_loopback_operation!(RedirectOperation, REDIRECT_ENDPOINT);
+    one_shot_loopback_operation!(UnauthorizedOperation, UNAUTHORIZED_ENDPOINT);
+    one_shot_loopback_operation!(ServerErrorOperation, SERVER_ERROR_ENDPOINT);
+
+    fn one_shot_test_open_container<'a>(
+        container: &'a CloudKitContainer<'a>,
+    ) -> CloudKitOpenContainer<'a, OneShotTestAnisette> {
+        let anisette = Arc::new(tokio::sync::Mutex::new(AnisetteClient::new(
+            OneShotTestAnisette,
+        )));
+        let account = AppleAccount::new_with_anisette(LoginClientInfo::default(), anisette.clone())
+            .expect("test Apple account must initialize");
+        let config: Arc<dyn OSConfig> = Arc::new(OneShotTestConfig);
+        let token_provider = TokenProvider::new(Arc::new(DebugMutex::new(account)), config.clone());
+        let client = Arc::new(CloudKitClient {
+            anisette,
+            state: DebugRwLock::new(CloudKitState::new("test-dsid".to_owned()).unwrap()),
+            config,
+            token_provider,
+        });
+
+        CloudKitOpenContainer {
+            container,
+            user_id: "test-cloudkit-user".to_owned(),
+            client,
+            keys: DebugMutex::new(HashMap::new()),
+            database_type: container.database_type,
+        }
+    }
+
+    fn one_shot_test_authentication(
+        open: &CloudKitOpenContainer<'_, OneShotTestAnisette>,
+    ) -> CloudKitPreparedAuthentication<OneShotTestAnisette> {
+        CloudKitPreparedAuthentication {
+            client: open.client.clone(),
+            user_id: open.user_id.clone(),
+            bundle_id: open.bundleid.to_owned(),
+            container_id: open.containerid.to_owned(),
+            database_type: open.database_type,
+            cloudkit_token: "test-cloudkit-token".to_owned(),
+            anisette_headers: HeaderMap::new(),
+        }
+    }
+
+    fn one_shot_test_container() -> CloudKitContainer<'static> {
+        CloudKitContainer {
+            database_type: Database::PrivateDb,
+            bundleid: "com.example.cloudkit-deadline-test",
+            containerid: "com.example.cloudkit-deadline-test",
+            env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        }
+    }
+
+    fn assert_one_shot_timeout(
+        failure: CloudKitRequestFailure,
+        identity: &CloudKitRequestIdentity,
+        expected_message: &str,
+    ) {
+        assert_eq!(failure.request_identity.as_ref(), Some(identity));
+        assert!(failure.outcome_may_be_committed);
+        assert!(matches!(
+            failure.error,
+            PushError::IoError(ref source)
+                if source.kind() == ErrorKind::TimedOut
+                    && source.to_string() == expected_message
+        ));
+    }
+
+    async fn assert_public_one_shot_status_without_replay<Op: CloudKitOp>(
+        operation: Op,
+        endpoint: &'static OnceLock<String>,
+        status: u16,
+        reason: &'static str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        endpoint.set(format!("http://{address}/status")).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains(HTTP_REQUEST_UUID));
+            let redirect = if (300..400).contains(&status) {
+                format!("Location: http://{address}/replayed\r\n")
+            } else {
+                String::new()
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\n{redirect}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+        let result = open
+            .perform_operations_detailed_once_with_identity(
+                &CloudKitSession::new(),
+                &[operation],
+                IsolationLevel::Operation,
+                &CloudKitRetryPolicy {
+                    max_attempts: 4,
+                    request_timeout: Duration::from_secs(2),
+                    ..CloudKitRetryPolicy::default()
+                },
+                identity.clone(),
+                one_shot_test_authentication(&open),
+            )
+            .await;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("HTTP status {status} unexpectedly succeeded"),
+        };
+        assert_eq!(failure.request_identity.as_ref(), Some(&identity));
+        assert!(failure.outcome_may_be_committed);
+        assert!(matches!(
+            failure.error,
+            PushError::CloudKitHttpError { status: actual, .. } if actual == status
+        ));
+        assert!(
+            !server.await.unwrap(),
+            "one-shot status request was replayed"
+        );
+    }
 
     #[test]
     fn persisted_request_identity_preserves_canonical_uuids() {
@@ -4270,7 +4727,7 @@ mod cloud_sync_transport_tests {
     }
 
     #[test]
-    fn operation_headers_cannot_override_persisted_request_identity() {
+    fn operation_headers_cannot_override_identity_scope_or_authentication() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-cloudkit-partition",
@@ -4278,11 +4735,25 @@ mod cloud_sync_transport_tests {
         );
         assert!(validate_cloudkit_operation_headers(&headers).is_ok());
 
-        headers.insert(
+        for reserved in [
             "x-apple-request-uuid",
-            HeaderValue::from_static(HTTP_REQUEST_UUID),
-        );
-        assert!(validate_cloudkit_operation_headers(&headers).is_err());
+            "x-apple-operation-group-id",
+            "x-apple-operation-id",
+            "x-cloudkit-userid",
+            "x-cloudkit-authtoken",
+            "x-cloudkit-bundleid",
+            "x-cloudkit-containerid",
+            "x-cloudkit-databasescope",
+            "x-cloudkit-environment",
+            "x-mme-client-info",
+        ] {
+            let mut attempted_override = HeaderMap::new();
+            attempted_override.insert(
+                HeaderName::from_static(reserved),
+                HeaderValue::from_static("override"),
+            );
+            assert!(validate_cloudkit_operation_headers(&attempted_override).is_err());
+        }
     }
 
     #[test]
@@ -4300,34 +4771,237 @@ mod cloud_sync_transport_tests {
     }
 
     #[tokio::test]
-    async fn one_shot_http_client_does_not_follow_redirects() {
+    async fn public_one_shot_does_not_redirect_refresh_or_retry_http_failures() {
+        assert_public_one_shot_status_without_replay(
+            RedirectOperation,
+            &REDIRECT_ENDPOINT,
+            307,
+            "Temporary Redirect",
+        )
+        .await;
+        assert_public_one_shot_status_without_replay(
+            UnauthorizedOperation,
+            &UNAUTHORIZED_ENDPOINT,
+            401,
+            "Unauthorized",
+        )
+        .await;
+        assert_public_one_shot_status_without_replay(
+            ServerErrorOperation,
+            &SERVER_ERROR_ENDPOINT,
+            500,
+            "Internal Server Error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_one_shot_times_out_before_headers_without_replay() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        BEFORE_HEADERS_ENDPOINT
+            .set(format!("http://{address}/before-headers"))
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains(HTTP_REQUEST_UUID));
+
+            let replay = tokio::time::timeout(Duration::from_millis(700), listener.accept()).await;
+            drop(socket);
+            replay.is_ok()
+        });
+
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+        let policy = CloudKitRetryPolicy {
+            max_attempts: 4,
+            request_timeout: Duration::from_millis(300),
+            ..CloudKitRetryPolicy::default()
+        };
+        let result = open
+            .perform_operations_detailed_once_with_identity(
+                &CloudKitSession::new(),
+                &[BeforeHeadersOperation],
+                IsolationLevel::Operation,
+                &policy,
+                identity.clone(),
+                one_shot_test_authentication(&open),
+            )
+            .await;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("one-shot request unexpectedly completed before its deadline"),
+        };
+
+        assert_one_shot_timeout(
+            failure,
+            &identity,
+            "CloudKit one-shot operation timed out before receiving response headers",
+        );
+        assert!(!server.await.unwrap(), "one-shot request was replayed");
+    }
+
+    #[tokio::test]
+    async fn public_one_shot_shares_one_deadline_across_headers_and_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        SHARED_BUDGET_ENDPOINT
+            .set(format!("http://{address}/shared-budget"))
+            .unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 2048];
-            let _ = socket.read(&mut request).await.unwrap();
-            let response = format!(
-                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                    .await
-                    .is_err()
-            );
+            let mut request = [0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains(HTTP_REQUEST_UUID));
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = socket.write_all(b"body").await;
+            let replay = tokio::time::timeout(Duration::from_millis(400), listener.accept()).await;
+            replay.is_ok()
         });
 
-        let response = REQWEST_NO_REDIRECT
-            .post(format!("http://{address}/first"))
-            .body("fixture")
-            .send()
-            .await
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+        let policy = CloudKitRetryPolicy {
+            max_attempts: 4,
+            request_timeout: Duration::from_millis(600),
+            ..CloudKitRetryPolicy::default()
+        };
+        let result = open
+            .perform_operations_detailed_once_with_identity(
+                &CloudKitSession::new(),
+                &[SharedBudgetOperation],
+                IsolationLevel::Operation,
+                &policy,
+                identity.clone(),
+                one_shot_test_authentication(&open),
+            )
+            .await;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("one-shot request unexpectedly completed within its shared budget"),
+        };
+
+        assert_one_shot_timeout(
+            failure,
+            &identity,
+            "CloudKit one-shot operation timed out while reading response body",
+        );
+        assert!(!server.await.unwrap(), "one-shot request was replayed");
+    }
+
+    #[tokio::test]
+    async fn public_one_shot_marks_dropped_response_unknown_without_replay() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        DROPPED_RESPONSE_ENDPOINT
+            .set(format!("http://{address}/dropped-response"))
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        server.await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains(HTTP_REQUEST_UUID));
+            drop(socket);
+
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+        let result = open
+            .perform_operations_detailed_once_with_identity(
+                &CloudKitSession::new(),
+                &[DroppedResponseOperation],
+                IsolationLevel::Operation,
+                &CloudKitRetryPolicy {
+                    max_attempts: 4,
+                    request_timeout: Duration::from_secs(2),
+                    ..CloudKitRetryPolicy::default()
+                },
+                identity.clone(),
+                one_shot_test_authentication(&open),
+            )
+            .await;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("dropped response unexpectedly succeeded"),
+        };
+
+        assert_eq!(failure.request_identity.as_ref(), Some(&identity));
+        assert!(failure.outcome_may_be_committed);
+        assert!(!server.await.unwrap(), "one-shot request was replayed");
+    }
+
+    #[tokio::test]
+    async fn public_one_shot_rejects_invalid_timeout_before_submission() {
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .unwrap();
+
+        for request_timeout in [
+            Duration::ZERO,
+            CLOUDKIT_MAX_ONE_SHOT_REQUEST_TIMEOUT + Duration::from_millis(1),
+        ] {
+            let result = open
+                .perform_operations_detailed_once_with_identity(
+                    &CloudKitSession::new(),
+                    &[BeforeHeadersOperation],
+                    IsolationLevel::Operation,
+                    &CloudKitRetryPolicy {
+                        request_timeout,
+                        ..CloudKitRetryPolicy::default()
+                    },
+                    identity.clone(),
+                    one_shot_test_authentication(&open),
+                )
+                .await;
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(_) => panic!("invalid timeout unexpectedly reached submission"),
+            };
+            assert_eq!(failure.request_identity.as_ref(), Some(&identity));
+            assert!(!failure.outcome_may_be_committed);
+        }
     }
 
     #[test]
@@ -4347,6 +5021,96 @@ mod cloud_sync_transport_tests {
     #[test]
     fn empty_record_mapping_is_rejected_instead_of_silently_reallocated() {
         assert!(allocate_or_reuse_record_name(Some("")).is_err());
+    }
+
+    #[test]
+    fn fallible_save_builder_rejects_missing_pcs_key_without_panicking() {
+        let zone = public_zone();
+        let key = PCSZoneConfig {
+            identifier: zone.clone(),
+            zone_keys: vec![],
+            zone_protection_tag: None,
+            default_record_keys: vec![],
+            record_prot_tag: None,
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        };
+
+        let result = SaveRecordOperation::try_new(
+            record_identifier(zone, "create-only-fixture"),
+            ZoneUpdatePlugin {
+                zone_update_data: vec![],
+            },
+            Some(&key),
+            false,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_builder_encodes_create_only_wire_semantics() {
+        let operation = SaveRecordOperation::try_new(
+            record_identifier(public_zone(), "create-only-record"),
+            ZoneUpdatePlugin {
+                zone_update_data: vec![],
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(operation.0.save_semantics, Some(2));
+        assert!(operation.0.record_protection_info_tag.is_none());
+    }
+
+    #[test]
+    fn fetched_record_identity_must_match_the_exact_requested_name() {
+        let response = ResponseOperation {
+            record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
+                record: Some(Record {
+                    record_identifier: Some(record_identifier(public_zone(), "returned-record")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fetched = FetchRecordOperation::retrieve_response(&response).unwrap();
+
+        fetched.verify_id("returned-record").unwrap();
+        assert!(fetched.verify_id("requested-record").is_err());
+    }
+
+    #[test]
+    fn pcs_record_validation_rejects_missing_identity_key_and_oversized_prefix() {
+        let zone = public_zone();
+        let keys = PCSZoneConfig {
+            identifier: zone.clone(),
+            zone_keys: vec![],
+            zone_protection_tag: None,
+            default_record_keys: vec![PCSKey::random()],
+            record_prot_tag: None,
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        };
+
+        assert!(pcs_keys_for_record(&Record::default(), &keys).is_err());
+
+        let missing_key = Record {
+            record_identifier: Some(record_identifier(zone.clone(), "missing-pcs-key")),
+            ..Default::default()
+        };
+        assert!(pcs_keys_for_record(&missing_key, &keys).is_err());
+
+        let oversized_prefix = Record {
+            record_identifier: Some(record_identifier(zone, "oversized-pcs-prefix")),
+            pcs_key: Some(vec![0; 1024]),
+            ..Default::default()
+        };
+        assert!(pcs_keys_for_record(&oversized_prefix, &keys).is_err());
     }
 
     #[test]

@@ -10,10 +10,12 @@ use crate::cloud_messages::cloudmessagesp::{
     ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4,
 };
 use crate::cloudkit::{
-    pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest,
+    pcs_keys_for_record, record_identifier, CloudKitBatchResponse, CloudKitFailureClass,
+    CloudKitOpenContainer, CloudKitPreparedAuthentication, CloudKitRequestFailure,
+    CloudKitRequestIdentity, CloudKitRetryPolicy, CloudKitSession, CloudKitUploadRequest,
     DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords,
     QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS,
-    CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE, NO_ASSETS,
+    CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE, CLOUDKIT_MAX_OPERATIONS_PER_REQUEST, NO_ASSETS,
 };
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
@@ -51,7 +53,7 @@ use crate::util::{
     StreamTypedCoder,
 };
 use crate::{
-    cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer},
+    cloudkit::{CloudKitClient, CloudKitContainer},
     PushError,
 };
 use crate::{Attachment, AttachmentType, FileContainer};
@@ -884,6 +886,708 @@ fn map_ordered_page_changes(
         .collect()
 }
 
+/// The redacted result of one prepared message save. The native caller gets
+/// durable correlation data and CloudKit's retry classification, but never a
+/// raw CloudKit record or a `PushError` that could contain response payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloudMessagesSaveFailureScope {
+    Request,
+    Operation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloudMessagesSaveResult {
+    Succeeded,
+    /// The request crossed the remote-submission ambiguity boundary but no
+    /// trustworthy per-operation response proved what Apple committed. A
+    /// durable caller must reconcile this stable record name and payload; it
+    /// must not replay the create as an ordinary retry.
+    UnknownOutcome {
+        failure_class: Option<CloudKitFailureClass>,
+        retry_after: Option<Duration>,
+    },
+    Failed {
+        scope: CloudMessagesSaveFailureScope,
+        failure_class: Option<CloudKitFailureClass>,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Protected reconciliation result for one stable message record name.
+/// Message contents never cross the native bridge; the caller compares them
+/// inside Rust and receives only the disposition and retry classification.
+#[derive(Debug)]
+pub enum CloudMessageRecordLookup {
+    Found(CloudMessage),
+    NotFound,
+    Unresolved {
+        failure_class: Option<CloudKitFailureClass>,
+        retry_after: Option<Duration>,
+    },
+}
+
+fn is_cloudkit_record_not_found(error: &PushError) -> bool {
+    let PushError::CloudKitError(result) = error else {
+        return false;
+    };
+    result
+        .error
+        .as_ref()
+        .and_then(|error| error.server_error.as_ref())
+        .and_then(|error| error.r#type)
+        .and_then(|code| {
+            cloudkit_proto::response_operation::result::error::server::Code::try_from(code).ok()
+        })
+        == Some(cloudkit_proto::response_operation::result::error::server::Code::NotFound)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudMessagesSaveOutcome {
+    pub local_operation_id: String,
+    pub apple_operation_uuid: String,
+    pub result: CloudMessagesSaveResult,
+}
+
+/// Native-only input for one V2 message save. The Apple CloudKit record name
+/// is intentionally distinct from the local durable operation correlation ID.
+/// The former is used only to build the native save operation; only the latter
+/// is retained in the prepared owner and returned in outcomes.
+pub struct CloudMessageSaveInput {
+    pub local_operation_id: String,
+    pub server_record_name: String,
+    /// The exact persisted Apple operation UUID bound to this local operation.
+    /// Preparation rejects positional reordering against the request identity.
+    pub apple_operation_uuid: String,
+    pub message: CloudMessage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloudMessagesSaveConsumeError {
+    CorrelationMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudMessagesSaveMode {
+    /// Existing mapped-record updates are intentionally unsupported until
+    /// predecessor ETag binding is fixture-proven and durably persisted.
+    CreateOnly,
+}
+
+impl CloudMessagesSaveMode {
+    const fn update_flag(self) -> bool {
+        match self {
+            Self::CreateOnly => false,
+        }
+    }
+}
+
+/// A native, single-use owner for one message-only CloudKit save request.
+///
+/// This intentionally has no `Clone` implementation. Once `consume_once` is
+/// called, the authentication, request identity, and operations are moved
+/// into the no-replay CloudKit primitive together. The caller cannot recreate
+/// or submit the same prepared request through this value.
+pub struct CloudMessagesPreparedSaveSubmission<P: AnisetteProvider> {
+    container: Arc<CloudKitOpenContainer<'static, P>>,
+    session: CloudKitSession,
+    request_identity: CloudKitRequestIdentity,
+    prepared_authentication: CloudKitPreparedAuthentication<P>,
+    operations: Vec<SaveRecordOperation>,
+    local_operation_ids: Vec<String>,
+    retry_policy: CloudKitRetryPolicy,
+}
+
+impl<P: AnisetteProvider> CloudMessagesPreparedSaveSubmission<P> {
+    /// Consumes this owner exactly once through the identified, no-replay
+    /// CloudKit operation. Request-level failures are converted into one
+    /// redacted outcome per local record so the durable caller retains the
+    /// local-ID/Apple-operation-ID correlation even when no response arrives.
+    pub async fn consume_once(
+        self,
+    ) -> Result<Vec<CloudMessagesSaveOutcome>, CloudMessagesSaveConsumeError> {
+        let Self {
+            container,
+            session,
+            request_identity,
+            prepared_authentication,
+            operations,
+            local_operation_ids,
+            retry_policy,
+        } = self;
+
+        let expected_request_identity = request_identity.clone();
+        let operation_uuids = expected_request_identity.operation_uuids().to_vec();
+        if operation_uuids.len() != local_operation_ids.len()
+            || operations.len() != local_operation_ids.len()
+        {
+            return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+        }
+        // Retain only the redacted durable correlation needed to fail closed
+        // if Apple's response is malformed. Once the request is submitted, a
+        // response-identity or response-shape mismatch cannot prove that the
+        // corresponding create did not commit, so it must never become an
+        // ordinary retryable failure.
+        let correlation_fallback = local_operation_ids
+            .iter()
+            .cloned()
+            .zip(operation_uuids.iter().cloned())
+            .collect::<Vec<_>>();
+        let response = container
+            .perform_operations_detailed_once_with_identity(
+                &session,
+                &operations,
+                IsolationLevel::Operation,
+                &retry_policy,
+                request_identity,
+                prepared_authentication,
+            )
+            .await;
+
+        let mapped = match response {
+            Ok(response) => redacted_batch_response_outcomes(
+                local_operation_ids,
+                &expected_request_identity,
+                response,
+            ),
+            Err(failure) => redacted_request_failure_outcomes(
+                local_operation_ids,
+                &expected_request_identity,
+                failure,
+            ),
+        };
+        match mapped {
+            Ok(outcomes) => Ok(outcomes),
+            Err(CloudMessagesSaveConsumeError::CorrelationMismatch) => Ok(correlation_fallback
+                .into_iter()
+                .map(
+                    |(local_operation_id, apple_operation_uuid)| CloudMessagesSaveOutcome {
+                        local_operation_id,
+                        apple_operation_uuid,
+                        result: CloudMessagesSaveResult::UnknownOutcome {
+                            failure_class: Some(CloudKitFailureClass::Unknown),
+                            retry_after: None,
+                        },
+                    },
+                )
+                .collect()),
+        }
+    }
+}
+
+fn redacted_batch_response_outcomes(
+    local_operation_ids: Vec<String>,
+    expected_request_identity: &CloudKitRequestIdentity,
+    response: CloudKitBatchResponse<Option<Record>>,
+) -> Result<Vec<CloudMessagesSaveOutcome>, CloudMessagesSaveConsumeError> {
+    if response.request_identity != *expected_request_identity {
+        return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+    }
+
+    let operation_uuids = expected_request_identity.operation_uuids().to_vec();
+    if local_operation_ids.len() != operation_uuids.len()
+        || response.outcomes.len() != local_operation_ids.len()
+    {
+        return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+    }
+
+    let mut outcomes_by_index = (0..local_operation_ids.len())
+        .map(|_| None)
+        .collect::<Vec<_>>();
+    for outcome in response.outcomes {
+        let request_index = outcome.request_index;
+        if request_index >= outcomes_by_index.len() || outcomes_by_index[request_index].is_some() {
+            return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+        }
+        outcomes_by_index[request_index] = Some(outcome);
+    }
+
+    local_operation_ids
+        .into_iter()
+        .zip(operation_uuids)
+        .enumerate()
+        .map(
+            |(request_index, (local_operation_id, apple_operation_uuid))| {
+                let outcome = outcomes_by_index[request_index]
+                    .take()
+                    .ok_or(CloudMessagesSaveConsumeError::CorrelationMismatch)?;
+                if outcome.operation_uuid != apple_operation_uuid {
+                    return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+                }
+                Ok(CloudMessagesSaveOutcome {
+                    local_operation_id,
+                    apple_operation_uuid,
+                    result: if outcome.result.is_ok() {
+                        CloudMessagesSaveResult::Succeeded
+                    } else if outcome.failure_class.is_none()
+                        || outcome.failure_class == Some(CloudKitFailureClass::Unknown)
+                    {
+                        // An unclassified operation response is not proof of
+                        // rejection. Preserve the stable record mapping and
+                        // force reconciliation rather than replaying it.
+                        CloudMessagesSaveResult::UnknownOutcome {
+                            failure_class: outcome.failure_class,
+                            retry_after: outcome.retry_after,
+                        }
+                    } else {
+                        CloudMessagesSaveResult::Failed {
+                            scope: CloudMessagesSaveFailureScope::Operation,
+                            failure_class: outcome.failure_class,
+                            retry_after: outcome.retry_after,
+                        }
+                    },
+                })
+            },
+        )
+        .collect()
+}
+
+fn redacted_request_failure_outcomes(
+    local_operation_ids: Vec<String>,
+    expected_request_identity: &CloudKitRequestIdentity,
+    failure: CloudKitRequestFailure,
+) -> Result<Vec<CloudMessagesSaveOutcome>, CloudMessagesSaveConsumeError> {
+    if failure.request_identity.as_ref() != Some(expected_request_identity)
+        || local_operation_ids.len() != expected_request_identity.operation_uuids().len()
+    {
+        return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
+    }
+
+    let operation_uuids = expected_request_identity.operation_uuids().to_vec();
+    let failure_result = if failure.outcome_may_be_committed {
+        CloudMessagesSaveResult::UnknownOutcome {
+            failure_class: failure.failure_class,
+            retry_after: failure.retry_after,
+        }
+    } else {
+        CloudMessagesSaveResult::Failed {
+            scope: CloudMessagesSaveFailureScope::Request,
+            failure_class: failure.failure_class,
+            retry_after: failure.retry_after,
+        }
+    };
+
+    Ok(local_operation_ids
+        .into_iter()
+        .zip(operation_uuids)
+        .map(
+            |(local_operation_id, apple_operation_uuid)| CloudMessagesSaveOutcome {
+                local_operation_id,
+                apple_operation_uuid,
+                result: failure_result,
+            },
+        )
+        .collect())
+}
+
+fn ordered_message_save_pairs(
+    messages: &[CloudMessageSaveInput],
+    request_identity: &CloudKitRequestIdentity,
+) -> Result<Vec<(String, String)>, PushError> {
+    if messages.is_empty()
+        || messages.len() > CLOUDKIT_MAX_OPERATIONS_PER_REQUEST
+        || messages.iter().any(|input| {
+            input.local_operation_id.is_empty()
+                || input.server_record_name.is_empty()
+                || input.apple_operation_uuid.is_empty()
+        })
+    {
+        return Err(PushError::BadMsg);
+    }
+
+    let mut seen_local_operation_ids = std::collections::HashSet::with_capacity(messages.len());
+    let mut seen_server_record_names = std::collections::HashSet::with_capacity(messages.len());
+    if messages.iter().any(|input| {
+        !seen_local_operation_ids.insert(input.local_operation_id.as_str())
+            || !seen_server_record_names.insert(input.server_record_name.as_str())
+    }) {
+        return Err(PushError::BadMsg);
+    }
+
+    if request_identity.operation_uuids().len() != messages.len() {
+        return Err(PushError::BadMsg);
+    }
+    if messages
+        .iter()
+        .zip(request_identity.operation_uuids())
+        .any(|(input, persisted_uuid)| input.apple_operation_uuid != *persisted_uuid)
+    {
+        return Err(PushError::BadMsg);
+    }
+
+    Ok(messages
+        .iter()
+        .map(|input| {
+            (
+                input.local_operation_id.clone(),
+                input.apple_operation_uuid.clone(),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod cloud_message_save_tests {
+    use super::*;
+    use crate::cloudkit::CloudKitOperationOutcome;
+
+    #[test]
+    fn only_explicit_server_not_found_proves_record_absence() {
+        let not_found = PushError::CloudKitError(cloudkit_proto::response_operation::Result {
+            error: Some(cloudkit_proto::response_operation::result::Error {
+                server_error: Some(cloudkit_proto::response_operation::result::error::Server {
+                    r#type: Some(
+                        cloudkit_proto::response_operation::result::error::server::Code::NotFound
+                            as i32,
+                    ),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let overloaded = PushError::CloudKitError(cloudkit_proto::response_operation::Result {
+            error: Some(cloudkit_proto::response_operation::result::Error {
+                server_error: Some(cloudkit_proto::response_operation::result::error::Server {
+                    r#type: Some(
+                        cloudkit_proto::response_operation::result::error::server::Code::Overloaded
+                            as i32,
+                    ),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(is_cloudkit_record_not_found(&not_found));
+        assert!(!is_cloudkit_record_not_found(&overloaded));
+        assert!(!is_cloudkit_record_not_found(&PushError::BadMsg));
+    }
+
+    fn input(
+        local_operation_id: &str,
+        server_record_name: &str,
+        apple_operation_uuid: &str,
+    ) -> CloudMessageSaveInput {
+        CloudMessageSaveInput {
+            local_operation_id: local_operation_id.to_string(),
+            server_record_name: server_record_name.to_string(),
+            apple_operation_uuid: apple_operation_uuid.to_string(),
+            message: CloudMessage::default(),
+        }
+    }
+
+    fn identity_with_http(
+        http_request_uuid: &str,
+        operation_uuids: &[&str],
+    ) -> CloudKitRequestIdentity {
+        CloudKitRequestIdentity::new(
+            http_request_uuid.to_string(),
+            operation_uuids
+                .iter()
+                .map(|uuid| (*uuid).to_string())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn identity(operation_uuids: &[&str]) -> CloudKitRequestIdentity {
+        identity_with_http("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", operation_uuids)
+    }
+
+    #[test]
+    fn save_pairing_preserves_local_order_without_returning_server_names() {
+        let operation_a = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB";
+        let operation_b = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC";
+        let messages = vec![
+            input("local-operation-a", "private-server-record-a", operation_a),
+            input("local-operation-b", "private-server-record-b", operation_b),
+        ];
+        let request_identity = identity(&[operation_a, operation_b]);
+
+        let pairs = ordered_message_save_pairs(&messages, &request_identity).unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "local-operation-a".to_string(),
+                    "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB".to_string(),
+                ),
+                (
+                    "local-operation-b".to_string(),
+                    "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC".to_string(),
+                ),
+            ]
+        );
+        assert!(!format!("{pairs:?}").contains("private-server-record"));
+    }
+
+    #[test]
+    fn save_pairing_rejects_empty_duplicate_and_mismatched_batches() {
+        let operation_a = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB";
+        let operation_b = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC";
+        let request_identity = identity(&[operation_a]);
+
+        assert!(matches!(
+            ordered_message_save_pairs(&[], &request_identity),
+            Err(PushError::BadMsg)
+        ));
+        assert!(matches!(
+            ordered_message_save_pairs(
+                &[input("", "server-record", operation_a)],
+                &request_identity,
+            ),
+            Err(PushError::BadMsg)
+        ));
+        assert!(matches!(
+            ordered_message_save_pairs(
+                &[
+                    input("duplicate", "server-a", operation_a),
+                    input("duplicate", "server-b", operation_b),
+                ],
+                &identity(&[operation_a, operation_b]),
+            ),
+            Err(PushError::BadMsg)
+        ));
+        assert!(matches!(
+            ordered_message_save_pairs(
+                &[
+                    input("one", "server", operation_a),
+                    input("two", "server", operation_b),
+                ],
+                &identity(&[operation_a, operation_b]),
+            ),
+            Err(PushError::BadMsg)
+        ));
+        assert!(matches!(
+            ordered_message_save_pairs(
+                &[
+                    input("one", "server-one", operation_a),
+                    input("two", "server-two", operation_b),
+                ],
+                &request_identity,
+            ),
+            Err(PushError::BadMsg)
+        ));
+        assert!(matches!(
+            ordered_message_save_pairs(
+                &[
+                    input("one", "server-one", operation_b),
+                    input("two", "server-two", operation_a),
+                ],
+                &identity(&[operation_a, operation_b]),
+            ),
+            Err(PushError::BadMsg)
+        ));
+    }
+
+    #[test]
+    fn save_pairing_rejects_more_than_one_cloudkit_batch() {
+        let messages = (0..=CLOUDKIT_MAX_OPERATIONS_PER_REQUEST)
+            .map(|index| {
+                let operation_uuid = Uuid::new_v4().to_string().to_uppercase();
+                input(
+                    &format!("local-operation-{index}"),
+                    &format!("server-record-{index}"),
+                    &operation_uuid,
+                )
+            })
+            .collect::<Vec<_>>();
+        let operation_uuids = messages
+            .iter()
+            .map(|input| input.apple_operation_uuid.clone())
+            .collect::<Vec<_>>();
+        let request_identity = CloudKitRequestIdentity::new(
+            "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA".to_string(),
+            operation_uuids,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ordered_message_save_pairs(&messages, &request_identity),
+            Err(PushError::BadMsg)
+        ));
+    }
+
+    #[test]
+    fn save_mode_is_explicitly_create_only() {
+        assert!(!CloudMessagesSaveMode::CreateOnly.update_flag());
+    }
+
+    #[test]
+    fn save_outcomes_follow_request_index_and_reject_mismatches() {
+        let operation_a = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB".to_string();
+        let operation_b = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC".to_string();
+        let response = CloudKitBatchResponse {
+            request_identity: identity(&[operation_a.as_str(), operation_b.as_str()]),
+            outcomes: vec![
+                CloudKitOperationOutcome {
+                    request_index: 1,
+                    operation_uuid: operation_b.clone(),
+                    result: Ok(None),
+                    retry_after: None,
+                    failure_class: None,
+                },
+                CloudKitOperationOutcome {
+                    request_index: 0,
+                    operation_uuid: operation_a.clone(),
+                    result: Err(PushError::BadMsg),
+                    retry_after: Some(Duration::from_secs(3)),
+                    failure_class: Some(CloudKitFailureClass::TransientServer),
+                },
+            ],
+        };
+
+        let outcomes = redacted_batch_response_outcomes(
+            vec!["local-a".to_string(), "local-b".to_string()],
+            &identity(&[operation_a.as_str(), operation_b.as_str()]),
+            response,
+        )
+        .unwrap();
+        assert_eq!(outcomes[0].local_operation_id, "local-a");
+        assert_eq!(outcomes[0].apple_operation_uuid, operation_a);
+        assert!(matches!(
+            outcomes[0].result,
+            CloudMessagesSaveResult::Failed {
+                scope: CloudMessagesSaveFailureScope::Operation,
+                failure_class: Some(CloudKitFailureClass::TransientServer),
+                retry_after: Some(_),
+            }
+        ));
+        assert_eq!(outcomes[1].local_operation_id, "local-b");
+        assert!(matches!(
+            outcomes[1].result,
+            CloudMessagesSaveResult::Succeeded
+        ));
+
+        let mismatched = CloudKitBatchResponse {
+            request_identity: identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
+            outcomes: vec![],
+        };
+        assert!(matches!(
+            redacted_batch_response_outcomes(
+                vec!["local-a".to_string()],
+                &identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
+                mismatched,
+            ),
+            Err(CloudMessagesSaveConsumeError::CorrelationMismatch)
+        ));
+
+        let wrong_request_identity = CloudKitBatchResponse {
+            request_identity: identity_with_http(
+                "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD",
+                &["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"],
+            ),
+            outcomes: vec![CloudKitOperationOutcome {
+                request_index: 0,
+                operation_uuid: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB".to_string(),
+                result: Ok(None),
+                retry_after: None,
+                failure_class: None,
+            }],
+        };
+        assert!(matches!(
+            redacted_batch_response_outcomes(
+                vec!["local-a".to_string()],
+                &identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
+                wrong_request_identity,
+            ),
+            Err(CloudMessagesSaveConsumeError::CorrelationMismatch)
+        ));
+    }
+
+    #[test]
+    fn unclassified_operation_failure_requires_reconciliation() {
+        let operation_uuid = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB";
+        for failure_class in [None, Some(CloudKitFailureClass::Unknown)] {
+            let response = CloudKitBatchResponse {
+                request_identity: identity(&[operation_uuid]),
+                outcomes: vec![CloudKitOperationOutcome {
+                    request_index: 0,
+                    operation_uuid: operation_uuid.to_owned(),
+                    result: Err(PushError::BadMsg),
+                    retry_after: None,
+                    failure_class,
+                }],
+            };
+            let outcomes = redacted_batch_response_outcomes(
+                vec!["local-a".to_owned()],
+                &identity(&[operation_uuid]),
+                response,
+            )
+            .expect("unclassified response should retain correlation");
+            assert!(matches!(
+                outcomes[0].result,
+                CloudMessagesSaveResult::UnknownOutcome { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn request_failure_requires_the_exact_persisted_identity() {
+        let expected = identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]);
+        for request_identity in [
+            None,
+            Some(identity_with_http(
+                "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD",
+                &["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"],
+            )),
+        ] {
+            let failure = CloudKitRequestFailure {
+                error: PushError::BadMsg,
+                retry_after: None,
+                failure_class: Some(CloudKitFailureClass::Unknown),
+                request_identity,
+                outcome_may_be_committed: false,
+            };
+            assert!(matches!(
+                redacted_request_failure_outcomes(vec!["local-a".to_string()], &expected, failure,),
+                Err(CloudMessagesSaveConsumeError::CorrelationMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn request_failure_preserves_unknown_outcome_after_submission_boundary() {
+        let expected = identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]);
+        let unknown = redacted_request_failure_outcomes(
+            vec!["local-a".to_string()],
+            &expected,
+            CloudKitRequestFailure {
+                error: PushError::BadMsg,
+                retry_after: None,
+                failure_class: Some(CloudKitFailureClass::Unknown),
+                request_identity: Some(expected.clone()),
+                outcome_may_be_committed: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            unknown[0].result,
+            CloudMessagesSaveResult::UnknownOutcome { .. }
+        ));
+
+        let pre_submission = redacted_request_failure_outcomes(
+            vec!["local-a".to_string()],
+            &expected,
+            CloudKitRequestFailure {
+                error: PushError::BadMsg,
+                retry_after: None,
+                failure_class: Some(CloudKitFailureClass::Permanent),
+                request_identity: Some(expected.clone()),
+                outcome_may_be_committed: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            pre_submission[0].result,
+            CloudMessagesSaveResult::Failed {
+                scope: CloudMessagesSaveFailureScope::Request,
+                ..
+            }
+        ));
+    }
+}
+
 pub struct CloudMessagesClient<P: AnisetteProvider> {
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
     pub client: Arc<CloudKitClient<P>>,
@@ -919,6 +1623,128 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
         *locked = Some(container.clone());
         Ok(container)
+    }
+
+    /// Fetches one stable MessageEncryptedV3 record for ambiguous-write
+    /// reconciliation. The read-only CloudKit primitive may retry safely, but
+    /// only an explicit per-record NOT_FOUND is evidence that create replay is
+    /// safe. Every other failure remains unresolved.
+    pub async fn lookup_message_record(
+        &self,
+        server_record_name: &str,
+    ) -> Result<CloudMessageRecordLookup, PushError> {
+        if server_record_name.is_empty() || server_record_name.len() > 4096 {
+            return Err(PushError::BadMsg);
+        }
+        let container = self.get_container().await?;
+        let zone = container.private_zone("messageManateeZone".to_string());
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
+        let operations = [FetchRecordOperation::new(
+            &NO_ASSETS,
+            record_identifier(zone, server_record_name),
+        )];
+        let response = match container
+            .perform_operations_detailed(
+                &CloudKitSession::new(),
+                &operations,
+                IsolationLevel::Operation,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                return Ok(CloudMessageRecordLookup::Unresolved {
+                    failure_class: failure.failure_class,
+                    retry_after: failure.retry_after,
+                })
+            }
+        };
+        if response.outcomes.len() != 1 {
+            return Ok(CloudMessageRecordLookup::Unresolved {
+                failure_class: Some(CloudKitFailureClass::Unknown),
+                retry_after: None,
+            });
+        }
+        let outcome = response
+            .outcomes
+            .into_iter()
+            .next()
+            .ok_or(PushError::BadMsg)?;
+        match outcome.result {
+            Ok(record) => {
+                record.verify_id(server_record_name)?;
+                Ok(CloudMessageRecordLookup::Found(
+                    record.get_record(Some(&key))?,
+                ))
+            }
+            Err(error) if is_cloudkit_record_not_found(&error) => {
+                Ok(CloudMessageRecordLookup::NotFound)
+            }
+            Err(_) => Ok(CloudMessageRecordLookup::Unresolved {
+                failure_class: outcome.failure_class,
+                retry_after: outcome.retry_after,
+            }),
+        }
+    }
+
+    /// Prepares one message-only, CREATE-ONLY save batch while all
+    /// authentication and PCS work is still outside the remote-submission
+    /// ambiguity boundary. Existing mapped-record updates are unsupported
+    /// until predecessor ETag binding is fixture-proven and durably persisted.
+    ///
+    /// `messages` is deliberately an ordered vector instead of a map. Its
+    /// local operation IDs, server record names, message payloads, and the
+    /// caller's persisted operation UUIDs are paired by position. Only local
+    /// operation IDs are retained for correlation after the native save
+    /// operation is built.
+    pub async fn prepare_message_save_submission(
+        &self,
+        messages: Vec<CloudMessageSaveInput>,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        if request_timeout.is_zero() || request_timeout > Duration::from_secs(5 * 60) {
+            return Err(PushError::BadMsg);
+        }
+        let ordered_pairs = ordered_message_save_pairs(&messages, &request_identity)?;
+        let container = self.get_container().await?;
+        let zone = container.private_zone("messageManateeZone".to_string());
+        let key = container
+            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
+
+        let mut operations = Vec::with_capacity(messages.len());
+        let mut local_operation_ids = Vec::with_capacity(messages.len());
+        for (input, (paired_local_operation_id, _)) in
+            messages.into_iter().zip(ordered_pairs.iter())
+        {
+            debug_assert_eq!(&input.local_operation_id, paired_local_operation_id);
+            operations.push(SaveRecordOperation::try_new(
+                record_identifier(zone.clone(), &input.server_record_name),
+                input.message,
+                Some(&key),
+                CloudMessagesSaveMode::CreateOnly.update_flag(),
+            )?);
+            local_operation_ids.push(input.local_operation_id);
+        }
+
+        let prepared_authentication = container.prepare_operations_authentication().await?;
+
+        Ok(CloudMessagesPreparedSaveSubmission {
+            container,
+            session: CloudKitSession::new(),
+            request_identity,
+            prepared_authentication,
+            operations,
+            local_operation_ids,
+            retry_policy: CloudKitRetryPolicy {
+                max_attempts: 1,
+                request_timeout,
+                ..CloudKitRetryPolicy::default()
+            },
+        })
     }
 
     async fn sync_records_page(
@@ -1040,12 +1866,12 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             let mut operations = vec![];
             let mut ids = vec![];
             for (record_id, chat) in batch {
-                operations.push(SaveRecordOperation::new(
+                operations.push(SaveRecordOperation::try_new(
                     record_identifier(zone.clone(), &record_id),
                     chat,
                     Some(&key),
                     true,
-                ));
+                )?);
                 ids.push(record_id.clone());
             }
 
@@ -1396,7 +2222,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let record: Vec<CloudAttachment> = files
             .keys()
             .map(|f| records.get_record(f, Some(&key)))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         container
             .get_assets(
@@ -1436,7 +2262,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let record: Vec<CloudChat> = files
             .keys()
             .map(|f| records.get_record(f, Some(&key)))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         if record.iter().any(|r| r.group_photo.is_none()) {
             return Err(PushError::MissingGroupPhoto);

@@ -397,7 +397,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
                 .await?,
         );
         let record =
-            records.get_record::<IMessageRawNicknameRecord>(&message.cloud_kit_record_key, None);
+            records.get_record::<IMessageRawNicknameRecord>(&message.cloud_kit_record_key, None)?;
         let mut result_ad: Vec<u8> = vec![];
         let mut cursor_ad = Cursor::new(&mut result_ad);
         let mut assets = vec![];
@@ -407,7 +407,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
 
         // optional poster stuff
         let raw_poster = if message.poster.is_some() {
-            Some(records.get_record::<IMessageRawPosterRecord>(&poster_id, None))
+            Some(records.get_record::<IMessageRawPosterRecord>(&poster_id, None)?)
         } else {
             None
         };
@@ -506,7 +506,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             .upload_asset(&session, &public_zone(), upload_requests)
             .await?;
 
-        let mut raw_ops = vec![SaveRecordOperation::new(
+        let mut raw_ops = vec![SaveRecordOperation::try_new(
             record_identifier_public(&record_id),
             &IMessageRawNicknameRecord {
                 n: record.n,
@@ -515,10 +515,10 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             },
             None,
             false,
-        )];
+        )?];
 
         if let Some(poster) = &record.poster {
-            raw_ops.push(SaveRecordOperation::new(
+            raw_ops.push(SaveRecordOperation::try_new(
                 record_identifier_public(&poster_id),
                 &IMessageRawPosterRecord {
                     pr: cloudkit_proto::record::Reference {
@@ -531,7 +531,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
                 },
                 None,
                 false,
-            ));
+            )?);
         }
 
         if let Err(e) = container

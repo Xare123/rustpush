@@ -2133,12 +2133,12 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                 )
                 .await?;
 
-            let save = SaveRecordOperation::new(
+            let save = SaveRecordOperation::try_new(
                 record_identifier(group.id.clone(), &format!("item-{id}")),
                 shared_item,
                 Some(&key),
                 true,
-            );
+            )?;
 
             container.perform(&CloudKitSession::new(), save).await?;
 

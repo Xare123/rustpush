@@ -1679,15 +1679,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             dict.clone(),
         )?;
 
-        let mut ops = vec![SaveRecordOperation::new(
+        let mut ops = vec![SaveRecordOperation::try_new(
             record_identifier(record_zone.clone(), &uuid),
             item,
             None,
             true,
-        )];
+        )?];
 
         if let Some(tag) = associated_tag {
-            ops.push(SaveRecordOperation::new(
+            ops.push(SaveRecordOperation::try_new(
                 record_identifier(record_zone.clone(), tag),
                 CuttlefishCurrentItem {
                     item: Reference {
@@ -1697,7 +1697,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 },
                 None,
                 true,
-            ));
+            )?);
         }
 
         security_container
