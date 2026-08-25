@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{Cursor, Read, Write};
+use std::future::Future;
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -68,6 +69,30 @@ pub const MESSAGES_SERVICE: PCSService = PCSService {
     v2: false,
     global_record: true,
 };
+
+// Legacy sync runs one page at a time from a short-lived Flutter worker.  The
+// lower HTTP layer bounds request I/O, but token/keychain/header preparation
+// happens outside that timeout and a server-directed retry can otherwise keep
+// the worker alive indefinitely.  A timed-out read is safe to cancel because
+// the caller persists its continuation token only after applying the page.
+const LEGACY_CLOUDKIT_PAGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+async fn legacy_cloudkit_page_with_deadline<T, F>(
+    deadline: Duration,
+    operation: F,
+) -> Result<T, PushError>
+where
+    F: Future<Output = Result<T, PushError>>,
+{
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| {
+            PushError::IoError(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "Legacy CloudKit page timed out before cursor commit",
+            ))
+        })?
+}
 
 pub mod cloudmessagesp {
     use cloudkit_proto::{sealed::ProtoKind, CloudKitBytesKind};
@@ -553,6 +578,31 @@ impl CloudMessageRecordSystemFields {
 #[cfg(test)]
 mod cloud_message_page_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_page_deadline_preserves_timeout_as_retryable_io_failure() {
+        let result = legacy_cloudkit_page_with_deadline(Duration::from_millis(1), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<_, PushError>(())
+        })
+        .await;
+
+        let PushError::IoError(error) = result.expect_err("operation must time out") else {
+            panic!("timeout must remain an I/O failure");
+        };
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(error.to_string().contains("before cursor commit"));
+    }
+
+    #[tokio::test]
+    async fn legacy_page_deadline_returns_completed_page() {
+        let result = legacy_cloudkit_page_with_deadline(Duration::from_secs(1), async {
+            Ok::<_, PushError>("page")
+        })
+        .await;
+
+        assert_eq!(result.expect("completed page"), "page");
+    }
 
     fn fixture_identifier(name: &str) -> RecordIdentifier {
         RecordIdentifier {
@@ -1775,6 +1825,18 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     async fn sync_records<T: CloudKitRecord>(
+        &self,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+        legacy_cloudkit_page_with_deadline(
+            LEGACY_CLOUDKIT_PAGE_TIMEOUT,
+            self.sync_records_without_deadline(zone, continuation_token),
+        )
+        .await
+    }
+
+    async fn sync_records_without_deadline<T: CloudKitRecord>(
         &self,
         zone: &str,
         continuation_token: Option<Vec<u8>>,
