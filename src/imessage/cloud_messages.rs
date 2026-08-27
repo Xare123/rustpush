@@ -33,7 +33,7 @@ use cloudkit_proto::{
     Date, Record, RecordZoneIdentifier,
 };
 use hkdf::Hkdf;
-use log::info;
+use log::{info, warn};
 use omnisette::AnisetteProvider;
 use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::PKey;
@@ -888,21 +888,88 @@ fn record_identifier_name(identifier: Option<&RecordIdentifier>) -> Option<&str>
         .filter(|name| !name.is_empty())
 }
 
-fn record_metadata_is_well_formed(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudMessageMetadataFailure {
+    OuterIdentifierMissing,
+    InvalidChangeShape,
+    InnerIdentifierMalformed,
+    InnerIdentifierMismatch,
+    NestedRecordTypeMissing,
+    NestedRecordTypeMismatch,
+    FieldIdentifierMissing,
+    ResolvedRecordTypeMissing,
+}
+
+#[derive(Default)]
+struct CloudMessageMetadataFailureCounts {
+    outer_identifier_missing: usize,
+    invalid_change_shape: usize,
+    inner_identifier_malformed: usize,
+    inner_identifier_mismatch: usize,
+    nested_record_type_missing: usize,
+    nested_record_type_mismatch: usize,
+    field_identifier_missing: usize,
+    resolved_record_type_missing: usize,
+}
+
+impl CloudMessageMetadataFailureCounts {
+    fn record(&mut self, failure: CloudMessageMetadataFailure) {
+        match failure {
+            CloudMessageMetadataFailure::OuterIdentifierMissing => {
+                self.outer_identifier_missing += 1;
+            }
+            CloudMessageMetadataFailure::InvalidChangeShape => self.invalid_change_shape += 1,
+            CloudMessageMetadataFailure::InnerIdentifierMalformed => {
+                self.inner_identifier_malformed += 1;
+            }
+            CloudMessageMetadataFailure::InnerIdentifierMismatch => {
+                self.inner_identifier_mismatch += 1;
+            }
+            CloudMessageMetadataFailure::NestedRecordTypeMissing => {
+                self.nested_record_type_missing += 1;
+            }
+            CloudMessageMetadataFailure::NestedRecordTypeMismatch => {
+                self.nested_record_type_mismatch += 1;
+            }
+            CloudMessageMetadataFailure::FieldIdentifierMissing => {
+                self.field_identifier_missing += 1;
+            }
+            CloudMessageMetadataFailure::ResolvedRecordTypeMissing => {
+                self.resolved_record_type_missing += 1;
+            }
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.outer_identifier_missing
+            + self.invalid_change_shape
+            + self.inner_identifier_malformed
+            + self.inner_identifier_mismatch
+            + self.nested_record_type_missing
+            + self.nested_record_type_mismatch
+            + self.field_identifier_missing
+            + self.resolved_record_type_missing
+    }
+}
+
+fn record_metadata_failure(
     record: &Record,
     change_record_name: Option<&str>,
     change_record_type: Option<&str>,
-) -> bool {
+) -> Option<CloudMessageMetadataFailure> {
     let Some(change_record_name) = change_record_name else {
-        return false;
+        return Some(CloudMessageMetadataFailure::OuterIdentifierMissing);
     };
     // RetrieveChanges already binds the record to the outer change
     // identifier. Apple may omit the redundant identifier inside the nested
     // Record, so require equality only when that inner field is present. A
     // present-but-malformed or mismatched inner identifier still fails closed.
     if let Some(inner_identifier) = record.record_identifier.as_ref() {
-        if record_identifier_name(Some(inner_identifier)) != Some(change_record_name) {
-            return false;
+        let Some(inner_record_name) = record_identifier_name(Some(inner_identifier)) else {
+            return Some(CloudMessageMetadataFailure::InnerIdentifierMalformed);
+        };
+        if inner_record_name != change_record_name {
+            return Some(CloudMessageMetadataFailure::InnerIdentifierMismatch);
         }
     }
 
@@ -912,26 +979,31 @@ fn record_metadata_is_well_formed(
         .and_then(|record_type| record_type.name.as_deref())
         .filter(|record_type| !record_type.is_empty())
     else {
-        return false;
+        return Some(CloudMessageMetadataFailure::NestedRecordTypeMissing);
     };
     if change_record_type.is_some_and(|change_record_type| change_record_type != record_type) {
-        return false;
+        return Some(CloudMessageMetadataFailure::NestedRecordTypeMismatch);
     }
 
-    record.record_field.iter().all(|field| {
+    if record.record_field.iter().any(|field| {
         field
             .identifier
             .as_ref()
             .and_then(|identifier| identifier.name.as_deref())
-            .is_some_and(|name| !name.is_empty())
-    })
+            .is_none_or(str::is_empty)
+    }) {
+        return Some(CloudMessageMetadataFailure::FieldIdentifierMissing);
+    }
+
+    None
 }
 
 fn map_ordered_page_changes(
     changes: Vec<RecordChange>,
     expected_record_type: &str,
 ) -> Vec<CloudMessageRecordPageChange> {
-    changes
+    let mut metadata_failures = CloudMessageMetadataFailureCounts::default();
+    let mapped = changes
         .into_iter()
         .map(|change| {
             let record_name =
@@ -961,25 +1033,43 @@ fn map_ordered_page_changes(
                 Some(_) => false,
                 None => true,
             };
-            let kind = if record_name.is_none() || !change_shape_is_well_formed {
-                CloudMessageRecordKind::MalformedMetadata
+            let metadata_failure = if record_name.is_none() {
+                Some(CloudMessageMetadataFailure::OuterIdentifierMissing)
+            } else if !change_shape_is_well_formed {
+                Some(CloudMessageMetadataFailure::InvalidChangeShape)
             } else if let Some(record) = change.record.as_ref() {
-                if !record_metadata_is_well_formed(
+                record_metadata_failure(
                     record,
                     record_name.as_deref(),
                     change
                         .record_type
                         .as_ref()
                         .and_then(|record_type| record_type.name.as_deref()),
-                ) {
-                    CloudMessageRecordKind::MalformedMetadata
-                } else {
-                    match record_type.as_deref() {
-                        Some(record_type) if record_type == expected_record_type => {
-                            CloudMessageRecordKind::EncryptedUpsert
-                        }
-                        Some(_) => CloudMessageRecordKind::UnsupportedRecordType,
-                        None => CloudMessageRecordKind::MalformedMetadata,
+                )
+                .or_else(|| {
+                    record_type
+                        .is_none()
+                        .then_some(CloudMessageMetadataFailure::ResolvedRecordTypeMissing)
+                })
+            } else {
+                None
+            };
+            if let Some(failure) = metadata_failure {
+                metadata_failures.record(failure);
+            }
+
+            let kind = if metadata_failure.is_some() {
+                CloudMessageRecordKind::MalformedMetadata
+            } else if change.record.is_some() {
+                match record_type.as_deref() {
+                    Some(record_type) if record_type == expected_record_type => {
+                        CloudMessageRecordKind::EncryptedUpsert
+                    }
+                    Some(_) => CloudMessageRecordKind::UnsupportedRecordType,
+                    None => {
+                        // Accounted for as ResolvedRecordTypeMissing above.
+                        debug_assert!(false, "missing resolved record type was not classified");
+                        CloudMessageRecordKind::MalformedMetadata
                     }
                 }
             } else {
@@ -996,7 +1086,25 @@ fn map_ordered_page_changes(
                 kind,
             }
         })
-        .collect()
+        .collect();
+
+    if metadata_failures.total() > 0 {
+        // Content-free canary diagnostic. Counts and fixed categories only:
+        // never include record names, types, field names, payloads, or tokens.
+        warn!(
+            "CloudKit V2 structural metadata counts outer_missing={} shape_invalid={} inner_malformed={} inner_mismatch={} nested_type_missing={} nested_type_mismatch={} field_identifier_missing={} resolved_type_missing={}",
+            metadata_failures.outer_identifier_missing,
+            metadata_failures.invalid_change_shape,
+            metadata_failures.inner_identifier_malformed,
+            metadata_failures.inner_identifier_mismatch,
+            metadata_failures.nested_record_type_missing,
+            metadata_failures.nested_record_type_mismatch,
+            metadata_failures.field_identifier_missing,
+            metadata_failures.resolved_record_type_missing,
+        );
+    }
+
+    mapped
 }
 
 /// The redacted result of one prepared message save. The native caller gets
