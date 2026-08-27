@@ -640,7 +640,7 @@ mod cloud_message_page_tests {
                 record_type: Some(cloudkit_proto::record::Type {
                     name: Some("FixtureRecord".to_string()),
                 }),
-                r#type: Some(2),
+                r#type: Some(3),
                 record: None,
             },
         ];
@@ -729,6 +729,34 @@ mod cloud_message_page_tests {
             CloudMessageRecordKind::EncryptedUpsert
         ));
         assert!(mapped[0].encrypted_record.is_some());
+    }
+
+    #[test]
+    fn modified_change_type_with_record_is_an_upsert() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-modified")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(2),
+            record: Some(Record {
+                record_identifier: Some(fixture_identifier("fixture-modified")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::EncryptedUpsert
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+        assert!(mapped[0].tombstone_payload.is_none());
     }
 
     #[test]
@@ -826,7 +854,7 @@ mod cloud_message_page_tests {
             record_type: Some(cloudkit_proto::record::Type {
                 name: Some("FixtureRecord".to_string()),
             }),
-            r#type: Some(2),
+            r#type: Some(3),
             record: Some(Record {
                 record_identifier: Some(fixture_identifier("fixture-contradictory")),
                 r#type: Some(cloudkit_proto::record::Type {
@@ -987,9 +1015,9 @@ fn change_shape_failure(
     has_record: bool,
 ) -> Option<CloudMessageMetadataFailure> {
     match (change_type, has_record) {
-        (Some(1), false) => Some(CloudMessageMetadataFailure::UpsertRecordMissing),
-        (Some(2), true) => Some(CloudMessageMetadataFailure::TombstoneRecordPresent),
-        (Some(1), true) | (Some(2), false) | (None, _) => None,
+        (Some(1 | 2), false) => Some(CloudMessageMetadataFailure::UpsertRecordMissing),
+        (Some(3), true) => Some(CloudMessageMetadataFailure::TombstoneRecordPresent),
+        (Some(1 | 2), true) | (Some(3), false) | (None, _) => None,
         (Some(_), _) => Some(CloudMessageMetadataFailure::UnsupportedChangeShape),
     }
 }
@@ -1005,7 +1033,11 @@ mod cloud_message_metadata_diagnostic_tests {
             Some(CloudMessageMetadataFailure::UpsertRecordMissing)
         );
         assert_eq!(
-            change_shape_failure(Some(2), true),
+            change_shape_failure(Some(2), false),
+            Some(CloudMessageMetadataFailure::UpsertRecordMissing)
+        );
+        assert_eq!(
+            change_shape_failure(Some(3), true),
             Some(CloudMessageMetadataFailure::TombstoneRecordPresent)
         );
         assert_eq!(
@@ -1013,7 +1045,8 @@ mod cloud_message_metadata_diagnostic_tests {
             Some(CloudMessageMetadataFailure::UnsupportedChangeShape)
         );
         assert_eq!(change_shape_failure(Some(1), true), None);
-        assert_eq!(change_shape_failure(Some(2), false), None);
+        assert_eq!(change_shape_failure(Some(2), true), None);
+        assert_eq!(change_shape_failure(Some(3), false), None);
         assert_eq!(change_shape_failure(None, true), None);
     }
 
