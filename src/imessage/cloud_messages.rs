@@ -704,6 +704,63 @@ mod cloud_message_page_tests {
     }
 
     #[test]
+    fn ordered_page_accepts_omitted_redundant_inner_record_identifier() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-outer-only")),
+            etag: Some("etag-outer-only".to_string()),
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(1),
+            record: Some(Record {
+                record_identifier: None,
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert_eq!(mapped[0].record_name.as_deref(), Some("fixture-outer-only"));
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::EncryptedUpsert
+        ));
+        assert!(mapped[0].encrypted_record.is_some());
+    }
+
+    #[test]
+    fn present_malformed_inner_record_identifier_is_quarantined() {
+        let changes = vec![RecordChange {
+            identifier: Some(fixture_identifier("fixture-outer")),
+            etag: None,
+            record_type: Some(cloudkit_proto::record::Type {
+                name: Some("FixtureRecord".to_string()),
+            }),
+            r#type: Some(1),
+            record: Some(Record {
+                record_identifier: Some(RecordIdentifier {
+                    value: None,
+                    zone_identifier: None,
+                }),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("FixtureRecord".to_string()),
+                }),
+                ..Default::default()
+            }),
+        }];
+
+        let mapped = map_ordered_page_changes(changes, "FixtureRecord");
+
+        assert!(matches!(
+            mapped[0].kind,
+            CloudMessageRecordKind::MalformedMetadata
+        ));
+    }
+
+    #[test]
     fn malformed_field_metadata_is_quarantined_without_decoding() {
         let changes = vec![RecordChange {
             identifier: Some(fixture_identifier("fixture-malformed")),
@@ -839,8 +896,14 @@ fn record_metadata_is_well_formed(
     let Some(change_record_name) = change_record_name else {
         return false;
     };
-    if record_identifier_name(record.record_identifier.as_ref()) != Some(change_record_name) {
-        return false;
+    // RetrieveChanges already binds the record to the outer change
+    // identifier. Apple may omit the redundant identifier inside the nested
+    // Record, so require equality only when that inner field is present. A
+    // present-but-malformed or mismatched inner identifier still fails closed.
+    if let Some(inner_identifier) = record.record_identifier.as_ref() {
+        if record_identifier_name(Some(inner_identifier)) != Some(change_record_name) {
+            return false;
+        }
     }
 
     let Some(record_type) = record
