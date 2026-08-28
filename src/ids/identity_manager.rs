@@ -885,13 +885,29 @@ impl IdentityResource {
         Self::user_by_real_handle(users, handle)
     }
 
-    pub async fn register_pseudonym(&self, services: &[&str], handle: &str, pseud: &str, exp: f64) {
+    pub async fn register_pseudonym(
+        &self,
+        services: &[&str],
+        handle: &str,
+        pseud: &str,
+        exp: f64,
+    ) -> Result<(), PushError> {
         let mut cache_lock = self.cache.lock().await;
+        if services.iter().any(|service| {
+            cache_lock
+                .cache
+                .get(*service)
+                .and_then(|entries| entries.get(handle))
+                .is_none()
+        }) {
+            return Err(PushError::BadMsg);
+        }
         for service in services {
-            let Some(service) = cache_lock.cache.get_mut(*service) else {
-                panic!("No service {service}!")
-            };
-            let real_hash = service[handle].env_hash;
+            let service = cache_lock
+                .cache
+                .get_mut(*service)
+                .ok_or(PushError::BadMsg)?;
+            let real_hash = service.get(handle).ok_or(PushError::BadMsg)?.env_hash;
             let mut cache = CachedHandle::default();
             cache.real_handle = Some(handle.to_string());
             cache.expiry = Some(exp);
@@ -899,6 +915,7 @@ impl IdentityResource {
             service.insert(pseud.to_string(), cache);
         }
         cache_lock.save();
+        Ok(())
     }
 
     pub async fn validate_pseudonym(
@@ -909,13 +926,14 @@ impl IdentityResource {
     ) -> Result<bool, PushError> {
         let cache_lock = self.cache.lock().await;
         let Some(service) = cache_lock.cache.get(service) else {
-            panic!("No service {service}!")
+            warn!("Pseudonym validation service unavailable");
+            return Err(PushError::BadMsg);
         };
         let Some(pseud) = service.get(pseud) else {
-            warn!("Pseudonym not found {pseud}!");
+            warn!("Pseudonym validation entry unavailable");
             return Ok(false);
         };
-        info!("Validating pseudonym {:?} {}", pseud.real_handle, handle);
+        info!("Validating pseudonym ownership");
         Ok(pseud.real_handle == Some(handle.to_string()))
     }
 
@@ -943,13 +961,13 @@ impl IdentityResource {
         .await?;
         drop(users);
 
-        let new_alias = new_alias.expect("No new alias!!!");
+        let new_alias = new_alias.ok_or(PushError::BadMsg)?;
         let items = services
             .iter()
             .flat_map(|(a, b)| std::iter::once(*a).chain(b.iter().map(|a| *a)))
             .collect::<Vec<_>>();
         self.register_pseudonym(&items, handle, &new_alias, expiry_seconds)
-            .await;
+            .await?;
 
         Ok(new_alias)
     }
@@ -960,17 +978,20 @@ impl IdentityResource {
         services: HashMap<&'static str, Vec<&'static str>>,
         pseud: String,
     ) -> Result<(), PushError> {
-        let a_service = services.keys().next().unwrap();
+        let a_service = services.keys().next().ok_or(PushError::BadMsg)?;
         let cache_lock = self.cache.lock().await;
-        let Some(cache_handle) = cache_lock.cache[*a_service].get(&pseud) else {
+        let Some(service_cache) = cache_lock.cache.get(*a_service) else {
+            return Err(PushError::BadMsg);
+        };
+        let Some(cache_handle) = service_cache.get(&pseud) else {
             return Ok(()); /* handle doesn't exist; probably already deleted */
         };
         let handle = cache_handle
             .real_handle
             .as_ref()
-            .expect("Not a pseud?")
+            .ok_or(PushError::BadMsg)?
             .clone();
-        let expiry_seconds = cache_handle.expiry.expect("not a pseud?");
+        let expiry_seconds = cache_handle.expiry.ok_or(PushError::BadMsg)?;
         drop(cache_lock);
 
         let users = self.users.read().await;
@@ -991,11 +1012,22 @@ impl IdentityResource {
         drop(users);
 
         let mut cache_lock = self.cache.lock().await;
-        for service in services
+        let service_names = services
             .iter()
             .flat_map(|(a, b)| std::iter::once(*a).chain(b.iter().map(|a| *a)))
+            .collect::<Vec<_>>();
+        if service_names
+            .iter()
+            .any(|service| !cache_lock.cache.contains_key(*service))
         {
-            cache_lock.cache.get_mut(service).unwrap().remove(&pseud);
+            return Err(PushError::BadMsg);
+        }
+        for service in service_names {
+            cache_lock
+                .cache
+                .get_mut(service)
+                .ok_or(PushError::BadMsg)?
+                .remove(&pseud);
         }
         cache_lock.save();
 

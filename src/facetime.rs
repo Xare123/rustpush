@@ -3,7 +3,7 @@ use std::{
     io::Cursor,
     ops::Deref,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aes_gcm::KeyInit;
@@ -51,6 +51,7 @@ pub mod facetimep {
 }
 
 const FACETIME_VIDEO_AV_MODE: i32 = 2;
+const DELEGATED_RESPONSE_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 fn apply_conversation_message_metadata(
     session: &mut FTSession,
@@ -655,6 +656,16 @@ fn classify_letmein_response_failure(error: &PushError) -> LetMeInResponseFailur
     }
 }
 
+fn admission_follow_up_result(result: Result<(), PushError>) -> Result<(), PushError> {
+    if result.is_err() {
+        // The encrypted admission response has already been accepted by the
+        // transport. Optional ringing/member follow-up must never turn that
+        // success into a retryable response send.
+        warn!("FaceTime admission follow-up failed after response send");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DelegatedResponseStatus {
     Pending,
@@ -669,6 +680,7 @@ struct DelegatedResponseEntry {
     // acceptance. `None` means the first attempt has not captured its
     // decision yet.
     approved_group: Option<Option<String>>,
+    expires_at: Instant,
 }
 
 #[derive(Default)]
@@ -687,18 +699,26 @@ enum BeginDelegatedResponse {
 }
 
 impl DelegatedRequests {
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.requests.retain(|_, entry| entry.expires_at > now);
+    }
+
     fn insert(&mut self, delegation: String, request: LetMeInRequest) {
+        self.prune_expired();
         self.requests.insert(
             delegation,
             DelegatedResponseEntry {
                 request,
                 status: DelegatedResponseStatus::Pending,
                 approved_group: None,
+                expires_at: Instant::now() + DELEGATED_RESPONSE_RETENTION,
             },
         );
     }
 
-    fn get(&self, delegation: &str) -> Option<&LetMeInRequest> {
+    fn get(&mut self, delegation: &str) -> Option<&LetMeInRequest> {
+        self.prune_expired();
         self.requests.get(delegation).map(|entry| &entry.request)
     }
 
@@ -708,6 +728,7 @@ impl DelegatedRequests {
         requested_group: Option<&str>,
         manual_retry: bool,
     ) -> BeginDelegatedResponse {
+        self.prune_expired();
         let Some(entry) = self.requests.get_mut(delegation) else {
             return BeginDelegatedResponse::Missing;
         };
@@ -732,6 +753,7 @@ impl DelegatedRequests {
     }
 
     fn begin(&mut self, delegation: &str, manual_retry: bool) -> BeginDelegatedResponse {
+        self.prune_expired();
         let Some(entry) = self.requests.get_mut(delegation) else {
             return BeginDelegatedResponse::Missing;
         };
@@ -739,6 +761,7 @@ impl DelegatedRequests {
         match entry.status {
             DelegatedResponseStatus::Pending => {
                 entry.status = DelegatedResponseStatus::InFlight;
+                entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
                 BeginDelegatedResponse::Ready {
                     request: entry.request.clone(),
                     approved_group: entry.approved_group.clone().flatten(),
@@ -746,6 +769,7 @@ impl DelegatedRequests {
             }
             DelegatedResponseStatus::Failed(_) if manual_retry => {
                 entry.status = DelegatedResponseStatus::InFlight;
+                entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
                 BeginDelegatedResponse::Ready {
                     request: entry.request.clone(),
                     approved_group: entry.approved_group.clone().flatten(),
@@ -765,6 +789,7 @@ impl DelegatedRequests {
         requested_group: Option<&str>,
         manual_retry: bool,
     ) -> Result<(LetMeInRequest, Option<String>), PushError> {
+        self.prune_expired();
         let Some(entry) = self.requests.get_mut(delegation) else {
             return Err(PushError::FaceTimeAdmissionMissing);
         };
@@ -775,9 +800,11 @@ impl DelegatedRequests {
                     entry.approved_group = Some(requested_group.map(str::to_owned));
                 }
                 entry.status = DelegatedResponseStatus::InFlight;
+                entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
             }
             DelegatedResponseStatus::Failed(_) if manual_retry => {
                 entry.status = DelegatedResponseStatus::InFlight;
+                entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
             }
             DelegatedResponseStatus::InFlight => {
                 return Err(PushError::FaceTimeAdmissionInFlight);
@@ -794,6 +821,7 @@ impl DelegatedRequests {
     }
 
     fn remove_if_pending(&mut self, delegation: &str) {
+        self.prune_expired();
         if self
             .requests
             .get(delegation)
@@ -808,8 +836,10 @@ impl DelegatedRequests {
     }
 
     fn fail(&mut self, delegation: &str, failure: LetMeInResponseFailure) {
+        self.prune_expired();
         if let Some(entry) = self.requests.get_mut(delegation) {
             entry.status = DelegatedResponseStatus::Failed(failure);
+            entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
         }
     }
 
@@ -817,6 +847,7 @@ impl DelegatedRequests {
     /// transport. Only that in-flight state may transition back to retained
     /// failure. A completed request must never be resurrected and replayed.
     fn fail_if_in_flight(&mut self, delegation: &str, failure: LetMeInResponseFailure) -> bool {
+        self.prune_expired();
         let Some(entry) = self.requests.get_mut(delegation) else {
             return false;
         };
@@ -824,6 +855,7 @@ impl DelegatedRequests {
             return false;
         }
         entry.status = DelegatedResponseStatus::Failed(failure);
+        entry.expires_at = Instant::now() + DELEGATED_RESPONSE_RETENTION;
         true
     }
 }
@@ -889,6 +921,9 @@ async fn session_operation_for(
     group_id: &str,
 ) -> Arc<AsyncMutex<()>> {
     let mut operations = registry.lock().await;
+    // The map owns one strong reference. Entries with no caller reference are
+    // idle and can be retired before the next operation is registered.
+    operations.retain(|_, operation| Arc::strong_count(operation) > 1);
     operations
         .entry(group_id.to_string())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
@@ -1123,12 +1158,12 @@ impl FTClient {
                 receiver,
                 get_message(
                     |payload| {
-                        info!("Got relay {:?}", payload);
+                        info!("Received FaceTime relay allocation response");
                         let parsed =
                             match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
                                 Ok(parsed) => parsed,
-                                Err(e) => {
-                                    info!("Failed to parse {e}");
+                                Err(_) => {
+                                    info!("Failed to parse FaceTime relay allocation response");
                                     return None;
                                 }
                             };
@@ -1180,7 +1215,7 @@ impl FTClient {
             )
             .await?;
 
-        info!("Creating new link using pseud {new_alias} for handle {handle} with usage {usage:?}");
+        info!("Creating FaceTime link usage_present={}", usage.is_some());
 
         let key = CompactECKey::new()?;
 
@@ -1208,10 +1243,7 @@ impl FTClient {
         if state.links[&pseud].usage == Some(usage.to_string()) {
             return Ok(());
         }
-        info!(
-            "Using link {} for {usage} from {old_usage}",
-            existing.handle
-        );
+        info!("Rotating FaceTime link usage");
         if let Some(link) = state
             .links
             .values()
@@ -1972,10 +2004,7 @@ impl FTClient {
             }
         }
 
-        info!(
-            "Adding members {new_members:?} for session {}",
-            session.group_id
-        );
+        info!("Adding FaceTime members count={}", new_members.len());
 
         // make sure we have quickrelay ids for our new guest!
         self.ensure_allocations(session, &new_members).await?;
@@ -2205,13 +2234,13 @@ impl FTClient {
         &self,
         delegation_uuid: &str,
     ) -> Result<(), PushError> {
-        let request = self
-            .delegated_requests
-            .lock()
-            .await
-            .get(delegation_uuid)
-            .cloned()
-            .ok_or(PushError::FaceTimeAdmissionMissing)?;
+        let request = {
+            let mut requests = self.delegated_requests.lock().await;
+            requests
+                .get(delegation_uuid)
+                .cloned()
+                .ok_or(PushError::FaceTimeAdmissionMissing)?
+        };
         self.retry_letmein_manually(request, None).await
     }
 
@@ -2264,8 +2293,8 @@ impl FTClient {
     /// Runs a request that was atomically claimed by
     /// [`Self::respond_letmein_internal`]. Any error before the encrypted
     /// response is accepted by the transport is reconciled by the wrapper;
-    /// after that response succeeds the retained request is consumed before
-    /// optional follow-up ringing can fail.
+    /// after that response succeeds the retained request is consumed and
+    /// optional follow-up failure cannot reclassify the sent response.
     async fn respond_claimed_letmein(
         &self,
         letmein: LetMeInRequest,
@@ -2385,31 +2414,35 @@ impl FTClient {
             delegated_lock.complete(delegation);
         }
 
-        let Some(to_group) = effective_approved_group.as_deref() else {
-            return Ok(());
-        };
+        let follow_up = async {
+            let Some(_to_group) = effective_approved_group.as_deref() else {
+                return Ok(());
+            };
 
-        // doesn't currently work for native FT, see in callservicesd -[CSDFaceTimeConversationProviderDelegate handleInvitationMessage:forConversation:fromHandle:]
-        // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
-        // but we don't currently assign our link to the conversation. FT Web doesn't care
+            // doesn't currently work for native FT, see in callservicesd -[CSDFaceTimeConversationProviderDelegate handleInvitationMessage:forConversation:fromHandle:]
+            // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
+            // but we don't currently assign our link to the conversation. FT Web doesn't care
 
-        let member = FTMember {
-            handle: letmein.requestor.clone(),
-            nickname: letmein.nickname.clone(),
-        };
-        let snapshot = approved_snapshot
-            .take()
-            .ok_or(PushError::FaceTimeStateChanged)?;
-        let mut session = snapshot.session.clone();
-        if session.members.contains(&member) {
-            self.ring(&session, &[letmein.requestor.clone()], true)
-                .await?;
-        } else {
-            self.add_members(&mut session, vec![member], true, None)
-                .await?;
-            self.reconcile_session(snapshot, session).await?;
+            let member = FTMember {
+                handle: letmein.requestor.clone(),
+                nickname: letmein.nickname.clone(),
+            };
+            let snapshot = approved_snapshot
+                .take()
+                .ok_or(PushError::FaceTimeStateChanged)?;
+            let mut session = snapshot.session.clone();
+            if session.members.contains(&member) {
+                self.ring(&session, &[letmein.requestor.clone()], true)
+                    .await?;
+            } else {
+                self.add_members(&mut session, vec![member], true, None)
+                    .await?;
+                self.reconcile_session(snapshot, session).await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        admission_follow_up_result(follow_up)
     }
 
     pub async fn ring(
@@ -2549,7 +2582,7 @@ impl FTClient {
                     Some(FTMessage::Decline { guid })
                 }
                 ConversationMessageType::LetMeInDelegationResponse => {
-                    let requests = self.delegated_requests.lock().await;
+                    let mut requests = self.delegated_requests.lock().await;
                     let Some(request) = requests.get(&decoded.let_me_in_delegation_uuid) else {
                         return Ok(None);
                     };
@@ -2735,7 +2768,11 @@ impl FTClient {
                             let new = session.new_members(&message.added_members);
 
                             if !stand_up_for.is_empty() {
-                                info!("Standing up for {:?} to {:?}", stand_up_for, new);
+                                info!(
+                                    "Rebroadcasting FaceTime membership existing_count={} new_count={}",
+                                    stand_up_for.len(),
+                                    new.len()
+                                );
                                 // if some members we recently added were left out of this state change, we must tell
                                 // the new member that these members *do* exist and should be included in the session
                                 self.add_members(
@@ -2930,6 +2967,29 @@ mod tests {
             classify_letmein_response_failure(&PushError::BadMsg),
             LetMeInResponseFailure::TransportError
         );
+    }
+
+    #[test]
+    fn admission_follow_up_failure_cannot_reclassify_a_sent_response() {
+        assert!(admission_follow_up_result(Err(PushError::BadMsg)).is_ok());
+        assert!(admission_follow_up_result(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn expired_delegated_response_is_not_retryable() {
+        let mut requests = DelegatedRequests::default();
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+        requests
+            .requests
+            .get_mut("delegation-fixture")
+            .expect("fixture request should exist")
+            .expires_at = Instant::now() - Duration::from_secs(1);
+
+        assert!(requests.get("delegation-fixture").is_none());
+        assert!(matches!(
+            requests.claim("delegation-fixture", None, true),
+            Err(PushError::FaceTimeAdmissionMissing)
+        ));
     }
 
     #[test]
@@ -3148,6 +3208,18 @@ mod tests {
         timeout(Duration::from_millis(100), state_writer)
             .await
             .expect("per-session network serialization must not block state writers");
+    }
+
+    #[tokio::test]
+    async fn idle_session_operation_entries_are_retired() {
+        let operations = DebugMutex::new(HashMap::new());
+        for index in 0..128 {
+            let operation =
+                session_operation_for(&operations, &format!("fixture-session-{index}")).await;
+            drop(operation);
+        }
+
+        assert!(operations.lock().await.len() <= 1);
     }
 
     #[tokio::test]
