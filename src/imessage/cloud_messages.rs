@@ -1932,6 +1932,19 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_warm_for_test(
+        client: Arc<CloudKitClient<P>>,
+        keychain: Arc<KeychainClient<P>>,
+        container: Arc<CloudKitOpenContainer<'static, P>>,
+    ) -> Self {
+        Self {
+            container: Mutex::new(Some(container)),
+            client,
+            keychain,
+        }
+    }
+
     /// Returns the active account identifier inside the native boundary.
     /// Callers must immediately transform it with an application-secret keyed
     /// function and must never expose it over FFI or logs.
@@ -1952,6 +1965,19 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
         *locked = Some(container.clone());
         Ok(container)
+    }
+
+    /// Returns only a container opened by explicit prior authentication.
+    /// Semantic decode must not invoke `ckAppInit` or refresh login state.
+    pub async fn get_container_lookup_only(
+        &self,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        self.container
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
     }
 
     /// Fetches one stable MessageEncryptedV3 record for ambiguous-write
@@ -2083,9 +2109,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         continuation_token: Option<Vec<u8>>,
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
-        let container = self.get_container().await?;
+        let container = self.get_container_lookup_only().await?;
         let zone = container.private_zone(zone_name.to_string());
-        let page = FetchRecordChangesOperation::fetch_page_with_limit(
+        let page = FetchRecordChangesOperation::fetch_page_with_limit_lookup_only(
             &container,
             zone,
             continuation_token,

@@ -129,6 +129,16 @@ pub struct TokenProvider<T: AnisetteProvider> {
     os_config: Arc<dyn OSConfig>,
 }
 
+const MME_DELEGATE_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+
+fn mme_delegate_is_warm(delegate_present: bool, refreshed: SystemTime, now: SystemTime) -> bool {
+    delegate_present
+        && now
+            .duration_since(refreshed)
+            .map(|age| age <= MME_DELEGATE_MAX_AGE)
+            .unwrap_or(false)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct StorageInfoBytes {
     pub total_storage: u64,
@@ -300,12 +310,11 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
         // refresh every week
-        if self.mme_delegate.lock().await.is_none()
-            || SystemTime::now()
-                .duration_since(*self.mme_refreshed.lock().await)
-                .unwrap()
-                > Duration::from_secs(60 * 60 * 24 * 7)
-        {
+        if !mme_delegate_is_warm(
+            self.mme_delegate.lock().await.is_some(),
+            *self.mme_refreshed.lock().await,
+            SystemTime::now(),
+        ) {
             self.refresh_mme().await?;
         }
         self.mme_delegate
@@ -317,6 +326,42 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             .get(token)
             .ok_or(PushError::TokenMissing)
             .cloned()
+    }
+
+    /// Returns a token only when explicit prior authentication left a current
+    /// MobileMe delegate in memory. This accessor never logs in or refreshes.
+    pub async fn get_mme_token_cached(&self, token: &str) -> Result<String, PushError> {
+        let delegate = self.mme_delegate.lock().await;
+        if !mme_delegate_is_warm(
+            delegate.is_some(),
+            *self.mme_refreshed.lock().await,
+            SystemTime::now(),
+        ) {
+            return Err(PushError::CloudKitWarmAuthenticationRequired);
+        }
+        delegate
+            .as_ref()
+            .and_then(|delegate| delegate.tokens.get(token))
+            .cloned()
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
+    }
+}
+
+#[cfg(test)]
+mod token_provider_tests {
+    use super::{mme_delegate_is_warm, MME_DELEGATE_MAX_AGE};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn semantic_auth_preflight_requires_a_current_existing_delegate() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        assert!(!mme_delegate_is_warm(false, now, now));
+        assert!(mme_delegate_is_warm(true, now - MME_DELEGATE_MAX_AGE, now));
+        assert!(!mme_delegate_is_warm(
+            true,
+            now - MME_DELEGATE_MAX_AGE - Duration::from_secs(1),
+            now
+        ));
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, collections::BTreeSet, io::Cursor, time::SystemTime};
 
 use crate::{
-    keychain::{KeychainClient, KeychainClientState, PCSMeta},
+    keychain::{KeychainClient, KeychainClientState, PCSMeta, SavedKeychainZone},
     util::{
         base64_decode, base64_encode, decode_hex, encode_hex, kdf_ctr_hmac, rfc6637_unwrap_key,
         rfc6637_wrap_key, CompactECKey,
@@ -56,6 +56,45 @@ const MASTER_SERVICE: PCSService = PCSService {
     global_record: true, // should be unused
 };
 
+fn require_existing_service_key_dict<'a>(
+    zone: Option<&'a SavedKeychainZone>,
+    service: &PCSService<'_>,
+    missing: PushError,
+) -> Result<&'a Dictionary, PushError> {
+    zone.and_then(|zone| {
+        zone.get_current_key(&format!("com.apple.ProtectedCloudStorage-{}", service.name))
+    })
+    .ok_or(missing)
+}
+
+const PCS_SHARE_KEY_UNAVAILABLE: &str = "unavailable";
+
+fn share_key_not_found() -> PushError {
+    PushError::ShareKeyNotFound(PCS_SHARE_KEY_UNAVAILABLE.to_string())
+}
+
+fn decode_compact_public_key(key: &[u8]) -> Result<CompactECKey<Public>, PushError> {
+    let key: [u8; 32] = key.try_into().map_err(|_| PushError::BadMsg)?;
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+    let mut context = BigNumContext::new()?;
+    let mut encoded = [0u8; 33];
+    encoded[0] = 0x03;
+    encoded[1..].copy_from_slice(&key);
+    let point = EcPoint::from_bytes(&group, &encoded, &mut context)?;
+    CompactECKey::try_from(EcKey::from_public_key(&group, &point)?)
+}
+
+fn decode_compact_private_key(key: &[u8]) -> Result<CompactECKey<Private>, PushError> {
+    let key: [u8; 64] = key.try_into().map_err(|_| PushError::BadMsg)?;
+    let public = decode_compact_public_key(&key[..32])?;
+    let private = BigNum::from_slice(&key[32..])?;
+    CompactECKey::try_from(EcKey::from_private_components(
+        public.group(),
+        &private,
+        public.public_key(),
+    )?)
+}
+
 // _add_PCSAttributes see references for types
 #[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSAttribute {
@@ -109,9 +148,18 @@ impl PCSPublicKey {
     pub fn verify<T: HasPublic>(&self, key: &EcKey<T>) -> Result<bool, PushError> {
         let key = PKey::from_ec_key(key.clone())?;
         let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
-        verifier.update(&self.data_for_signing())?;
+        let data =
+            rasn::der::encode(&self.clone_without_signature()).map_err(|_| PushError::BadMsg)?;
+        verifier.update(&data)?;
 
-        Ok(verifier.verify(&self.signature.as_ref().unwrap().signature)?)
+        let signature = self.signature.as_ref().ok_or(PushError::BadMsg)?;
+        Ok(verifier.verify(&signature.signature)?)
+    }
+
+    fn clone_without_signature(&self) -> Self {
+        let mut item = self.clone();
+        item.signature = None;
+        item
     }
 
     pub fn sign(&mut self, key: &CompactECKey<Private>) -> Result<(), PushError> {
@@ -256,28 +304,38 @@ impl PCSPrivateKey {
         keychain: &KeychainClient<impl AnisetteProvider>,
     ) -> Result<Self, PushError> {
         let state = keychain.state.read().await;
-        if let Some(existing) = &state.items[MASTER_SERVICE.zone].get_current_key(&format!(
-            "com.apple.ProtectedCloudStorage-{}",
-            MASTER_SERVICE.name
-        )) {
-            Ok(Self::from_dict(&existing, &state))
-        } else {
-            drop(state);
-            let master_key = PCSPrivateKey::new_master_key()?;
-            info!(
-                "Creating new master key {}",
-                encode_hex(&master_key.key().compress())
-            );
-            master_key
-                .save_key(
-                    &Uuid::new_v4().to_string().to_uppercase(),
-                    &keychain,
-                    &MASTER_SERVICE,
-                )
-                .await?;
-            info!("Created new master key");
-            Ok(master_key)
+        let existing = state.items.get(MASTER_SERVICE.zone).and_then(|zone| {
+            zone.get_current_key(&format!(
+                "com.apple.ProtectedCloudStorage-{}",
+                MASTER_SERVICE.name
+            ))
+        });
+        if let Some(existing) = existing {
+            return Ok(Self::from_dict(existing, &state));
         }
+        drop(state);
+        let master_key = PCSPrivateKey::new_master_key()?;
+        master_key
+            .save_key(
+                &Uuid::new_v4().to_string().to_uppercase(),
+                &keychain,
+                &MASTER_SERVICE,
+            )
+            .await?;
+        Ok(master_key)
+    }
+
+    /// Returns the existing PCS master key without creating or saving one.
+    pub async fn require_existing_master_key(
+        keychain: &KeychainClient<impl AnisetteProvider>,
+    ) -> Result<Self, PushError> {
+        let state = keychain.state.read().await;
+        let existing = require_existing_service_key_dict(
+            state.items.get(MASTER_SERVICE.zone),
+            &MASTER_SERVICE,
+            PushError::MasterKeyNotFound,
+        )?;
+        Self::try_from_dict(existing, &state)
     }
 
     // use a service struct
@@ -287,31 +345,45 @@ impl PCSPrivateKey {
         config: &dyn OSConfig,
     ) -> Result<Self, PushError> {
         let state = keychain.state.read().await;
-        if let Some(existing) = state.items[service.zone]
-            .get_current_key(&format!("com.apple.ProtectedCloudStorage-{}", service.name))
-        {
-            Ok(PCSPrivateKey::from_dict(existing, &state))
-        } else {
-            drop(state);
-            let master_key = Self::get_master_key(keychain).await?;
-
-            let service_key =
-                PCSPrivateKey::new_service_key(&master_key, service.r#type, service.v2, config)?;
-            info!(
-                "Creating new service key {} for {}",
-                encode_hex(&master_key.key().compress()),
-                service.name
-            );
-            service_key
-                .save_key(
-                    &Uuid::new_v4().to_string().to_uppercase(),
-                    &keychain,
-                    service,
-                )
-                .await?;
-            info!("Created new service key");
-            Ok(service_key)
+        let existing = state.items.get(service.zone).and_then(|zone| {
+            zone.get_current_key(&format!("com.apple.ProtectedCloudStorage-{}", service.name))
+        });
+        if let Some(existing) = existing {
+            return Ok(PCSPrivateKey::from_dict(existing, &state));
         }
+        drop(state);
+        let master_key = Self::get_master_key(keychain).await?;
+
+        let service_key =
+            PCSPrivateKey::new_service_key(&master_key, service.r#type, service.v2, config)?;
+        service_key
+            .save_key(
+                &Uuid::new_v4().to_string().to_uppercase(),
+                &keychain,
+                service,
+            )
+            .await?;
+        Ok(service_key)
+    }
+
+    /// Returns an existing service key and its existing master-key dependency.
+    ///
+    /// This method intentionally has no creation fallback. It is the only PCS
+    /// service-key lookup allowed by semantic decode, where missing keychain
+    /// state must be reported instead of repaired with a remote insert.
+    pub async fn require_existing_service_key(
+        keychain: &KeychainClient<impl AnisetteProvider>,
+        service: &PCSService<'_>,
+    ) -> Result<Self, PushError> {
+        Self::require_existing_master_key(keychain).await?;
+
+        let state = keychain.state.read().await;
+        let existing = require_existing_service_key_dict(
+            state.items.get(service.zone),
+            service,
+            share_key_not_found(),
+        )?;
+        Self::try_from_dict(existing, &state)
     }
 
     pub fn new_service_key(
@@ -355,17 +427,15 @@ impl PCSPrivateKey {
     pub fn public(&self) -> Result<PCSPublicKey, PushError> {
         use prost::Message;
         Ok(match self {
-            Self::V1 { key: _, public } => public.clone().expect("no public key!"),
+            Self::V1 { key: _, public } => public.clone().ok_or(PushError::BadMsg)?,
             Self::V2 { data } => {
                 let decoded = cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data))?;
-                rasn::der::decode(
-                    decoded
-                        .encryption_key
-                        .public
-                        .as_ref()
-                        .expect("no public key!"),
-                )
-                .unwrap()
+                let public = decoded
+                    .encryption_key
+                    .public
+                    .as_ref()
+                    .ok_or(PushError::BadMsg)?;
+                rasn::der::decode(public).map_err(|_| PushError::BadMsg)?
             }
         })
     }
@@ -433,6 +503,21 @@ impl PCSPrivateKey {
         Ok(())
     }
 
+    fn try_from_dict(dict: &Dictionary, keychain: &KeychainClientState) -> Result<Self, PushError> {
+        let key = keychain.get_data(dict)?.ok_or(PushError::BadMsg)?;
+        let decoded: PCSPrivateKey = rasn::der::decode(&key).map_err(|_| PushError::BadMsg)?;
+        let key_id = dict
+            .get("atyp")
+            .and_then(Value::as_data)
+            .ok_or(PushError::BadMsg)?;
+
+        if !decoded.verify_with_keychain(keychain, key_id)? {
+            return Err(PushError::VerificationFailed);
+        }
+
+        Ok(decoded)
+    }
+
     pub fn from_dict(dict: &Dictionary, keychain: &KeychainClientState) -> Self {
         let key = keychain
             .get_data(dict)
@@ -473,6 +558,19 @@ impl PCSPrivateKey {
         CompactECKey::decompress_private(key[..].try_into().unwrap())
     }
 
+    fn try_key(&self) -> Result<CompactECKey<Private>, PushError> {
+        use prost::Message;
+        let key = match self {
+            Self::V1 { key, public: _ } => key.to_vec(),
+            Self::V2 { data } => {
+                cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data))?
+                    .encryption_key
+                    .key
+            }
+        };
+        decode_compact_private_key(&key)
+    }
+
     pub fn signing_key(&self) -> CompactECKey<Private> {
         use prost::Message;
         let key = match self {
@@ -485,52 +583,74 @@ impl PCSPrivateKey {
         CompactECKey::decompress_private(key[..].try_into().unwrap())
     }
 
+    fn try_signing_key(&self) -> Result<CompactECKey<Private>, PushError> {
+        use prost::Message;
+        let key = match self {
+            Self::V1 { key, public: _ } => key.to_vec(),
+            Self::V2 { data } => {
+                let decoded = cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data))?;
+                decoded.signing_key.unwrap_or(decoded.encryption_key).key
+            }
+        };
+        decode_compact_private_key(&key)
+    }
+
     pub fn verify_with_keychain(
         &self,
         keychain: &KeychainClientState,
         keyid: &[u8],
     ) -> Result<bool, PushError> {
         let public = self.public()?;
-        let signature = public.signature.as_ref().expect("No signature!");
+        let signature = public.signature.as_ref().ok_or(PushError::BadMsg)?;
 
         if keyid == &signature.keyid[..] {
             // self signed
-            public.verify(&self.signing_key())
+            let signing_key = self.try_signing_key()?;
+            public.verify(&signing_key)
         } else {
             let account = Value::Data(signature.keyid.to_vec());
-            let item = keychain.items["ProtectedCloudStorage"]
+            let item = keychain
+                .items
+                .get("ProtectedCloudStorage")
+                .ok_or(PushError::MasterKeyNotFound)?
                 .keys
                 .values()
                 .find(|x| x.get("atyp") == Some(&account))
                 .ok_or(PushError::MasterKeyNotFound)?;
-            let key = keychain
-                .get_data(item)
-                .expect("Failed to get data")
-                .expect("No dataa");
+            let key = keychain.get_data(item)?.ok_or(PushError::BadMsg)?;
 
-            let decoded: PCSPrivateKey = rasn::der::decode(&key).unwrap();
+            let decoded: PCSPrivateKey = rasn::der::decode(&key).map_err(|_| PushError::BadMsg)?;
 
             if !decoded.verify_with_keychain(keychain, &signature.keyid)? {
-                panic!("Parent key not valid!")
+                return Err(PushError::VerificationFailed);
             }
 
-            let key = decoded.signing_key();
+            let key = decoded.try_signing_key()?;
 
             public.verify(&key)
         }
     }
 }
 
-fn get_ciphertext_key(ciphertext: &[u8]) -> (Vec<u8>, usize) {
-    let encryption_version = ciphertext[0];
+fn get_ciphertext_key(ciphertext: &[u8]) -> Result<(Vec<u8>, usize), PushError> {
+    let encryption_version = *ciphertext
+        .first()
+        .ok_or(PushError::PCSCiphertextMalformed)?;
     if encryption_version != 3 {
-        panic!("Unimplemented encryption version {encryption_version}");
+        return Err(PushError::PCSCiphertextMalformed);
     }
 
-    let second_keyid_part_len = ciphertext[3] as usize;
-    let total_tag = [&ciphertext[1..3], &ciphertext[4..4 + second_keyid_part_len]].concat();
+    let second_keyid_part_len =
+        usize::from(*ciphertext.get(3).ok_or(PushError::PCSCiphertextMalformed)?);
+    let first_key_part = ciphertext
+        .get(1..3)
+        .ok_or(PushError::PCSCiphertextMalformed)?;
+    let second_key_part = ciphertext
+        .get(4..4 + second_keyid_part_len)
+        .ok_or(PushError::PCSCiphertextMalformed)?;
+    let total_tag = [first_key_part, second_key_part].concat();
 
-    (total_tag, 4 + second_keyid_part_len)
+    Ok((total_tag, 4 + second_keyid_part_len))
 }
 
 #[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -575,7 +695,7 @@ impl PCSKey {
 
     // AKA object key
     fn master_ec_key(&self) -> Result<EcKey<Private>, PushError> {
-        let mut ctx = BigNumContext::new().unwrap();
+        let mut ctx = BigNumContext::new()?;
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let mut output = [0u8; 128];
         pbkdf2_hmac(
@@ -652,25 +772,29 @@ impl PCSKey {
             self.0.len(),
         );
 
-        let (required_key, header_len) = get_ciphertext_key(ciphertext);
-
-        if &required_key[..] != &self.key_id()?[..required_key.len()] {
-            panic!(
-                "Mismatched key id! Data {} key {}",
-                encode_hex(&ciphertext[..16]),
-                encode_hex(&self.key_id()?)
-            );
+        let (required_key, header_len) = get_ciphertext_key(ciphertext)?;
+        let key_id = self.key_id()?;
+        if key_id.get(..required_key.len()) != Some(required_key.as_slice()) {
+            return Err(PushError::PCSKeyIdMismatch);
         }
 
         let tag_len = 12;
+        let iv = ciphertext
+            .get(header_len..header_len + 12)
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let firstaad = ciphertext
+            .get(..header_len)
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let gcm = AesGcm::<Aes128, U12, U12>::new_from_slice(&encryption_key)
+            .map_err(|_| PushError::BadMsg)?;
+        let tag = ciphertext
+            .get(header_len + 12..header_len + 12 + tag_len)
+            .ok_or(PushError::PCSCiphertextMalformed)?;
 
-        let iv = &ciphertext[header_len..header_len + 12];
-        let firstaad = &ciphertext[0..header_len];
-        let gcm =
-            AesGcm::<Aes128, U12, U12>::new(encryption_key[..].try_into().expect("Bad key size!"));
-        let tag = &ciphertext[header_len + 12..header_len + 12 + tag_len];
-
-        let mut text = ciphertext[header_len + 12 + tag_len..].to_vec();
+        let mut text = ciphertext
+            .get(header_len + 12 + tag_len..)
+            .ok_or(PushError::PCSCiphertextMalformed)?
+            .to_vec();
 
         gcm.decrypt_in_place_detached(
             Nonce::from_slice(iv),
@@ -678,7 +802,7 @@ impl PCSKey {
             &mut text,
             Tag::from_slice(tag),
         )
-        .expect("GCM error?");
+        .map_err(|_| PushError::PCSDecryptionFailed)?;
         Ok(text)
     }
 
@@ -717,30 +841,56 @@ pub struct PCSEncryptor {
     pub keys: Vec<PCSKey>,
     pub record_id: RecordIdentifier,
 }
+
+impl PCSEncryptor {
+    fn key_for_ciphertext(&self, ciphertext: &[u8]) -> Result<&PCSKey, PushError> {
+        let (required_key, _) = get_ciphertext_key(ciphertext)?;
+        for key in &self.keys {
+            let key_id = key.key_id()?;
+            if key_id.get(..required_key.len()) == Some(required_key.as_slice()) {
+                return Ok(key);
+            }
+        }
+        Err(PushError::PCSKeyIdMismatch)
+    }
+
+    /// Validates only the content-free PCS key routing header.
+    ///
+    /// Semantic decode uses this before the infallible legacy record decoder so
+    /// a mismatched key is returned as a typed failure rather than becoming a
+    /// panic or being collapsed to an empty field.
+    pub fn validate_ciphertext_key(&self, ciphertext: &[u8]) -> Result<(), PushError> {
+        self.key_for_ciphertext(ciphertext).map(|_| ())
+    }
+
+    pub fn decrypt_data_checked(
+        &self,
+        ciphertext: &[u8],
+        field_name: &str,
+    ) -> Result<Vec<u8>, PushError> {
+        let zone_name = self
+            .record_id
+            .zone_identifier
+            .as_ref()
+            .and_then(|zone| zone.value.as_ref())
+            .and_then(|identifier| identifier.name.as_deref())
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let record_name = self
+            .record_id
+            .value
+            .as_ref()
+            .and_then(|identifier| identifier.name.as_deref())
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let tag = format!("{zone_name}-{record_name}-{field_name}");
+        self.key_for_ciphertext(ciphertext)?
+            .decrypt(ciphertext, tag.as_bytes())
+    }
+}
+
 impl CloudKitEncryptor for PCSEncryptor {
     fn decrypt_data(&self, dec: &[u8], field_name: &str) -> Vec<u8> {
-        let (required_key, _) = get_ciphertext_key(dec);
-
-        let tag = format!(
-            "{}-{}-{}",
-            self.record_id
-                .zone_identifier
-                .as_ref()
-                .unwrap()
-                .value
-                .as_ref()
-                .unwrap()
-                .name(),
-            self.record_id.value.as_ref().unwrap().name(),
-            field_name
-        );
-
-        let key = self
-            .keys
-            .iter()
-            .find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..])
-            .expect("required key not found!");
-        key.decrypt(dec, tag.as_bytes()).expect("Decryption failed")
+        self.decrypt_data_checked(dec, field_name)
+            .unwrap_or_default()
     }
 
     fn encrypt_data(&self, enc: &[u8], field_name: &str) -> Vec<u8> {
@@ -818,14 +968,16 @@ impl PCSShareProtectionKeySet {
         self.hash = Some(sha256(&rasn::der::encode(self).unwrap()).to_vec().into());
     }
 
-    fn check_checksum(&mut self) {
-        let checksum = self.hash.take().unwrap();
-        let checked = sha256(&rasn::der::encode(self).unwrap());
+    fn check_checksum(&mut self) -> Result<(), PushError> {
+        let checksum = self.hash.take().ok_or(PushError::BadMsg)?;
+        let checked = sha256(&rasn::der::encode(&*self).map_err(|_| PushError::BadMsg)?);
 
         if &checked[..] != &checksum[..] {
-            panic!("Bad checksum!")
+            self.hash = Some(checksum);
+            return Err(PushError::VerificationFailed);
         }
         self.hash = Some(checksum);
+        Ok(())
     }
 }
 
@@ -837,11 +989,7 @@ impl PCSDigestData {
         if !sig.keyid.is_empty()
             && &*sig.keyid != TryInto::<CompactECKey<_>>::try_into(key.clone())?.compress()
         {
-            panic!(
-                "Mismatched key ID, expected {} got {}",
-                encode_hex(&sig.keyid),
-                encode_hex(&key.public_key_to_der()?)
-            )
+            return Err(PushError::VerificationFailed);
         }
 
         let mut verifier = Verifier::new(MessageDigest::sha256(), &pkey)?;
@@ -889,13 +1037,13 @@ pub struct PCSShareProtectionIdentities {
 }
 
 impl PCSShareProtection {
-    fn signature_data(&self) -> PCSObjectSignature {
-        rasn::der::decode(&self.signature_data.data).expect("failed to decode signature data")
+    fn signature_data(&self) -> Result<PCSObjectSignature, PushError> {
+        rasn::der::decode(&self.signature_data.data).map_err(|_| PushError::BadMsg)
     }
 
-    fn digest_data(&self, objsig: &PCSObjectSignature) -> PCSDigestData {
+    fn digest_data(&self, objsig: &PCSObjectSignature) -> Result<PCSDigestData, PushError> {
         let mut data = [
-            &rasn::der::encode(&self.keyset).unwrap(),
+            &rasn::der::encode(&self.keyset).map_err(|_| PushError::BadMsg)?,
             &self.meta[..],
             &objsig.outer_sign_key_type.to_be_bytes(),
             &objsig.roll_count.to_be_bytes(),
@@ -905,21 +1053,21 @@ impl PCSShareProtection {
         ]
         .concat();
         if let Some(attributes) = &objsig.attributes {
-            data.extend_from_slice(&rasn::der::encode(attributes).unwrap());
+            data.extend_from_slice(&rasn::der::encode(attributes).map_err(|_| PushError::BadMsg)?);
         }
         if let Some(ec_key_list) = &objsig.ec_key_list {
-            data.extend_from_slice(&rasn::der::encode(ec_key_list).unwrap());
+            data.extend_from_slice(&rasn::der::encode(ec_key_list).map_err(|_| PushError::BadMsg)?);
         }
-        PCSDigestData(data)
+        Ok(PCSDigestData(data))
     }
 
-    fn hmac_data(&self) -> Vec<u8> {
-        [
-            &rasn::der::encode(&self.keyset).unwrap(),
+    fn hmac_data(&self) -> Result<Vec<u8>, PushError> {
+        Ok([
+            &rasn::der::encode(&self.keyset).map_err(|_| PushError::BadMsg)?,
             &self.meta[..],
-            &rasn::der::encode(&self.signature_data()).unwrap(),
+            &rasn::der::encode(&self.signature_data()?).map_err(|_| PushError::BadMsg)?,
         ]
-        .concat()
+        .concat())
     }
 
     pub fn decode_key_public(&self) -> Result<Vec<u8>, PushError> {
@@ -927,7 +1075,7 @@ impl PCSShareProtection {
             .keyset
             .keyset
             .first()
-            .expect("No public keyset! (bad decoding?)")
+            .ok_or_else(share_key_not_found)?
             .decryption_key
             .pub_key
             .to_vec())
@@ -945,14 +1093,15 @@ impl PCSShareProtection {
             .map(|k| Value::String(base64_encode(&k.decryption_key.pub_key)))
             .collect::<Vec<_>>();
 
-        let item = keychain.items[service.zone]
+        let item = keychain
+            .items
+            .get(service.zone)
+            .ok_or_else(share_key_not_found)?
             .keys
             .values()
             .find(|x| matches!(x.get("acct"), Some(x) if keys.contains(x)))
-            .ok_or(PushError::ShareKeyNotFound(encode_hex(
-                &self.decode_key_public()?,
-            )))?;
-        Ok(PCSPrivateKey::from_dict(item, keychain))
+            .ok_or_else(share_key_not_found)?;
+        PCSPrivateKey::try_from_dict(item, keychain)
     }
 
     pub fn decrypt_with_keychain(
@@ -963,10 +1112,10 @@ impl PCSShareProtection {
     ) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         let decoded = self.get_private_key(keychain, service)?;
 
-        let key = decoded.key();
+        let key = decoded.try_key()?;
         info!("Decoding PCS data with a keychain key");
 
-        let signing = decoded.signing_key();
+        let signing = decoded.try_signing_key()?;
         self.decode(&[&key], if custom_signing { Some(&signing) } else { None })
     }
 
@@ -984,21 +1133,38 @@ impl PCSShareProtection {
 
     pub fn get_inner_keys(&self) -> Vec<CompactECKey<Public>> {
         self.signature_data()
-            .ec_key_list
+            .ok()
+            .and_then(|signature| signature.ec_key_list)
             .unwrap_or_default()
             .into_iter()
-            .map(|key| {
-                CompactECKey::decompress(key.pub_key.to_vec().try_into().expect("bad key lsne!"))
-            })
+            .filter_map(|key| decode_compact_public_key(&key.pub_key).ok())
             .collect()
     }
 
     pub fn get_roll_count(&self) -> u32 {
-        self.signature_data().roll_count
+        self.signature_data()
+            .map(|signature| signature.roll_count)
+            .unwrap_or_default()
+    }
+
+    pub fn try_from_protection_info(info: &ProtectionInfo) -> Result<Self, PushError> {
+        rasn::der::decode(info.protection_info()).map_err(|_| PushError::BadMsg)
     }
 
     pub fn from_protection_info(info: &ProtectionInfo) -> Self {
-        rasn::der::decode(info.protection_info()).expect("Bad invite protection?")
+        Self::try_from_protection_info(info).unwrap_or_else(|_| Self {
+            keyset: PCSKeySet {
+                unk1: 0,
+                keyset: SetOf::new(),
+                attributes: None,
+            },
+            meta: Default::default(),
+            signature_data: Default::default(),
+            hmac: Default::default(),
+            truncated_key_id: Default::default(),
+            signature: None,
+            attributes: None,
+        })
     }
 
     pub fn create_new(
@@ -1217,7 +1383,7 @@ impl PCSShareProtection {
             },
         };
 
-        let digest_data = protection.digest_data(&signature);
+        let digest_data = protection.digest_data(&signature)?;
         signature.signature = digest_data.sign(&master_ec_key, true)?;
 
         if let Some(last_key) = last_key {
@@ -1250,7 +1416,7 @@ impl PCSShareProtection {
             protection.attributes = Some(attributes);
         }
 
-        protection.hmac = master_key.hmac_sign(&protection.hmac_data())?.into();
+        protection.hmac = master_key.hmac_sign(&protection.hmac_data()?)?.into();
 
         Ok(protection)
     }
@@ -1258,7 +1424,7 @@ impl PCSShareProtection {
     pub fn get_signer(&self) -> Option<CompactECKey<Public>> {
         self.signature
             .as_ref()
-            .map(|a| CompactECKey::decompress(a.keyid.to_vec().try_into().expect("Key ID")))
+            .and_then(|signature| decode_compact_public_key(&signature.keyid).ok())
     }
 
     pub fn decode(
@@ -1278,16 +1444,14 @@ impl PCSShareProtection {
                     .find(|key| &*key.decryption_key.pub_key == &search_ref[..]);
                 other.map(|other| (key.borrow(), other))
             })
-            .expect("Could not find decode key!!");
+            .ok_or_else(share_key_not_found)?;
         let rm_master_key = PCSKey::new(key, &share_key.ciphertext)?;
-        info!("MAster key {}", encode_hex(&rm_master_key.0));
-
         let share_flags = share_key.flags.unwrap_or_default();
         let readonly = (share_flags & 1) != 0;
 
-        let sig = self.signature_data();
+        let sig = self.signature_data()?;
 
-        let digest_data = self.digest_data(&sig);
+        let digest_data = self.digest_data(&sig)?;
 
         info!("showed me off");
 
@@ -1309,7 +1473,7 @@ impl PCSShareProtection {
                     if let Some(past_signature) = &sig.signature_2 {
                         digest_data.verify(key, &past_signature)?;
                     } else {
-                        panic!("self sig check failed")
+                        return Err(PushError::VerificationFailed);
                     }
                 }
                 _e => _e?,
@@ -1325,7 +1489,8 @@ impl PCSShareProtection {
             .into_iter()
             .find(|a| a.key == 7);
         if let (Some(signing), Some(review)) = (custom_signing_key, owner_sign) {
-            let parsed: PCSSignature = rasn::der::decode(&review.value).expect("Bad signature???a");
+            let parsed: PCSSignature =
+                rasn::der::decode(&review.value).map_err(|_| PushError::BadMsg)?;
             digest_data.verify(signing, &parsed)?;
         }
 
@@ -1334,29 +1499,31 @@ impl PCSShareProtection {
             master_key = rm_master_key.get_share_key(true);
         }
 
-        assert_eq!(
-            &master_key.key_id()?[..4].to_vec(),
-            self.truncated_key_id.as_ref()
-        );
+        let master_key_id = master_key.key_id()?;
+        let expected_key_id = master_key_id.get(..4).ok_or(PushError::BadMsg)?;
+        if expected_key_id != self.truncated_key_id.as_ref() {
+            return Err(PushError::VerificationFailed);
+        }
 
-        if &master_key.hmac_sign(&self.hmac_data())? != &self.hmac {
-            panic!("HMAC check failed");
+        if &master_key.hmac_sign(&self.hmac_data()?)? != &self.hmac {
+            return Err(PushError::VerificationFailed);
         }
 
         let decrypted = master_key.decrypt(&self.meta, &[])?;
 
         info!("here");
 
-        let identities: PCSShareProtectionIdentities = rasn::der::decode(&decrypted).unwrap();
+        let identities: PCSShareProtectionIdentities =
+            rasn::der::decode(&decrypted).map_err(|_| PushError::BadMsg)?;
 
         let mut keys = vec![];
         for identity in identities.identities.as_ref().unwrap_or(&SetOf::new()) {
             let mut identity: PCSShareProtectionKeySet =
-                rasn::der::decode(&identity.keyset).unwrap();
-            identity.check_checksum();
+                rasn::der::decode(&identity.keyset).map_err(|_| PushError::BadMsg)?;
+            identity.check_checksum()?;
 
             for key in &identity.keys {
-                keys.push(key.key());
+                keys.push(key.try_key()?);
             }
         }
 
@@ -1370,6 +1537,274 @@ impl PCSShareProtection {
         );
 
         Ok((pcs_keys, keys))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        require_existing_service_key_dict, share_key_not_found, PCSDigestData, PCSEncryptor,
+        PCSKey, PCSService, PCSShareProtection, PCSShareProtectionKeySet, PCSSignature,
+        MASTER_SERVICE,
+    };
+    use crate::{
+        cloudkit::{public_zone, record_identifier},
+        keychain::SavedKeychainZone,
+        util::{encode_hex, CompactECKey},
+        PushError,
+    };
+    use cloudkit_proto::{CloudKitEncryptor, ProtectionInfo};
+    use openssl::pkey::{Private, Public};
+    use std::collections::BTreeSet;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn assert_content_free(error: &PushError, sentinels: &[&str]) {
+        let formatted = format!("{error:?} {error}");
+        for sentinel in sentinels {
+            assert!(
+                !formatted.contains(sentinel),
+                "loggable error exposed sentinel material"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_only_master_key_missing_state_is_typed_and_non_creating() {
+        let error =
+            require_existing_service_key_dict(None, &MASTER_SERVICE, PushError::MasterKeyNotFound)
+                .unwrap_err();
+
+        assert!(matches!(error, PushError::MasterKeyNotFound));
+    }
+
+    #[test]
+    fn lookup_only_service_key_missing_state_is_typed_and_non_creating() {
+        let sentinel_service = "SENTINEL_SHARE_KEY_ID_DO_NOT_EXPOSE";
+        let service = PCSService {
+            name: sentinel_service,
+            view_hint: "Messages",
+            zone: "chatManateeZone",
+            r#type: 4,
+            keychain_type: 4,
+            v2: true,
+            global_record: false,
+        };
+        let empty_zone = SavedKeychainZone::default();
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            require_existing_service_key_dict(Some(&empty_zone), &service, share_key_not_found())
+        }));
+        let error = checked
+            .expect("missing lookup-only PCS service key must not panic")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PushError::ShareKeyNotFound(ref name) if name == "unavailable"
+        ));
+        assert_content_free(&error, &[sentinel_service]);
+    }
+
+    #[test]
+    fn digest_signature_key_mismatch_is_typed_content_free_and_never_panics() {
+        let sentinel_key_id = "SENTINEL_SIGNATURE_KEY_ID_DO_NOT_EXPOSE";
+        let key = CompactECKey::new().unwrap();
+        let public_key = encode_hex(&key.public_key_to_der().unwrap());
+        let signature = PCSSignature {
+            keyid: sentinel_key_id.as_bytes().to_vec().into(),
+            digest: 1,
+            signature: vec![0xA5; 64].into(),
+        };
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            PCSDigestData(b"sentinel digest fixture".to_vec()).verify(&key, &signature)
+        }));
+        let error = checked
+            .expect("signature key mismatch must return rather than panic")
+            .unwrap_err();
+
+        assert!(matches!(error, PushError::VerificationFailed));
+        assert_content_free(&error, &[sentinel_key_id, &public_key]);
+    }
+
+    #[test]
+    fn truncated_zone_key_mismatch_is_typed_content_free_and_never_panics() {
+        let sentinel_key_id = "SENTINEL_TRUNCATED_KEY_ID_DO_NOT_EXPOSE";
+        let key = CompactECKey::new().unwrap();
+        let mut protection = PCSShareProtection::create_new(
+            &key,
+            &[] as &[CompactECKey<Private>],
+            &[] as &[CompactECKey<Private>],
+            false,
+        )
+        .unwrap();
+        protection.truncated_key_id = sentinel_key_id.as_bytes().to_vec().into();
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            protection.decode(&[&key], None::<&CompactECKey<Public>>)
+        }));
+        let error = match checked.expect("truncated PCS key mismatch must return rather than panic")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("truncated PCS key mismatch unexpectedly decoded"),
+        };
+
+        assert!(matches!(error, PushError::VerificationFailed));
+        assert_content_free(&error, &[sentinel_key_id]);
+    }
+
+    #[test]
+    fn malformed_signature_data_is_typed_content_free_and_never_panics() {
+        let sentinel_signature = "SENTINEL_SIGNATURE_BYTES_DO_NOT_EXPOSE";
+        let key = CompactECKey::new().unwrap();
+        let mut protection = PCSShareProtection::create_new(
+            &key,
+            &[] as &[CompactECKey<Private>],
+            &[] as &[CompactECKey<Private>],
+            false,
+        )
+        .unwrap();
+        protection.signature_data.data = sentinel_signature.as_bytes().to_vec().into();
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            protection.decode(&[&key], None::<&CompactECKey<Public>>)
+        }));
+        let error =
+            match checked.expect("malformed PCS signature data must return rather than panic") {
+                Err(error) => error,
+                Ok(_) => panic!("malformed PCS signature data unexpectedly decoded"),
+            };
+
+        assert!(matches!(error, PushError::BadMsg));
+        assert_content_free(&error, &[sentinel_signature]);
+    }
+
+    #[test]
+    fn malformed_zone_protection_is_typed_content_free_and_never_panics() {
+        let sentinel_protection = "SENTINEL_ZONE_PROTECTION_BYTES_DO_NOT_EXPOSE";
+        let info = ProtectionInfo {
+            protection_info: Some(sentinel_protection.as_bytes().to_vec()),
+            protection_info_tag: Some("SENTINEL_PROTECTION_TAG".to_string()),
+        };
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            PCSShareProtection::try_from_protection_info(&info)
+        }));
+        let error = checked
+            .expect("malformed zone protection must return rather than panic")
+            .unwrap_err();
+
+        assert!(matches!(error, PushError::BadMsg));
+        assert_content_free(&error, &[sentinel_protection, "SENTINEL_PROTECTION_TAG"]);
+
+        let compatibility = catch_unwind(AssertUnwindSafe(|| {
+            let protection = PCSShareProtection::from_protection_info(&info);
+            let key = CompactECKey::new().unwrap();
+            protection.decode(&[&key], None::<&CompactECKey<Public>>)
+        }));
+        let compatibility_error =
+            match compatibility.expect("legacy protection adapter must not panic") {
+                Err(error) => error,
+                Ok(_) => panic!("legacy protection adapter unexpectedly decoded"),
+            };
+        assert!(matches!(
+            compatibility_error,
+            PushError::ShareKeyNotFound(ref label) if label == "unavailable"
+        ));
+        assert_content_free(&compatibility_error, &[sentinel_protection]);
+    }
+
+    #[test]
+    fn missing_share_key_is_typed_content_free_and_never_panics() {
+        let owner = CompactECKey::new().unwrap();
+        let foreign = CompactECKey::new().unwrap();
+        let protection = PCSShareProtection::create_new(
+            &owner,
+            &[] as &[CompactECKey<Private>],
+            &[] as &[CompactECKey<Private>],
+            false,
+        )
+        .unwrap();
+        let sentinel_public_key = encode_hex(&protection.decode_key_public().unwrap());
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            protection.decode(&[&foreign], None::<&CompactECKey<Public>>)
+        }));
+        let error = match checked.expect("missing share key must return rather than panic") {
+            Err(error) => error,
+            Ok(_) => panic!("missing share key unexpectedly decoded"),
+        };
+
+        assert!(matches!(
+            error,
+            PushError::ShareKeyNotFound(ref label) if label == "unavailable"
+        ));
+        assert_content_free(&error, &[&sentinel_public_key]);
+    }
+
+    #[test]
+    fn malformed_identity_checksum_is_typed_content_free_and_never_panics() {
+        let sentinel_checksum = "SENTINEL_CHECKSUM_BYTES_DO_NOT_EXPOSE";
+        let mut keyset = PCSShareProtectionKeySet {
+            unk1: String::new(),
+            keys: BTreeSet::new(),
+            unk2: BTreeSet::new(),
+            hash: Some(sentinel_checksum.as_bytes().to_vec().into()),
+        };
+
+        let checked = catch_unwind(AssertUnwindSafe(|| keyset.check_checksum()));
+        let error = checked
+            .expect("bad PCS identity checksum must return rather than panic")
+            .unwrap_err();
+
+        assert!(matches!(error, PushError::VerificationFailed));
+        assert_content_free(&error, &[sentinel_checksum]);
+    }
+
+    #[test]
+    fn ciphertext_key_mismatch_is_typed_content_free_and_never_panics() {
+        let sentinel_message = "SENTINEL_MESSAGE_TEXT_DO_NOT_EXPOSE";
+        let sentinel_dsid = "SENTINEL_DSID_123456789";
+        let sentinel_token = "SENTINEL_CHANGE_TOKEN";
+        let sentinel_peer_id = "SENTINEL_PEER_ID";
+        let sentinel_key_id = "feedfacecafebeef";
+        let sentinel_key_bytes = "00112233445566778899aabbccddeeff";
+        let sentinel_ciphertext_bytes = "030102020304";
+
+        let encryptor = PCSEncryptor {
+            keys: vec![PCSKey(vec![0xAA; 16])],
+            record_id: record_identifier(public_zone(), "sentinel-record"),
+        };
+        let mut ciphertext = vec![0x03, 0x01, 0x02, 0x02, 0x03, 0x04];
+        ciphertext.resize(42, 0);
+
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            encryptor.decrypt_data_checked(&ciphertext, "sentinel-field")
+        }));
+        let error = checked
+            .expect("PCS mismatch must return rather than panic")
+            .expect_err("a foreign key identifier must be rejected");
+        assert!(matches!(error, PushError::PCSKeyIdMismatch));
+
+        let legacy = catch_unwind(AssertUnwindSafe(|| {
+            encryptor.decrypt_data(&ciphertext, "sentinel-field")
+        }));
+        assert_eq!(
+            legacy.expect("legacy trait adapter must not panic"),
+            Vec::<u8>::new()
+        );
+
+        let formatted = format!("{error:?} {error}");
+        for sentinel in [
+            sentinel_message,
+            sentinel_dsid,
+            sentinel_token,
+            sentinel_peer_id,
+            sentinel_key_id,
+            sentinel_key_bytes,
+            sentinel_ciphertext_bytes,
+        ] {
+            assert!(!formatted.contains(sentinel));
+        }
     }
 }
 

@@ -1833,12 +1833,11 @@ pub fn rfc6637_unwrap_key(
 ) -> Result<Vec<u8>, PushError> {
     let (_, unpacked) = RFC6637WrappedKey::from_bytes((wrapped_key, 0))?;
 
-    let compact = CompactECKey::decompress(
-        unpacked
-            .public_ephemeral
-            .try_into()
-            .expect("RFC6637 Bad Ephemeral size"),
-    );
+    let ephemeral: [u8; 32] = unpacked
+        .public_ephemeral
+        .try_into()
+        .map_err(|_| PushError::BadMsg)?;
+    let compact = CompactECKey::try_decompress(ephemeral)?;
 
     let private_key = private_key.get_pkey();
     let public_key = compact.get_pkey();
@@ -1856,18 +1855,37 @@ pub fn rfc6637_unwrap_key(
         &unpacked.wrapped,
     )?;
 
-    let padding_len = *unwrapped.last().unwrap() as usize;
-    for i in 0..padding_len {
-        if unwrapped[unwrapped.len() - 1 - i] != padding_len as u8 {
-            panic!("Invalid padding!");
-        }
+    if unwrapped.first() != Some(&1) {
+        return Err(PushError::BadMsg);
     }
-    let key_len = unwrapped.len() - padding_len - 1 - 2;
-    let key = &unwrapped[1..key_len + 1];
+    let padding_len = usize::from(*unwrapped.last().ok_or(PushError::BadMsg)?);
+    if padding_len == 0 {
+        return Err(PushError::BadMsg);
+    }
+    let padding_start = unwrapped
+        .len()
+        .checked_sub(padding_len)
+        .ok_or(PushError::BadMsg)?;
+    if !unwrapped
+        .get(padding_start..)
+        .is_some_and(|padding| padding.iter().all(|byte| usize::from(*byte) == padding_len))
+    {
+        return Err(PushError::BadMsg);
+    }
+    let key_end = padding_start.checked_sub(2).ok_or(PushError::BadMsg)?;
+    let key = unwrapped.get(1..key_end).ok_or(PushError::BadMsg)?;
+    if key.is_empty() {
+        return Err(PushError::BadMsg);
+    }
 
     let checksum = key.iter().fold(0u16, |acc, i| acc.wrapping_add(*i as u16));
-    if checksum != u16::from_be_bytes(unwrapped[1 + key_len..1 + key_len + 2].try_into().unwrap()) {
-        panic!("Bad checksum!")
+    let encoded_checksum: [u8; 2] = unwrapped
+        .get(key_end..padding_start)
+        .ok_or(PushError::BadMsg)?
+        .try_into()
+        .map_err(|_| PushError::BadMsg)?;
+    if checksum != u16::from_be_bytes(encoded_checksum) {
+        return Err(PushError::BadMsg);
     }
 
     Ok(key.to_vec())
@@ -2058,38 +2076,36 @@ impl CompactECKey<Private> {
 }
 
 impl CompactECKey<Public> {
-    pub fn decompress(key: [u8; 32]) -> Self {
-        let mut ctx = BigNumContext::new().unwrap();
+    pub fn try_decompress(key: [u8; 32]) -> Result<Self, PushError> {
+        let mut ctx = BigNumContext::new()?;
         let mut unpacked_key = [0u8; 33];
         unpacked_key[0] = 0x3;
         unpacked_key[1..].copy_from_slice(&key);
 
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut ctx)
-            .expect("Ec point decompress failed!");
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut ctx)?;
 
-        let mut ctx = BigNumContext::new().expect("a failed");
-        let mut x = BigNum::new().expect("New bn failed!");
-        let mut y = BigNum::new().expect("b failed");
-        let mut p = BigNum::new().expect("c failed");
-        let mut scratch = BigNum::new().expect("New bn failed!");
-        group
-            .components_gfp(&mut p, &mut scratch, &mut BigNum::new().unwrap(), &mut ctx)
-            .expect("d failed");
-        point
-            .affine_coordinates(&group, &mut x, &mut y, &mut ctx)
-            .expect("e failed");
+        let mut ctx = BigNumContext::new()?;
+        let mut x = BigNum::new()?;
+        let mut y = BigNum::new()?;
+        let mut p = BigNum::new()?;
+        let mut scratch = BigNum::new()?;
+        let mut b = BigNum::new()?;
+        group.components_gfp(&mut p, &mut scratch, &mut b, &mut ctx)?;
+        point.affine_coordinates(&group, &mut x, &mut y, &mut ctx)?;
 
         let result = scratch.checked_sub(&p, &y);
-        y.mul_word(2).expect("What");
+        y.mul_word(2)?;
         if y >= p {
-            result.expect("Sub failed!");
-            point
-                .set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx)
-                .expect("Set affine coordinates failed!");
+            result?;
+            point.set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx)?;
         }
 
-        Self(EcKey::from_public_key(&group, &point).unwrap())
+        Ok(Self(EcKey::from_public_key(&group, &point)?))
+    }
+
+    pub fn decompress(key: [u8; 32]) -> Self {
+        Self::try_decompress(key).expect("Ec point decompress failed!")
     }
 }
 
@@ -2104,6 +2120,25 @@ impl<T> DerefMut for CompactECKey<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+#[test]
+fn rfc6637_unwrap_is_fallible_for_malformed_remote_keys() -> Result<(), PushError> {
+    let private = CompactECKey::new()?;
+    let plaintext = b"0123456789abcdef";
+    let wrapped = rfc6637_wrap_key(&private, plaintext, b"fingerprint")?;
+    assert_eq!(
+        rfc6637_unwrap_key(&private, &wrapped, b"fingerprint")?,
+        plaintext
+    );
+
+    for malformed in [Vec::new(), vec![0; 3], vec![0; 64]] {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rfc6637_unwrap_key(&private, &malformed, b"fingerprint")
+        }));
+        assert!(matches!(outcome, Ok(Err(_))));
+    }
+    Ok(())
 }
 
 #[test]

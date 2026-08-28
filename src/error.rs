@@ -213,6 +213,18 @@ pub enum PushError {
     Bad2FaCode,
     #[error("PCS record key id not found!")]
     PCSRecordKeyMissing,
+    #[error("PCS ciphertext was malformed")]
+    PCSCiphertextMalformed,
+    #[error("PCS ciphertext key identifier did not match")]
+    PCSKeyIdMismatch,
+    #[error("PCS ciphertext decryption failed")]
+    PCSDecryptionFailed,
+    #[error("CloudKit warm authentication is required")]
+    CloudKitWarmAuthenticationRequired,
+    #[error("CloudKit semantic operation was not read-only")]
+    CloudKitSemanticOperationDenied,
+    #[error("CloudKit change token expired")]
+    CloudKitChangeTokenExpired,
     #[error("Circle is over!")]
     CircleOver,
     #[error("Too many requests!")]

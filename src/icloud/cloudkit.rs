@@ -88,13 +88,109 @@ use sha2::Sha256;
 use std::str::FromStr;
 use uuid::Uuid;
 
+#[cfg(test)]
+use std::pin::Pin;
+
 const CLOUDKIT_MAX_RESPONSE_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const CLOUDKIT_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
 const CLOUDKIT_MAX_RECORD_CHANGE_BYTES: usize = 8 * 1024 * 1024;
 const CLOUDKIT_MAX_RECORD_CHANGE_PAGE_BYTES: usize = 24 * 1024 * 1024;
 
+enum CloudKitHttpResponse {
+    Reqwest(reqwest::Response),
+    #[cfg(test)]
+    Buffered(CloudKitBufferedResponse),
+}
+
+impl CloudKitHttpResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        match self {
+            Self::Reqwest(response) => response.status(),
+            #[cfg(test)]
+            Self::Buffered(response) => response.status,
+        }
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        match self {
+            Self::Reqwest(response) => response.headers(),
+            #[cfg(test)]
+            Self::Buffered(response) => &response.headers,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CloudKitBufferedResponse {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
+}
+
+#[cfg(test)]
+type CloudKitTestTransportFuture =
+    Pin<Box<dyn Future<Output = Result<CloudKitBufferedResponse, PushError>> + Send + 'static>>;
+
+#[cfg(test)]
+pub(crate) trait CloudKitTestHttpTransport: Send + Sync {
+    fn send(&self, request: RequestBuilder) -> CloudKitTestTransportFuture;
+}
+
+#[cfg(test)]
+impl<F> CloudKitTestHttpTransport for F
+where
+    F: Fn(RequestBuilder) -> CloudKitTestTransportFuture + Send + Sync,
+{
+    fn send(&self, request: RequestBuilder) -> CloudKitTestTransportFuture {
+        self(request)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CLOUDKIT_TEST_HTTP_TRANSPORT: Arc<dyn CloudKitTestHttpTransport>;
+    static CLOUDKIT_TEST_WARM_AUTHENTICATION: ();
+}
+
+#[cfg(test)]
+pub(crate) async fn with_cloudkit_test_transport<F, R>(
+    transport: Arc<dyn CloudKitTestHttpTransport>,
+    future: F,
+) -> R
+where
+    F: Future<Output = R>,
+{
+    CLOUDKIT_TEST_WARM_AUTHENTICATION
+        .scope((), CLOUDKIT_TEST_HTTP_TRANSPORT.scope(transport, future))
+        .await
+}
+
+async fn send_cloudkit_http_request(
+    request: RequestBuilder,
+) -> Result<CloudKitHttpResponse, PushError> {
+    #[cfg(test)]
+    if let Ok(transport) = CLOUDKIT_TEST_HTTP_TRANSPORT.try_with(Arc::clone) {
+        return transport
+            .send(request)
+            .await
+            .map(CloudKitHttpResponse::Buffered);
+    }
+
+    Ok(CloudKitHttpResponse::Reqwest(request.send().await?))
+}
+
 fn cloudkit_protocol_error(message: &'static str) -> PushError {
     PushError::IoError(std::io::Error::new(ErrorKind::InvalidData, message))
+}
+
+fn cloudkit_zone_name(zone_id: &RecordZoneIdentifier) -> Result<String, PushError> {
+    zone_id
+        .value
+        .as_ref()
+        .and_then(|identifier| identifier.name.as_deref())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| cloudkit_protocol_error("CloudKit zone identifier name was missing"))
 }
 
 fn cloudkit_invalid_input(message: &'static str) -> PushError {
@@ -334,6 +430,34 @@ pub struct CloudKitPreparedAsset<'t> {
     field_name: &'static str,
 }
 
+/// Closed audit vocabulary for the native semantic fetch/decode lane.
+///
+/// `CkAppInit` belongs to explicit authentication bootstrap only. Warm
+/// semantic pulls never select it. The remaining variants are the complete
+/// CloudKit content/key/trust read allowlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticReadOperation {
+    CkAppInit,
+    FetchRecordChanges,
+    FetchZone,
+    CuttlefishFetchChanges,
+    CuttlefishFetchRecoverableTlkShares,
+}
+
+impl SemanticReadOperation {
+    pub const ALL: [Self; 5] = [
+        Self::CkAppInit,
+        Self::FetchRecordChanges,
+        Self::FetchZone,
+        Self::CuttlefishFetchChanges,
+        Self::CuttlefishFetchRecoverableTlkShares,
+    ];
+
+    pub const fn is_warm_semantic_transport(self) -> bool {
+        !matches!(self, Self::CkAppInit)
+    }
+}
+
 pub trait CloudKitOp {
     type Response;
 
@@ -369,6 +493,23 @@ pub trait CloudKitOp {
     fn custom_headers(&self) -> HeaderMap {
         HeaderMap::new()
     }
+    fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+        None
+    }
+}
+
+fn record_semantic_read_operations<Op: CloudKitOp>(
+    operations: &[Op],
+) -> Result<Vec<SemanticReadOperation>, PushError> {
+    operations
+        .iter()
+        .map(|operation| {
+            operation
+                .semantic_read_operation()
+                .filter(|operation| operation.is_warm_semantic_transport())
+                .ok_or(PushError::CloudKitSemanticOperationDenied)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,6 +834,25 @@ fn redact_cloudkit_result(
     result
 }
 
+/// Classifies Apple's Cuttlefish sentinel before free-form descriptions are
+/// redacted. Callers receive a typed, content-free signal and never inspect or
+/// format the server description themselves.
+fn is_change_token_expired_result(result: &cloudkit_proto::response_operation::Result) -> bool {
+    result
+        .error
+        .as_ref()
+        .and_then(|error| error.error_description.as_deref())
+        == Some(".changeTokenExpired")
+}
+
+fn content_safe_cloudkit_error(result: &cloudkit_proto::response_operation::Result) -> PushError {
+    if is_change_token_expired_result(result) {
+        PushError::CloudKitChangeTokenExpired
+    } else {
+        PushError::CloudKitError(redact_cloudkit_result(result.clone()))
+    }
+}
+
 fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
     let value = value?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
@@ -773,6 +933,23 @@ async fn read_cloudkit_response_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+async fn read_cloudkit_http_response_body(
+    response: CloudKitHttpResponse,
+) -> Result<Vec<u8>, PushError> {
+    match response {
+        CloudKitHttpResponse::Reqwest(response) => read_cloudkit_response_body(response).await,
+        #[cfg(test)]
+        CloudKitHttpResponse::Buffered(response) => {
+            if response.body.len() > CLOUDKIT_MAX_RESPONSE_BODY_BYTES {
+                return Err(cloudkit_protocol_error(
+                    "CloudKit response body exceeded the safety limit",
+                ));
+            }
+            Ok(response.body)
+        }
+    }
 }
 
 fn decode_cloudkit_response_body(body: Vec<u8>) -> Result<Vec<ResponseOperation>, PushError> {
@@ -1218,6 +1395,9 @@ impl CloudKitOp for FetchZoneOperation {
     fn retry_safety(&self) -> CloudKitRetrySafety {
         CloudKitRetrySafety::ReadOnly
     }
+    fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+        Some(SemanticReadOperation::FetchZone)
+    }
 }
 impl FetchZoneOperation {
     pub fn new(id: RecordZoneIdentifier) -> Self {
@@ -1470,6 +1650,9 @@ impl CloudKitOp for FetchRecordChangesOperation {
     fn retry_safety(&self) -> CloudKitRetrySafety {
         CloudKitRetrySafety::ReadOnly
     }
+    fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+        Some(SemanticReadOperation::FetchRecordChanges)
+    }
 }
 
 pub struct CloudKitRecordChangePage {
@@ -1645,13 +1828,54 @@ impl FetchRecordChangesOperation {
         assets: &cloudkit_proto::AssetsToDownload,
         max_changes: u32,
     ) -> Result<CloudKitRecordChangePage, PushError> {
+        Self::fetch_page_with_limit_and_access(
+            container,
+            zone,
+            continuation_token,
+            assets,
+            max_changes,
+            false,
+        )
+        .await
+    }
+
+    pub async fn fetch_page_with_limit_lookup_only(
+        container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
+        zone: cloudkit_proto::RecordZoneIdentifier,
+        continuation_token: Option<Vec<u8>>,
+        assets: &cloudkit_proto::AssetsToDownload,
+        max_changes: u32,
+    ) -> Result<CloudKitRecordChangePage, PushError> {
+        Self::fetch_page_with_limit_and_access(
+            container,
+            zone,
+            continuation_token,
+            assets,
+            max_changes,
+            true,
+        )
+        .await
+    }
+
+    async fn fetch_page_with_limit_and_access(
+        container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
+        zone: cloudkit_proto::RecordZoneIdentifier,
+        continuation_token: Option<Vec<u8>>,
+        assets: &cloudkit_proto::AssetsToDownload,
+        max_changes: u32,
+        lookup_only: bool,
+    ) -> Result<CloudKitRecordChangePage, PushError> {
         let requested_token = continuation_token.clone();
-        let (assets, response) = container
-            .perform(
-                &CloudKitSession::new(),
-                Self::new_with_limit(zone, continuation_token, assets, max_changes),
-            )
-            .await?;
+        let operation = Self::new_with_limit(zone, continuation_token, assets, max_changes);
+        let (assets, response) = if lookup_only {
+            container
+                .perform_semantic_read_only(&CloudKitSession::new(), operation)
+                .await?
+        } else {
+            container
+                .perform(&CloudKitSession::new(), operation)
+                .await?
+        };
         let status = response.status();
         validate_record_change_page_size(&response.change, max_changes)?;
         let page = CloudKitRecordChangePage {
@@ -1672,6 +1896,23 @@ impl FetchRecordChangesOperation {
         container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
         zones: &[(cloudkit_proto::RecordZoneIdentifier, Option<Vec<u8>>)],
         assets: &cloudkit_proto::AssetsToDownload,
+    ) -> Result<Vec<(Vec<AssetGetResponse>, Vec<RecordChange>, Option<Vec<u8>>)>, PushError> {
+        Self::do_sync_with_access(container, zones, assets, false).await
+    }
+
+    pub async fn do_sync_lookup_only(
+        container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
+        zones: &[(cloudkit_proto::RecordZoneIdentifier, Option<Vec<u8>>)],
+        assets: &cloudkit_proto::AssetsToDownload,
+    ) -> Result<Vec<(Vec<AssetGetResponse>, Vec<RecordChange>, Option<Vec<u8>>)>, PushError> {
+        Self::do_sync_with_access(container, zones, assets, true).await
+    }
+
+    async fn do_sync_with_access(
+        container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
+        zones: &[(cloudkit_proto::RecordZoneIdentifier, Option<Vec<u8>>)],
+        assets: &cloudkit_proto::AssetsToDownload,
+        lookup_only: bool,
     ) -> Result<Vec<(Vec<AssetGetResponse>, Vec<RecordChange>, Option<Vec<u8>>)>, PushError> {
         let mut responses = zones
             .iter()
@@ -1702,22 +1943,33 @@ impl FetchRecordChangesOperation {
                 .enumerate()
                 .filter(|(_, zone)| !finished_zones.contains(&zone.0))
                 .collect::<Vec<_>>();
-            let operations = container
-                .perform_operations_checked(
-                    &CloudKitSession::new(),
-                    &sync_zones_here
-                        .iter()
-                        .map(|(idx, zone)| {
-                            FetchRecordChangesOperation::new(
-                                zone.0.clone(),
-                                responses[*idx].2.clone(),
-                                assets,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                    IsolationLevel::Zone,
-                )
-                .await?;
+            let fetch_operations = sync_zones_here
+                .iter()
+                .map(|(idx, zone)| {
+                    FetchRecordChangesOperation::new(
+                        zone.0.clone(),
+                        responses[*idx].2.clone(),
+                        assets,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let operations = if lookup_only {
+                container
+                    .perform_semantic_read_only_operations_checked(
+                        &CloudKitSession::new(),
+                        &fetch_operations,
+                        IsolationLevel::Zone,
+                    )
+                    .await?
+            } else {
+                container
+                    .perform_operations_checked(
+                        &CloudKitSession::new(),
+                        &fetch_operations,
+                        IsolationLevel::Zone,
+                    )
+                    .await?
+            };
             for (result, (zone_idx, zone)) in operations.into_iter().zip(sync_zones_here.iter_mut())
             {
                 let previous_token = responses[*zone_idx].2.clone();
@@ -1917,6 +2169,17 @@ impl CloudKitOp for FunctionInvokeOperation {
             .unwrap(),
         );
         map
+    }
+    fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+        match (self.0.service.as_deref(), self.0.name.as_deref()) {
+            (Some("Cuttlefish"), Some("fetchChanges")) => {
+                Some(SemanticReadOperation::CuttlefishFetchChanges)
+            }
+            (Some("Cuttlefish"), Some("fetchRecoverableTLKShares")) => {
+                Some(SemanticReadOperation::CuttlefishFetchRecoverableTlkShares)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2656,15 +2919,39 @@ pub struct PCSZoneConfig {
     record_roll_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZoneEncryptionConfigAccess {
+    /// The historical path may create a missing PCS zone for callers that
+    /// explicitly use the legacy helper.
+    AllowCreate,
+    /// Semantic decode may resolve existing configuration, but cannot create
+    /// or modify a CloudKit zone.
+    LookupOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingZoneAction {
+    ReturnError,
+    CreateAndFetch,
+}
+
+impl ZoneEncryptionConfigAccess {
+    const fn missing_zone_action(self) -> MissingZoneAction {
+        match self {
+            Self::AllowCreate => MissingZoneAction::CreateAndFetch,
+            Self::LookupOnly => MissingZoneAction::ReturnError,
+        }
+    }
+}
+
 impl PCSZoneConfig {
     fn decode_record_protection(
         &self,
         protection: &ProtectionInfo,
     ) -> Result<Vec<PCSKey>, PushError> {
-        let record_protection = PCSShareProtection::from_protection_info(protection);
-        let (key, _record_keys) = record_protection
-            .decode(&self.zone_keys, None::<&CompactECKey<Public>>)
-            .unwrap();
+        let record_protection = PCSShareProtection::try_from_protection_info(protection)?;
+        let (key, _record_keys) =
+            record_protection.decode(&self.zone_keys, None::<&CompactECKey<Public>>)?;
 
         Ok(key)
     }
@@ -2733,9 +3020,37 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         client: &KeychainClient<T>,
         pcs_service: &PCSService<'_>,
     ) -> Result<PCSZoneConfig, PushError> {
-        self.get_zone_encryption_config_sev(&[(zone_id.clone(), None)], client, pcs_service, true)
-            .await?
-            .remove(0)
+        self.get_zone_encryption_config_sev_with_policy(
+            &[(zone_id.clone(), None)],
+            client,
+            pcs_service,
+            true,
+            ZoneEncryptionConfigAccess::AllowCreate,
+        )
+        .await?
+        .remove(0)
+    }
+
+    /// Resolves the PCS configuration using reads only.
+    ///
+    /// Unlike the legacy helper above, a missing or deleted zone is returned as
+    /// an error. Semantic CloudKit pulls must never create a zone as a side
+    /// effect of decoding an already-fetched record.
+    pub async fn get_zone_encryption_config_lookup_only(
+        &self,
+        zone_id: &cloudkit_proto::RecordZoneIdentifier,
+        client: &KeychainClient<T>,
+        pcs_service: &PCSService<'_>,
+    ) -> Result<PCSZoneConfig, PushError> {
+        self.get_zone_encryption_config_sev_with_policy(
+            &[(zone_id.clone(), None)],
+            client,
+            pcs_service,
+            true,
+            ZoneEncryptionConfigAccess::LookupOnly,
+        )
+        .await?
+        .remove(0)
     }
 
     pub async fn get_zone_encryption_config_share(
@@ -2745,9 +3060,15 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         pcs_service: &PCSService<'_>,
         share: Option<ShareInfo>,
     ) -> Result<PCSZoneConfig, PushError> {
-        self.get_zone_encryption_config_sev(&[(zone_id.clone(), share)], client, pcs_service, true)
-            .await?
-            .remove(0)
+        self.get_zone_encryption_config_sev_with_policy(
+            &[(zone_id.clone(), share)],
+            client,
+            pcs_service,
+            true,
+            ZoneEncryptionConfigAccess::AllowCreate,
+        )
+        .await?
+        .remove(0)
     }
 
     pub async fn get_zone_encryption_config_sev(
@@ -2757,60 +3078,108 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         pcs_service: &PCSService<'_>,
         sync_keychain: bool,
     ) -> Result<Vec<Result<PCSZoneConfig, PushError>>, PushError> {
+        self.get_zone_encryption_config_sev_with_policy(
+            zone_ids,
+            client,
+            pcs_service,
+            sync_keychain,
+            ZoneEncryptionConfigAccess::AllowCreate,
+        )
+        .await
+    }
+
+    async fn get_zone_encryption_config_sev_with_policy(
+        &self,
+        zone_ids: &[(cloudkit_proto::RecordZoneIdentifier, Option<ShareInfo>)],
+        client: &KeychainClient<T>,
+        pcs_service: &PCSService<'_>,
+        sync_keychain: bool,
+        access: ZoneEncryptionConfigAccess,
+    ) -> Result<Vec<Result<PCSZoneConfig, PushError>>, PushError> {
         let mut cached_keys = self.keys.lock().await;
-        let mut get_needed = zone_ids
-            .iter()
-            .filter(|(zone_id, share)| {
-                let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
-                !cached_keys.contains_key(&zone_name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut get_needed = Vec::new();
+        for (zone_id, share) in zone_ids {
+            let zone_name = cloudkit_zone_name(zone_id)?;
+            if !cached_keys.contains_key(&zone_name) {
+                get_needed.push((zone_id.clone(), share.clone()));
+            }
+        }
 
         let mut add_errors = HashMap::new();
         // todo what if get_needed is empty
         if !get_needed.is_empty() {
             if sync_keychain {
-                client
-                    .sync_keychain(&[&pcs_service.zone, "ProtectedCloudStorage"])
-                    .await?;
+                if access == ZoneEncryptionConfigAccess::LookupOnly {
+                    client
+                        .sync_keychain_lookup_only(&[&pcs_service.zone, "ProtectedCloudStorage"])
+                        .await?;
+                } else {
+                    client
+                        .sync_keychain(&[&pcs_service.zone, "ProtectedCloudStorage"])
+                        .await?;
+                }
             }
 
-            let zones = self
-                .perform_operations(
+            let zone_operations = get_needed
+                .iter()
+                .map(|(zone, _share)| FetchZoneOperation::new(zone.clone()))
+                .collect::<Vec<_>>();
+            let zones = if access == ZoneEncryptionConfigAccess::LookupOnly {
+                self.perform_semantic_read_only_operations(
                     &CloudKitSession::new(),
-                    &get_needed
-                        .iter()
-                        .map(|(zone, share)| FetchZoneOperation::new(zone.clone()))
-                        .collect::<Vec<_>>(),
+                    &zone_operations,
                     IsolationLevel::Zone,
                 )
-                .await?;
+                .await?
+            } else {
+                self.perform_operations(
+                    &CloudKitSession::new(),
+                    &zone_operations,
+                    IsolationLevel::Zone,
+                )
+                .await?
+            };
+            if zones.len() != get_needed.len() {
+                return Err(cloudkit_protocol_error(
+                    "CloudKit zone response count did not match the request",
+                ));
+            }
 
             let mut add_zones = vec![];
             let mut result_zones = vec![];
             let mut fetch_shares = vec![];
             for (result, (zone_id, share_info)) in zones.into_iter().zip(&get_needed) {
                 if share_info.is_none() && self.database_type == Database::SharedDb {
+                    if access == ZoneEncryptionConfigAccess::LookupOnly {
+                        return Err(PushError::CloudKitSemanticOperationDenied);
+                    }
                     fetch_shares.push(FetchRecordOperation::new(
                         &NO_ASSETS,
                         record_identifier(zone_id.clone(), "cloudkit.zoneshare"),
                     ));
                 }
                 result_zones.push(match result {
-                    Ok(data) => data.target_zone.unwrap(),
-                    Err(PushError::CloudKitError(cloudkit_proto::response_operation::Result {
-                        error:
-                            Some(cloudkit_proto::response_operation::result::Error {
-                                client_error:
-                                    Some(cloudkit_proto::response_operation::result::error::Client {
-                                        r#type: Some(48 | 59), // zone not found or user deleted data
-                                    }),
-                                ..
-                            }),
-                        ..
-                    })) => {
-                        let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
+                    Ok(data) => data.target_zone.ok_or_else(|| {
+                        cloudkit_protocol_error("CloudKit zone response omitted the target zone")
+                    })?,
+                    Err(error @ PushError::CloudKitError(
+                        cloudkit_proto::response_operation::Result {
+                            error:
+                                Some(cloudkit_proto::response_operation::result::Error {
+                                    client_error: Some(
+                                        cloudkit_proto::response_operation::result::error::Client {
+                                            r#type: Some(48 | 59),
+                                        },
+                                    ),
+                                    ..
+                                }),
+                            ..
+                        },
+                    )) => {
+                        match access.missing_zone_action() {
+                            MissingZoneAction::ReturnError => return Err(error),
+                            MissingZoneAction::CreateAndFetch => {}
+                        }
                         let service = PCSPrivateKey::get_service_key(
                             client,
                             pcs_service,
@@ -2868,20 +3237,31 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             }
 
             for (zone, (zone_id, share_info)) in result_zones.into_iter().zip(get_needed) {
-                let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
-                let zone_protection = PCSShareProtection::from_protection_info(
-                    zone.protection_info.as_ref().unwrap(),
-                );
+                let zone_name = cloudkit_zone_name(&zone_id)?;
 
-                let service = PCSPrivateKey::get_service_key(
-                    client,
-                    pcs_service,
-                    self.client.config.as_ref(),
-                )
-                .await?;
+                let service = match access {
+                    ZoneEncryptionConfigAccess::LookupOnly => {
+                        PCSPrivateKey::require_existing_service_key(client, pcs_service).await?
+                    }
+                    ZoneEncryptionConfigAccess::AllowCreate => {
+                        PCSPrivateKey::get_service_key(
+                            client,
+                            pcs_service,
+                            self.client.config.as_ref(),
+                        )
+                        .await?
+                    }
+                };
 
                 let data = client.state.read().await;
                 let decrypt = (|| -> Result<_, PushError> {
+                    let zone_protection_info = zone.protection_info.as_ref().ok_or_else(|| {
+                        cloudkit_protocol_error(
+                            "CloudKit zone response omitted PCS protection information",
+                        )
+                    })?;
+                    let zone_protection =
+                        PCSShareProtection::try_from_protection_info(zone_protection_info)?;
                     let (parent_keys, keys) = if self.database_type == Database::SharedDb {
                         let raw = share_info.expect("No share info provided??");
                         let my_participant = self.get_my_participant(&service, &raw);
@@ -2917,12 +3297,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     let mut keys = PCSZoneConfig {
                         identifier: zone_id.clone(),
                         zone_keys: keys,
-                        zone_protection_tag: zone
-                            .protection_info
-                            .as_ref()
-                            .unwrap()
-                            .protection_info_tag
-                            .clone(),
+                        zone_protection_tag: zone_protection_info.protection_info_tag.clone(),
                         default_record_keys: vec![],
                         record_prot_tag: if let Some(record_protection_info) =
                             &zone.record_protection_info
@@ -2938,10 +3313,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
                     if let Some(record_protection_info) = &zone.record_protection_info {
                         let record_protection =
-                            PCSShareProtection::from_protection_info(record_protection_info);
+                            PCSShareProtection::try_from_protection_info(record_protection_info)?;
                         let (key, _record_keys) = record_protection
-                            .decode(&keys.zone_keys, None::<&CompactECKey<Public>>)
-                            .unwrap();
+                            .decode(&keys.zone_keys, None::<&CompactECKey<Public>>)?;
                         keys.record_roll_count = record_protection.get_roll_count();
                         keys.default_record_keys = key;
                     }
@@ -2963,11 +3337,13 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         let keys = zone_ids
             .iter()
             .map(|(zone_id, share)| {
-                let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
+                let zone_name = cloudkit_zone_name(zone_id)?;
                 if let Some(zone) = cached_keys.get(&zone_name) {
                     Ok(zone.clone())
                 } else {
-                    Err(add_errors.remove(&zone_name).expect("Zone disappeared??"))
+                    Err(add_errors.remove(&zone_name).unwrap_or_else(|| {
+                        cloudkit_protocol_error("CloudKit zone configuration result was missing")
+                    }))
                 }
             })
             .collect::<Vec<_>>();
@@ -3696,12 +4072,11 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                         request_index,
                         retry_after,
                     );
+                    let error = content_safe_cloudkit_error(result);
                     return CloudKitOperationOutcome {
                         request_index,
                         operation_uuid: request_uuid.clone(),
-                        result: Err(PushError::CloudKitError(redact_cloudkit_result(
-                            result.clone(),
-                        ))),
+                        result: Err(error),
                         retry_after,
                         failure_class: Some(failure_class),
                     };
@@ -3830,6 +4205,111 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             cloudkit_token,
             anisette_headers,
         })
+    }
+
+    /// Prepares one warm semantic read without provisioning or refreshing the
+    /// MobileMe delegate. An explicit login/bootstrap must already have opened
+    /// the container and populated the token cache.
+    ///
+    /// Generating anisette headers is authentication work and may update
+    /// session or ADI state. It is deliberately outside the guarantee below,
+    /// which is limited to zero CloudKit content, key, or trust mutation.
+    async fn prepare_semantic_read_authentication(
+        &self,
+    ) -> Result<CloudKitPreparedAuthentication<T>, PushError> {
+        #[cfg(test)]
+        if CLOUDKIT_TEST_WARM_AUTHENTICATION.try_with(|_| ()).is_ok() {
+            return Ok(CloudKitPreparedAuthentication {
+                client: self.client.clone(),
+                user_id: self.user_id.clone(),
+                bundle_id: self.bundleid.to_owned(),
+                container_id: self.containerid.to_owned(),
+                database_type: self.database_type,
+                cloudkit_token: "semantic-test-warm-token".to_owned(),
+                anisette_headers: HeaderMap::new(),
+            });
+        }
+
+        let cloudkit_token = self
+            .client
+            .token_provider
+            .get_mme_token_cached("cloudKitToken")
+            .await?;
+        let anisette_headers = {
+            let mut locked = self.client.anisette.lock().await;
+            cloudkit_anisette_header_map(locked.get_headers().await?)?
+        };
+        Ok(CloudKitPreparedAuthentication {
+            client: self.client.clone(),
+            user_id: self.user_id.clone(),
+            bundle_id: self.bundleid.to_owned(),
+            container_id: self.containerid.to_owned(),
+            database_type: self.database_type,
+            cloudkit_token,
+            anisette_headers,
+        })
+    }
+
+    /// Executes only operations admitted by the closed semantic read policy.
+    ///
+    /// This transport seam never performs `ckAppInit`, token refresh, an HTTP
+    /// authentication replay, or a CloudKit content/key/trust write. It may
+    /// perform the authentication/ADI header work documented above.
+    pub async fn perform_semantic_read_only_operations<Op: CloudKitOp>(
+        &self,
+        session: &CloudKitSession,
+        operations: &[Op],
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<Result<Op::Response, PushError>>, PushError> {
+        let _recorded = record_semantic_read_operations(operations)?;
+        let mut responses = Vec::with_capacity(operations.len());
+        for batch in operations.chunks(CLOUDKIT_MAX_OPERATIONS_PER_REQUEST) {
+            let prepared_authentication = self.prepare_semantic_read_authentication().await?;
+            let request_identity = CloudKitRequestIdentity::generated(batch.len());
+            let retry_policy = CloudKitRetryPolicy {
+                max_attempts: 1,
+                ..CloudKitRetryPolicy::default()
+            };
+            responses.extend(
+                self.perform_operations_detailed_once_with_identity(
+                    session,
+                    batch,
+                    isolation_level,
+                    &retry_policy,
+                    request_identity,
+                    prepared_authentication,
+                )
+                .await
+                .map_err(|failure| failure.error)?
+                .outcomes
+                .into_iter()
+                .map(|outcome| outcome.result),
+            );
+        }
+        Ok(responses)
+    }
+
+    pub async fn perform_semantic_read_only_operations_checked<Op: CloudKitOp>(
+        &self,
+        session: &CloudKitSession,
+        operations: &[Op],
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<Op::Response>, PushError> {
+        self.perform_semantic_read_only_operations(session, operations, isolation_level)
+            .await?
+            .into_iter()
+            .collect()
+    }
+
+    pub async fn perform_semantic_read_only<Op: CloudKitOp>(
+        &self,
+        session: &CloudKitSession,
+        operation: Op,
+    ) -> Result<Op::Response, PushError> {
+        Ok(self
+            .perform_semantic_read_only_operations(session, &[operation], IsolationLevel::Zone)
+            .await?
+            .remove(0)?)
     }
 
     async fn perform_operations_detailed_with_identity_internal<Op: CloudKitOp>(
@@ -3967,15 +4447,23 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             let response = if let Some(deadline) = one_shot_deadline {
                 within_cloudkit_one_shot_deadline(
                     deadline,
-                    async { request.send().await.map_err(PushError::from) },
+                    send_cloudkit_http_request(request),
                     "CloudKit one-shot operation timed out before receiving response headers",
                 )
                 .await?
             } else {
-                match tokio::time::timeout(retry_policy.request_timeout, request.send()).await {
+                match tokio::time::timeout(
+                    retry_policy.request_timeout,
+                    send_cloudkit_http_request(request),
+                )
+                .await
+                {
                     Ok(Ok(response)) => response,
                     Ok(Err(error)) => {
-                        if automatic_retry_safe && attempt < max_attempts {
+                        if matches!(error, PushError::RequestError(_))
+                            && automatic_retry_safe
+                            && attempt < max_attempts
+                        {
                             let delay = retry_delay(retry_policy, attempt, None)
                                 .unwrap_or(Duration::ZERO);
                             warn!(
@@ -3988,7 +4476,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                             attempt += 1;
                             continue;
                         }
-                        return Err(PushError::RequestError(error).into());
+                        return Err(error.into());
                     }
                     Err(_) => {
                         if automatic_retry_safe && attempt < max_attempts {
@@ -4058,14 +4546,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             let body = if let Some(deadline) = one_shot_deadline {
                 within_cloudkit_one_shot_deadline(
                     deadline,
-                    read_cloudkit_response_body(response),
+                    read_cloudkit_http_response_body(response),
                     "CloudKit one-shot operation timed out while reading response body",
                 )
                 .await?
             } else {
                 match tokio::time::timeout(
                     retry_policy.request_timeout,
-                    read_cloudkit_response_body(response),
+                    read_cloudkit_http_response_body(response),
                 )
                 .await
                 {
@@ -4334,9 +4822,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 #[cfg(test)]
 mod cloud_sync_transport_tests {
     use super::*;
+    use crate::{
+        cloud_messages::{CloudMessageRecordKind, CloudMessagesClient},
+        keychain::KeychainClientState,
+        util::ungzip,
+    };
     use icloud_auth::AppleAccount;
     use omnisette::{AnisetteClient, AnisetteError, LoginClientInfo};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex as StdMutex, OnceLock};
 
     const HTTP_REQUEST_UUID: &str = "11111111-2222-4ABC-8DEF-555555555555";
     const OPERATION_UUID_A: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
@@ -4535,6 +5028,417 @@ mod cloud_sync_transport_tests {
             bundleid: "com.example.cloudkit-deadline-test",
             containerid: "com.example.cloudkit-deadline-test",
             env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        }
+    }
+
+    static SEMANTIC_FAKE_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
+        database_type: Database::PrivateDb,
+        bundleid: "com.apple.MobileSMS",
+        containerid: "com.apple.messages.cloud",
+        env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+    };
+
+    fn semantic_test_keychain(
+        open: &CloudKitOpenContainer<'static, OneShotTestAnisette>,
+    ) -> Arc<KeychainClient<OneShotTestAnisette>> {
+        let mut keychain_sync = plist::Dictionary::new();
+        keychain_sync.insert(
+            "escrowProxyUrl".to_owned(),
+            Value::String("https://invalid.test/unused".to_owned()),
+        );
+        let mut config = plist::Dictionary::new();
+        config.insert(
+            "com.apple.Dataclass.KeychainSync".to_owned(),
+            Value::Dictionary(keychain_sync),
+        );
+        let delegate = MobileMeDelegateResponse {
+            tokens: HashMap::new(),
+            config,
+        };
+        let state =
+            KeychainClientState::new("test-dsid".to_owned(), "test-adsid".to_owned(), &delegate)
+                .expect("test keychain state");
+
+        Arc::new(KeychainClient {
+            anisette: open.client.anisette.clone(),
+            token_provider: open.client.token_provider.clone(),
+            state: DebugRwLock::new(state),
+            config: open.client.config.clone(),
+            update_state: Box::new(|_| {}),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: open.client.clone(),
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct FaithfulSemanticTransport {
+        recorded: Arc<StdMutex<Vec<String>>>,
+    }
+
+    fn validate_semantic_request_target(request: &reqwest::Request) -> Result<(), PushError> {
+        let url = request.url();
+        if request.method() != reqwest::Method::POST
+            || url.scheme() != "https"
+            || url.host_str() != Some("gateway.icloud.com")
+            || url.port_or_known_default() != Some(443)
+        {
+            return Err(PushError::CloudKitSemanticOperationDenied);
+        }
+        Ok(())
+    }
+
+    impl FaithfulSemanticTransport {
+        fn transport(&self) -> Arc<dyn CloudKitTestHttpTransport> {
+            let transport = self.clone();
+            Arc::new(move |request| {
+                let transport = transport.clone();
+                Box::pin(async move { transport.handle(request) }) as CloudKitTestTransportFuture
+            })
+        }
+
+        fn recorded(&self) -> Vec<String> {
+            self.recorded.lock().expect("recorder lock").clone()
+        }
+
+        fn handle(&self, request: RequestBuilder) -> Result<CloudKitBufferedResponse, PushError> {
+            let request = request.build()?;
+            validate_semantic_request_target(&request)?;
+            if request
+                .headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok())
+                != Some("gzip")
+            {
+                return Err(PushError::CloudKitSemanticOperationDenied);
+            }
+            let compressed = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .ok_or(PushError::CloudKitSemanticOperationDenied)?;
+            let decoded = ungzip(compressed)?;
+            let frames = undelimit_response(&decoded)?;
+            if frames.is_empty() {
+                return Err(PushError::CloudKitSemanticOperationDenied);
+            }
+
+            let mut responses = Vec::with_capacity(frames.len());
+            for frame in frames {
+                let operation = cloudkit_proto::RequestOperation::decode(frame.as_slice())?;
+                let logical_operation = self.validate_operation(request.url(), &operation)?;
+                self.recorded
+                    .lock()
+                    .expect("recorder lock")
+                    .push(logical_operation.to_owned());
+                responses.push(self.response_for(&operation, logical_operation)?);
+            }
+
+            let mut body = Vec::new();
+            for response in responses {
+                let encoded = response.encode_to_vec();
+                body.extend(encode_uleb128(encoded.len() as u64));
+                body.extend(encoded);
+            }
+            Ok(CloudKitBufferedResponse {
+                status: reqwest::StatusCode::OK,
+                headers: HeaderMap::new(),
+                body,
+            })
+        }
+
+        fn validate_operation<'a>(
+            &self,
+            url: &Url,
+            operation: &'a cloudkit_proto::RequestOperation,
+        ) -> Result<&'static str, PushError> {
+            let populated_fields = [
+                operation.zone_save_request.is_some(),
+                operation.zone_retrieve_request.is_some(),
+                operation.zone_delete_request.is_some(),
+                operation.retrieve_zone_changes_request.is_some(),
+                operation.record_save_request.is_some(),
+                operation.record_retrieve_request.is_some(),
+                operation.retrieve_changes_request.is_some(),
+                operation.record_delete_request.is_some(),
+                operation.resolve_token_request.is_some(),
+                operation.query_retrieve_request.is_some(),
+                operation.asset_upload_token_retrieve_request.is_some(),
+                operation.create_subscription_request.is_some(),
+                operation.user_query_request.is_some(),
+                operation.share_accept_request.is_some(),
+                operation.share_decline_request.is_some(),
+                operation.token_registration_request.is_some(),
+                operation.token_unregistration_request.is_some(),
+                operation.function_invoke_request.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if populated_fields != 1 {
+                return Err(PushError::CloudKitSemanticOperationDenied);
+            }
+
+            let operation_type = operation
+                .request
+                .as_ref()
+                .and_then(|request| request.r#type)
+                .and_then(|value| cloudkit_proto::operation::Type::try_from(value).ok());
+            match url.path() {
+                "/ckdatabase/api/client/record/sync"
+                    if operation.retrieve_changes_request.is_some()
+                        && operation_type
+                            == Some(cloudkit_proto::operation::Type::RecordRetrieveChangesType) =>
+                {
+                    Ok("record/sync")
+                }
+                "/ckdatabase/api/client/zone/retrieve"
+                    if operation.zone_retrieve_request.is_some()
+                        && operation_type
+                            == Some(cloudkit_proto::operation::Type::ZoneRetrieveType) =>
+                {
+                    Ok("zone/retrieve")
+                }
+                "/ckcoderouter/api/client/code/invoke"
+                    if operation.function_invoke_request.is_some()
+                        && operation_type
+                            == Some(cloudkit_proto::operation::Type::FunctionInvokeType) =>
+                {
+                    let function = operation
+                        .function_invoke_request
+                        .as_ref()
+                        .ok_or(PushError::CloudKitSemanticOperationDenied)?;
+                    match (function.service.as_deref(), function.name.as_deref()) {
+                        (Some("Cuttlefish"), Some("fetchChanges")) => Ok("Cuttlefish/fetchChanges"),
+                        (Some("Cuttlefish"), Some("fetchRecoverableTLKShares")) => {
+                            Ok("Cuttlefish/fetchRecoverableTLKShares")
+                        }
+                        _ => Err(PushError::CloudKitSemanticOperationDenied),
+                    }
+                }
+                _ => Err(PushError::CloudKitSemanticOperationDenied),
+            }
+        }
+
+        fn response_for(
+            &self,
+            operation: &cloudkit_proto::RequestOperation,
+            logical_operation: &str,
+        ) -> Result<ResponseOperation, PushError> {
+            let result = Some(cloudkit_proto::response_operation::Result {
+                code: Some(cloudkit_proto::response_operation::result::Code::Success as i32),
+                ..Default::default()
+            });
+            let mut response = ResponseOperation {
+                response: operation.request.clone(),
+                result,
+                ..Default::default()
+            };
+            match logical_operation {
+                "record/sync" => {
+                    let zone = operation
+                        .retrieve_changes_request
+                        .as_ref()
+                        .and_then(|request| request.zone_identifier.clone())
+                        .ok_or(PushError::CloudKitSemanticOperationDenied)?;
+                    let identifier = record_identifier(zone, "faithful-fake-chat-record");
+                    response.retrieve_changes_response =
+                        Some(cloudkit_proto::RetrieveChangesResponse {
+                            change: vec![RecordChange {
+                                identifier: Some(identifier.clone()),
+                                etag: Some("faithful-fake-etag".to_owned()),
+                                record_type: Some(record::Type {
+                                    name: Some("chatEncryptedv2".to_owned()),
+                                }),
+                                r#type: Some(1),
+                                record: Some(Record {
+                                    record_identifier: Some(identifier),
+                                    r#type: Some(record::Type {
+                                        name: Some("chatEncryptedv2".to_owned()),
+                                    }),
+                                    ..Default::default()
+                                }),
+                            }],
+                            status: Some(CLOUDKIT_RECORD_CHANGES_STATUS_COMPLETE),
+                            ..Default::default()
+                        });
+                }
+                "zone/retrieve" => {
+                    response.zone_retrieve_response = Some(cloudkit_proto::ZoneRetrieveResponse {
+                        zone_summary: vec![Default::default()],
+                    });
+                }
+                "Cuttlefish/fetchChanges" | "Cuttlefish/fetchRecoverableTLKShares" => {
+                    response.function_invoke_response =
+                        Some(cloudkit_proto::FunctionInvokeResponse {
+                            serialized_result: Some(Vec::new()),
+                        });
+                }
+                _ => return Err(PushError::CloudKitSemanticOperationDenied),
+            }
+            Ok(response)
+        }
+    }
+
+    struct SpoofedSemanticWriteOperation;
+
+    impl CloudKitOp for SpoofedSemanticWriteOperation {
+        type Response = ();
+
+        fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
+            output.record_save_request = Some(Default::default());
+        }
+
+        fn retrieve_response(
+            _response: &cloudkit_proto::ResponseOperation,
+        ) -> Result<Self::Response, PushError> {
+            Ok(())
+        }
+
+        fn flow_control_key() -> &'static str {
+            "SpoofedSemanticWrite"
+        }
+
+        fn operation() -> cloudkit_proto::operation::Type {
+            cloudkit_proto::operation::Type::RecordRetrieveChangesType
+        }
+
+        fn is_fetch() -> bool {
+            true
+        }
+
+        fn link() -> &'static str {
+            "https://gateway.icloud.com/ckdatabase/api/client/record/sync"
+        }
+
+        fn retry_safety(&self) -> CloudKitRetrySafety {
+            CloudKitRetrySafety::ReadOnly
+        }
+
+        fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+            Some(SemanticReadOperation::FetchRecordChanges)
+        }
+    }
+
+    #[tokio::test]
+    async fn faithful_fake_transport_exercises_real_warm_semantic_fetch_allowlist() {
+        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER));
+        let keychain = semantic_test_keychain(&open);
+        let cloud_messages =
+            CloudMessagesClient::new_warm_for_test(open.client.clone(), keychain, open.clone());
+        let transport = FaithfulSemanticTransport::default();
+
+        let (page, zone, fetch_changes, recoverable_shares) =
+            with_cloudkit_test_transport(transport.transport(), async {
+                let page = cloud_messages.sync_chats_page(None, Some(17)).await?;
+                let zone = open
+                    .perform_semantic_read_only(
+                        &CloudKitSession::new(),
+                        FetchZoneOperation::new(open.private_zone("chatManateeZone".to_owned())),
+                    )
+                    .await?;
+                let fetch_changes = open
+                    .perform_semantic_read_only(
+                        &CloudKitSession::new(),
+                        FunctionInvokeOperation::new(
+                            "Cuttlefish".to_owned(),
+                            "fetchChanges".to_owned(),
+                            Vec::new(),
+                        ),
+                    )
+                    .await?;
+                let recoverable_shares = open
+                    .perform_semantic_read_only(
+                        &CloudKitSession::new(),
+                        FunctionInvokeOperation::new(
+                            "Cuttlefish".to_owned(),
+                            "fetchRecoverableTLKShares".to_owned(),
+                            Vec::new(),
+                        ),
+                    )
+                    .await?;
+                Ok::<_, PushError>((page, zone, fetch_changes, recoverable_shares))
+            })
+            .await
+            .expect("faithful semantic reads");
+
+        assert!(page.is_complete());
+        assert_eq!(page.next_token, None);
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(
+            page.changes[0].record_name.as_deref(),
+            Some("faithful-fake-chat-record")
+        );
+        assert_eq!(
+            page.changes[0].kind,
+            CloudMessageRecordKind::EncryptedUpsert
+        );
+        assert!(page.changes[0].encrypted_record.is_some());
+        assert!(zone.target_zone.is_none());
+        assert!(fetch_changes.is_empty());
+        assert!(recoverable_shares.is_empty());
+        assert_eq!(
+            transport.recorded(),
+            vec![
+                "record/sync".to_owned(),
+                "zone/retrieve".to_owned(),
+                "Cuttlefish/fetchChanges".to_owned(),
+                "Cuttlefish/fetchRecoverableTLKShares".to_owned(),
+            ]
+        );
+        assert!(!transport
+            .recorded()
+            .iter()
+            .any(|operation| operation.contains("ckAppInit")));
+    }
+
+    #[tokio::test]
+    async fn faithful_fake_transport_rejects_spoofed_write_inside_allowed_endpoint() {
+        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let transport = FaithfulSemanticTransport::default();
+        let result = with_cloudkit_test_transport(transport.transport(), async {
+            open.perform_semantic_read_only(&CloudKitSession::new(), SpoofedSemanticWriteOperation)
+                .await
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PushError::CloudKitSemanticOperationDenied)
+        ));
+        assert!(transport.recorded().is_empty());
+    }
+
+    #[test]
+    fn faithful_fake_transport_pins_method_scheme_host_and_port() {
+        let client = reqwest::Client::new();
+        let allowed = client
+            .post("https://gateway.icloud.com/ckdatabase/api/client/record/sync")
+            .build()
+            .expect("allowed request");
+        assert!(validate_semantic_request_target(&allowed).is_ok());
+
+        for request in [
+            client
+                .get("https://gateway.icloud.com/ckdatabase/api/client/record/sync")
+                .build()
+                .expect("wrong method"),
+            client
+                .post("http://gateway.icloud.com/ckdatabase/api/client/record/sync")
+                .build()
+                .expect("wrong scheme"),
+            client
+                .post("https://example.invalid/ckdatabase/api/client/record/sync")
+                .build()
+                .expect("wrong host"),
+            client
+                .post("https://gateway.icloud.com:444/ckdatabase/api/client/record/sync")
+                .build()
+                .expect("wrong port"),
+        ] {
+            assert!(matches!(
+                validate_semantic_request_target(&request),
+                Err(PushError::CloudKitSemanticOperationDenied)
+            ));
         }
     }
 
@@ -5024,6 +5928,157 @@ mod cloud_sync_transport_tests {
     }
 
     #[test]
+    fn semantic_pcs_lookup_cannot_select_missing_zone_creation() {
+        assert_eq!(
+            ZoneEncryptionConfigAccess::LookupOnly.missing_zone_action(),
+            MissingZoneAction::ReturnError
+        );
+        assert_eq!(
+            ZoneEncryptionConfigAccess::AllowCreate.missing_zone_action(),
+            MissingZoneAction::CreateAndFetch
+        );
+    }
+
+    #[test]
+    fn semantic_transport_allowlist_is_closed_complete_and_path_pinned() {
+        assert_eq!(
+            SemanticReadOperation::ALL,
+            [
+                SemanticReadOperation::CkAppInit,
+                SemanticReadOperation::FetchRecordChanges,
+                SemanticReadOperation::FetchZone,
+                SemanticReadOperation::CuttlefishFetchChanges,
+                SemanticReadOperation::CuttlefishFetchRecoverableTlkShares,
+            ]
+        );
+        assert!(!SemanticReadOperation::CkAppInit.is_warm_semantic_transport());
+        assert_eq!(
+            FetchRecordChangesOperation::link(),
+            "https://gateway.icloud.com/ckdatabase/api/client/record/sync"
+        );
+        assert_eq!(
+            FetchZoneOperation::link(),
+            "https://gateway.icloud.com/ckdatabase/api/client/zone/retrieve"
+        );
+
+        assert_eq!(
+            record_semantic_read_operations(&[FetchRecordChangesOperation::new(
+                public_zone(),
+                None,
+                &NO_ASSETS,
+            )])
+            .unwrap(),
+            vec![SemanticReadOperation::FetchRecordChanges]
+        );
+        assert_eq!(
+            record_semantic_read_operations(&[FetchZoneOperation::new(public_zone())]).unwrap(),
+            vec![SemanticReadOperation::FetchZone]
+        );
+        assert_eq!(
+            record_semantic_read_operations(&[FunctionInvokeOperation::new(
+                "Cuttlefish".to_owned(),
+                "fetchChanges".to_owned(),
+                Vec::new(),
+            )])
+            .unwrap(),
+            vec![SemanticReadOperation::CuttlefishFetchChanges]
+        );
+        assert_eq!(
+            record_semantic_read_operations(&[FunctionInvokeOperation::new(
+                "Cuttlefish".to_owned(),
+                "fetchRecoverableTLKShares".to_owned(),
+                Vec::new(),
+            )])
+            .unwrap(),
+            vec![SemanticReadOperation::CuttlefishFetchRecoverableTlkShares]
+        );
+    }
+
+    #[test]
+    fn semantic_transport_rejects_every_content_key_and_trust_mutation() {
+        assert!(record_semantic_read_operations(&[ZoneSaveOperation(Default::default())]).is_err());
+        assert!(
+            record_semantic_read_operations(&[ZoneDeleteOperation(Default::default())]).is_err()
+        );
+        assert!(
+            record_semantic_read_operations(&[SaveRecordOperation(Default::default())]).is_err()
+        );
+        assert!(
+            record_semantic_read_operations(&[DeleteRecordOperation(Default::default())]).is_err()
+        );
+        assert!(record_semantic_read_operations(&[
+            CreateSubscriptionOperation(Default::default())
+        ])
+        .is_err());
+        assert!(record_semantic_read_operations(&[FetchRecordOperation::new(
+            &NO_ASSETS,
+            record_identifier(public_zone(), "not-allowlisted"),
+        )])
+        .is_err());
+
+        for method in ["updateTrust", "reset", "joinWithVoucher"] {
+            assert!(
+                record_semantic_read_operations(&[FunctionInvokeOperation::new(
+                    "Cuttlefish".to_owned(),
+                    method.to_owned(),
+                    Vec::new(),
+                )])
+                .is_err()
+            );
+        }
+
+        for prerequisite in [
+            PushError::NotInClique,
+            PushError::MasterKeyNotFound,
+            PushError::ShareKeyNotFound("sentinel-service".to_owned()),
+        ] {
+            assert!(matches!(
+                prerequisite,
+                PushError::NotInClique
+                    | PushError::MasterKeyNotFound
+                    | PushError::ShareKeyNotFound(_)
+            ));
+            assert_eq!(
+                ZoneEncryptionConfigAccess::LookupOnly.missing_zone_action(),
+                MissingZoneAction::ReturnError
+            );
+        }
+    }
+
+    #[test]
+    fn change_token_expiry_survives_redaction_as_a_content_free_signal() {
+        let result = cloudkit_proto::response_operation::Result {
+            code: Some(cloudkit_proto::response_operation::result::Code::Failure as i32),
+            error: Some(cloudkit_proto::response_operation::result::Error {
+                error_description: Some(".changeTokenExpired".to_owned()),
+                error_key: Some("SENTINEL_MESSAGE_TEXT_DO_NOT_EXPOSE".to_owned()),
+                error_internal: Some("SENTINEL_DSID_AND_TOKEN".to_owned()),
+                extension_error: Some(
+                    cloudkit_proto::response_operation::result::error::Extension {
+                        extension_name: Some("SENTINEL_PEER_AND_KEY_ID".to_owned()),
+                        extension_payload: Some(b"SENTINEL_KEY_AND_CIPHERTEXT_BYTES".to_vec()),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+        };
+
+        assert!(is_change_token_expired_result(&result));
+        let error = content_safe_cloudkit_error(&result);
+        assert!(matches!(error, PushError::CloudKitChangeTokenExpired));
+        let formatted = format!("{error:?} {error}");
+        for sentinel in [
+            "SENTINEL_MESSAGE_TEXT_DO_NOT_EXPOSE",
+            "SENTINEL_DSID_AND_TOKEN",
+            "SENTINEL_PEER_AND_KEY_ID",
+            "SENTINEL_KEY_AND_CIPHERTEXT_BYTES",
+        ] {
+            assert!(!formatted.contains(sentinel));
+        }
+    }
+
+    #[test]
     fn fallible_save_builder_rejects_missing_pcs_key_without_panicking() {
         let zone = public_zone();
         let key = PCSZoneConfig {
@@ -5106,11 +6161,31 @@ mod cloud_sync_transport_tests {
         assert!(pcs_keys_for_record(&missing_key, &keys).is_err());
 
         let oversized_prefix = Record {
-            record_identifier: Some(record_identifier(zone, "oversized-pcs-prefix")),
+            record_identifier: Some(record_identifier(zone.clone(), "oversized-pcs-prefix")),
             pcs_key: Some(vec![0; 1024]),
             ..Default::default()
         };
         assert!(pcs_keys_for_record(&oversized_prefix, &keys).is_err());
+
+        let sentinel = "SENTINEL_MALFORMED_RECORD_PROTECTION_DO_NOT_EXPOSE";
+        let malformed_protection = Record {
+            record_identifier: Some(record_identifier(zone, "malformed-protection")),
+            protection_info: Some(ProtectionInfo {
+                protection_info: Some(sentinel.as_bytes().to_vec()),
+                protection_info_tag: Some("SENTINEL_PROTECTION_TAG".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pcs_keys_for_record(&malformed_protection, &keys)
+        }));
+        let error =
+            match checked.expect("malformed record protection must return rather than panic") {
+                Err(error) => error,
+                Ok(_) => panic!("malformed record protection unexpectedly decoded"),
+            };
+        assert!(matches!(error, PushError::BadMsg));
+        assert!(!format!("{error:?}").contains(sentinel));
     }
 
     #[test]

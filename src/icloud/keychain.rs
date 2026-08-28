@@ -7,6 +7,7 @@ use std::{
 };
 
 use aes_gcm::{AesGcm, Nonce};
+use base64::Engine as _;
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::{
     ot_bottle::OtAuthenticatedCiphertext,
@@ -189,14 +190,18 @@ pub struct CuttlefishEncItem {
 }
 
 impl CuttlefishEncItem {
-    fn authenticated_data_v2(&self, uuid: &str, fields: &[Field]) -> BTreeMap<String, Vec<u8>> {
+    fn authenticated_data_v2(
+        &self,
+        uuid: &str,
+        fields: &[Field],
+    ) -> Result<BTreeMap<String, Vec<u8>>, PushError> {
         info!("AAD v2");
         let mut aad = BTreeMap::from_iter(
             [
                 ("UUID", uuid.as_bytes().to_vec()),
                 ("encver", self.encver.to_le_bytes().to_vec()),
                 ("gen", self.r#gen.to_le_bytes().to_vec()),
-                ("wrappedkey", self.parent_key_id().as_bytes().to_vec()),
+                ("wrappedkey", self.parent_key_id()?.as_bytes().to_vec()),
             ]
             .map(|(a, s)| (a.to_string(), s)),
         );
@@ -212,7 +217,11 @@ impl CuttlefishEncItem {
         }
 
         for field in fields {
-            let name = field.identifier.as_ref().unwrap().name();
+            let name = field
+                .identifier
+                .as_ref()
+                .and_then(|identifier| identifier.name.as_deref())
+                .ok_or(PushError::BadMsg)?;
             match name {
                 "gen" | "pcspublickey" | "UUID" | "data" | "pcsservice" | "pcspublicidentity"
                 | "parentkeyref" | "uploadver" | "wrappedkey" | "encver" => continue,
@@ -220,7 +229,7 @@ impl CuttlefishEncItem {
                     if _name.starts_with("server_") {
                         continue;
                     }
-                    let val = field.value.as_ref().unwrap();
+                    let val = field.value.as_ref().ok_or(PushError::BadMsg)?;
                     if let Some(string) = &val.string_value {
                         aad.insert(_name.to_string(), string.as_bytes().to_vec());
                     }
@@ -234,7 +243,7 @@ impl CuttlefishEncItem {
                         let nanos = (time.fract() * 1e9) as u32;
 
                         let timestamp =
-                            DateTime::from_timestamp(secs, nanos).expect("Invalid timestamp");
+                            DateTime::from_timestamp(secs, nanos).ok_or(PushError::BadMsg)?;
                         aad.insert(
                             _name.to_string(),
                             timestamp
@@ -252,31 +261,29 @@ impl CuttlefishEncItem {
             }
         }
 
-        aad
+        Ok(aad)
     }
 
-    fn authenticated_data_v1(&self, uuid: &str) -> BTreeMap<String, Vec<u8>> {
+    fn authenticated_data_v1(&self, uuid: &str) -> Result<BTreeMap<String, Vec<u8>>, PushError> {
         info!("AAD v1");
-        BTreeMap::from_iter(
+        Ok(BTreeMap::from_iter(
             [
                 ("UUID", uuid.as_bytes().to_vec()),
                 ("encver", self.encver.to_le_bytes().to_vec()),
                 ("gen", self.r#gen.to_le_bytes().to_vec()),
-                ("wrappedkey", self.parent_key_id().as_bytes().to_vec()),
+                ("wrappedkey", self.parent_key_id()?.as_bytes().to_vec()),
             ]
             .map(|(a, s)| (a.to_string(), s)),
-        )
+        ))
     }
 
-    fn parent_key_id(&self) -> &str {
+    fn parent_key_id(&self) -> Result<&str, PushError> {
         self.parentkeyref
             .record_identifier
             .as_ref()
-            .unwrap()
-            .value
-            .as_ref()
-            .unwrap()
-            .name()
+            .and_then(|identifier| identifier.value.as_ref())
+            .and_then(|identifier| identifier.name.as_deref())
+            .ok_or(PushError::BadMsg)
     }
 
     fn encrypt(&mut self, uuid: &str, key: &SivKey, data: Dictionary) -> Result<(), PushError> {
@@ -286,7 +293,7 @@ impl CuttlefishEncItem {
         let mut cipher = CmacSiv::<Aes256>::new_from_slice(&record_key).unwrap();
 
         let iv: [u8; 16] = rand::random();
-        let aad = self.authenticated_data_v2(uuid, &[]);
+        let aad = self.authenticated_data_v2(uuid, &[])?;
 
         let mut headers = vec![iv.to_vec()];
         headers.extend(aad.into_values());
@@ -317,28 +324,30 @@ impl CuttlefishEncItem {
         keystore: &KeychainKeyStore,
         keystore_key: &SivKey,
     ) -> Result<Dictionary, PushError> {
-        let item =
-            keystore
-                .get_key_id(self.parent_key_id())
-                .ok_or(PushError::DecryptionKeyNotFound(
-                    self.parent_key_id().to_string(),
-                ))?;
-        let result = item.decrypt(&keystore_key, &base64_decode(&self.wrappedkey));
+        let parent_key_id = self.parent_key_id()?;
+        let item = keystore
+            .get_key_id(parent_key_id)
+            .ok_or_else(|| PushError::DecryptionKeyNotFound("unavailable".to_owned()))?;
+        let wrapped_key = decode_remote_base64(&self.wrappedkey)?;
+        let result = item.try_decrypt(keystore_key, &wrapped_key)?;
 
-        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
+        let mut cipher =
+            CmacSiv::<Aes256>::new_from_slice(&result).map_err(|_| PushError::BadMsg)?;
 
         let aad = if self.encver == 1 {
-            self.authenticated_data_v1(uuid)
+            self.authenticated_data_v1(uuid)?
         } else {
-            self.authenticated_data_v2(uuid, &record.record_field)
+            self.authenticated_data_v2(uuid, &record.record_field)?
         };
 
-        let mut headers = vec![self.data[..16].to_vec()];
+        let iv = self.data.get(..16).ok_or(PushError::BadMsg)?;
+        let encrypted = self.data.get(16..).ok_or(PushError::BadMsg)?;
+        let mut headers = vec![iv.to_vec()];
         headers.extend(aad.into_values());
 
         let mut data = cipher
-            .decrypt::<&[Vec<u8>], &Vec<u8>>(&headers, &self.data[16..])
-            .unwrap();
+            .decrypt::<&[Vec<u8>], &Vec<u8>>(&headers, encrypted)
+            .map_err(|_| PushError::BadMsg)?;
 
         let mut ptr = data.len();
         while ptr > 0 {
@@ -349,11 +358,9 @@ impl CuttlefishEncItem {
                 data.resize(ptr, 0);
                 break;
             } else {
-                panic!("Bad padding!");
+                return Err(PushError::BadMsg);
             }
         }
-
-        info!("data {}", encode_hex(&data));
 
         Ok(plist::from_bytes(&data)?)
     }
@@ -385,12 +392,12 @@ pub struct CuttlefishTlkShare {
 }
 
 impl CuttlefishTlkShare {
-    fn data_for_signing(&self) -> Vec<u8> {
+    fn data_for_signing(&self, wrapped_key: &[u8]) -> Vec<u8> {
         [
             &self.version.to_le_bytes()[..],
             self.receiver.as_bytes(),
             self.sender.as_bytes(),
-            &base64_decode(&self.wrappedkey),
+            wrapped_key,
             &self.curve.to_le_bytes()[..],
             &self.epoch.to_le_bytes()[..],
             &self.poisoned.to_le_bytes()[..],
@@ -407,6 +414,14 @@ pub struct IESCiphertext {
     ciphertext: Data,
     #[serde(rename = "SFEphemeralSenderPublicKeyExternaRepresentation")]
     ephermeral_sender: NSData,
+}
+
+fn ies_ciphertext_payload(ciphertext: &[u8]) -> Result<&[u8], PushError> {
+    let payload_len = ciphertext
+        .len()
+        .checked_sub(97 + 16)
+        .ok_or(PushError::BadMsg)?;
+    ciphertext.get(..payload_len).ok_or(PushError::BadMsg)
 }
 
 impl IESCiphertext {
@@ -459,13 +474,14 @@ impl IESCiphertext {
         let mut data = [0u8; 32 + 16];
         derive_key_into::<Sha256>(&secret, &*self.ephermeral_sender, &mut data);
 
-        let key: [u8; 32] = data[0..32].try_into().unwrap();
+        let key: [u8; 32] = data[..32].try_into().map_err(|_| PushError::BadMsg)?;
         let iv = &data[32..48];
         let cipher = AesGcm::<Aes256, U16>::new(&key.into());
 
         let ciphertext_ref = self.ciphertext.as_ref();
         // is this a security bug in SecurityFoundation? It appears this extra data is leaked, uninitialized memory
-        let joinedcipher = [&ciphertext_ref[..ciphertext_ref.len() - 97 /* pkey size */ - 16 /* authentication code size */], self.authentication_code.as_ref()].concat();
+        let ciphertext = ies_ciphertext_payload(ciphertext_ref)?;
+        let joinedcipher = [ciphertext, self.authentication_code.as_ref()].concat();
 
         let decrypted = cipher
             .decrypt(Nonce::from_slice(iv), &*joinedcipher)
@@ -479,10 +495,16 @@ impl IESCiphertext {
 pub struct SivKey(pub Vec<u8>);
 
 impl SivKey {
-    pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
-        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&self.0).unwrap();
+    pub fn try_decrypt(&self, payload: &[u8]) -> Result<Vec<u8>, PushError> {
+        let mut cipher =
+            CmacSiv::<Aes256>::new_from_slice(&self.0).map_err(|_| PushError::BadMsg)?;
+        cipher
+            .decrypt::<&[&[u8]; 0], &&[u8]>(&[], &payload)
+            .map_err(|_| PushError::BadMsg)
+    }
 
-        cipher.decrypt::<&[&[u8]; 0], &&[u8]>(&[], payload).unwrap()
+    pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
+        self.try_decrypt(payload).unwrap_or_default()
     }
 
     pub fn encrypt(&self, payload: &[u8]) -> Vec<u8> {
@@ -500,12 +522,21 @@ impl EncryptedCloudKey {
     fn new(cloud: &SivKey, access: &SivKey) -> Self {
         Self(access.encrypt(&cloud.0))
     }
+    fn try_decode(&self, access: &SivKey) -> Result<SivKey, PushError> {
+        Ok(SivKey(access.try_decrypt(&self.0)?))
+    }
+
     fn decode(&self, access: &SivKey) -> SivKey {
-        SivKey(access.decrypt(&self.0))
+        self.try_decode(access)
+            .unwrap_or_else(|_| SivKey(Vec::new()))
+    }
+
+    pub fn try_decrypt(&self, access: &SivKey, payload: &[u8]) -> Result<Vec<u8>, PushError> {
+        self.try_decode(access)?.try_decrypt(payload)
     }
 
     pub fn decrypt(&self, access: &SivKey, payload: &[u8]) -> Vec<u8> {
-        self.decode(access).decrypt(payload)
+        self.try_decrypt(access, payload).unwrap_or_default()
     }
 
     pub fn encrypt(&self, access: &SivKey, payload: &[u8]) -> Vec<u8> {
@@ -1387,7 +1418,7 @@ impl KeychainClientState {
         Ok(if let Some(Value::Data(d)) = entry.get("v_Data") {
             Some(d.clone())
         } else if let Some(Value::Data(d)) = entry.get("v_Data_Encrypted") {
-            Some(self.get_keychain_access_key()?.decrypt(d))
+            Some(self.get_keychain_access_key()?.try_decrypt(d)?)
         } else {
             None
         })
@@ -1503,6 +1534,88 @@ impl EscrowBottle {
     }
 }
 
+/// Cuttlefish methods that are safe to invoke from a semantic lookup.
+///
+/// Keeping this as a closed enum prevents a lookup-only caller from selecting
+/// updateTrust, reset, join, or another mutating method by accident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadOnlyCuttlefishMethod {
+    FetchChanges,
+    FetchRecoverableTlkShares,
+}
+
+const LOOKUP_ONLY_DIAGNOSTIC_TRUST_FETCH_FAILED: &str = "Read-only trust fetch failed";
+const LOOKUP_ONLY_DIAGNOSTIC_KEYCHAIN_DECRYPT_FAILED: &str =
+    "Read-only keychain item could not be decrypted";
+const LOOKUP_ONLY_DIAGNOSTIC_VOUCHED_PEER: &str = "Read-only trust accepted a vouched peer";
+const LOOKUP_ONLY_DIAGNOSTIC_EXCLUDED_PEER_IGNORED: &str =
+    "Read-only trust ignored an excluded peer";
+const LOOKUP_ONLY_DIAGNOSTIC_ALLOWED_PEER_ADDED: &str = "Read-only trust added an allowed peer";
+const LOOKUP_ONLY_DIAGNOSTIC_PEER_EXCLUDED: &str = "Read-only trust excluded a peer";
+const LOOKUP_ONLY_DIAGNOSTIC_SHARE_RETURNED: &str = "Read-only key-share fetch returned an item";
+const LOOKUP_ONLY_DIAGNOSTIC_SHARE_SENDER_MISSING: &str =
+    "Read-only key-share item had no matching sender";
+const LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED: &str = "Read-only key-share item was malformed";
+const LOOKUP_ONLY_DIAGNOSTIC_PEER_MALFORMED: &str = "Read-only trust ignored a malformed peer";
+
+const LOOKUP_ONLY_CONTENT_FREE_DIAGNOSTICS: [&str; 10] = [
+    LOOKUP_ONLY_DIAGNOSTIC_TRUST_FETCH_FAILED,
+    LOOKUP_ONLY_DIAGNOSTIC_KEYCHAIN_DECRYPT_FAILED,
+    LOOKUP_ONLY_DIAGNOSTIC_VOUCHED_PEER,
+    LOOKUP_ONLY_DIAGNOSTIC_EXCLUDED_PEER_IGNORED,
+    LOOKUP_ONLY_DIAGNOSTIC_ALLOWED_PEER_ADDED,
+    LOOKUP_ONLY_DIAGNOSTIC_PEER_EXCLUDED,
+    LOOKUP_ONLY_DIAGNOSTIC_SHARE_RETURNED,
+    LOOKUP_ONLY_DIAGNOSTIC_SHARE_SENDER_MISSING,
+    LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED,
+    LOOKUP_ONLY_DIAGNOSTIC_PEER_MALFORMED,
+];
+
+fn decode_remote_base64(value: &str) -> Result<Vec<u8>, PushError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| PushError::BadMsg)
+}
+
+fn remote_record_identifier_name(identifier: Option<&RecordIdentifier>) -> Result<&str, PushError> {
+    identifier
+        .and_then(|identifier| identifier.value.as_ref())
+        .and_then(|identifier| identifier.name.as_deref())
+        .filter(|name| !name.is_empty())
+        .ok_or(PushError::BadMsg)
+}
+
+fn remote_record_type_name(record: &Record) -> Result<&str, PushError> {
+    record
+        .r#type
+        .as_ref()
+        .and_then(|record_type| record_type.name.as_deref())
+        .filter(|name| !name.is_empty())
+        .ok_or(PushError::BadMsg)
+}
+
+fn remote_peer_hash(peer: &CuttlefishPeer) -> Option<&str> {
+    peer.hash.as_deref()
+}
+
+impl ReadOnlyCuttlefishMethod {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::FetchChanges => "fetchChanges",
+            Self::FetchRecoverableTlkShares => "fetchRecoverableTLKShares",
+        }
+    }
+
+    #[cfg(test)]
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "fetchChanges" => Some(Self::FetchChanges),
+            "fetchRecoverableTLKShares" => Some(Self::FetchRecoverableTlkShares),
+            _ => None,
+        }
+    }
+}
+
 impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
@@ -1513,6 +1626,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             CUTTLEFISH_CONTAINER.init(self.client.clone()).await?,
         ));
         return Ok(locked.clone().unwrap());
+    }
+
+    /// Returns only an already-open Cuttlefish container. Semantic decode must
+    /// not trigger `ckAppInit` or authentication bootstrap.
+    async fn get_container_lookup_only(
+        &self,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        self.container
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
     }
 
     pub async fn get_security_container(
@@ -1526,6 +1652,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             SECURITYD_CONTAINER.init(self.client.clone()).await?,
         ));
         return Ok(locked.clone().unwrap());
+    }
+
+    /// Returns only an already-open keychain database container. It never
+    /// initializes a CloudKit container or refreshes authentication.
+    async fn get_security_container_lookup_only(
+        &self,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        self.security_container
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
     }
 
     async fn invoke_cuttlefish<T: prost::Message, R: prost::Message + Default>(
@@ -1559,36 +1698,70 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             .unwrap_or(false)
     }
 
+    async fn invoke_cuttlefish_read_only<T: prost::Message, R: prost::Message + Default>(
+        &self,
+        method: ReadOnlyCuttlefishMethod,
+        body: T,
+    ) -> Result<R, PushError> {
+        let response = self
+            .get_container_lookup_only()
+            .await?
+            .perform_semantic_read_only(
+                &CloudKitSession::new(),
+                FunctionInvokeOperation::new(
+                    "Cuttlefish".to_string(),
+                    method.name().to_string(),
+                    body.encode_to_vec(),
+                ),
+            )
+            .await?;
+        Ok(R::decode(&response[..])?)
+    }
+
     async fn sync_changes(&self) -> Result<(), PushError> {
+        self.sync_changes_with_access(false).await
+    }
+
+    async fn sync_changes_lookup_only(&self) -> Result<(), PushError> {
+        self.sync_changes_with_access(true).await
+    }
+
+    async fn sync_changes_with_access(&self, lookup_only: bool) -> Result<(), PushError> {
         let mut token = self.state.read().await.state_token.clone();
 
         loop {
-            let result = self
-                .invoke_cuttlefish(
-                    "fetchChanges",
-                    CuttlefishFetchChangesRequest { sync_token: token },
-                )
-                .await;
+            let request = CuttlefishFetchChangesRequest { sync_token: token };
+            let result = if lookup_only {
+                self.invoke_cuttlefish_read_only(ReadOnlyCuttlefishMethod::FetchChanges, request)
+                    .await
+            } else {
+                self.invoke_cuttlefish("fetchChanges", request).await
+            };
             let changes: CuttlefishFetchChangesResponse = match result {
                 Ok(changes) => changes,
-                Err(PushError::CloudKitError(e)) => {
-                    info!("result {e:?}");
-                    if matches!(&e.error, Some(error) if error.error_description() == ".changeTokenExpired")
-                    {
-                        info!("Change token reset, locking");
-                        // someone reset our clique...
-                        let mut lock = self.state.write().await;
-                        info!("Change token reset, locked");
-                        lock.state_token = None;
-                        lock.state.clear();
-                        self.invoke_cuttlefish(
-                            "fetchChanges",
-                            CuttlefishFetchChangesRequest { sync_token: None },
+                Err(PushError::CloudKitChangeTokenExpired) => {
+                    info!("Trust change token expired; resetting local projection");
+                    let mut lock = self.state.write().await;
+                    lock.state_token = None;
+                    lock.state.clear();
+                    let request = CuttlefishFetchChangesRequest { sync_token: None };
+                    if lookup_only {
+                        self.invoke_cuttlefish_read_only(
+                            ReadOnlyCuttlefishMethod::FetchChanges,
+                            request,
                         )
                         .await?
                     } else {
-                        return Err(PushError::CloudKitError(e));
+                        self.invoke_cuttlefish("fetchChanges", request).await?
                     }
+                }
+                Err(PushError::CloudKitError(e)) => {
+                    if lookup_only {
+                        info!("{LOOKUP_ONLY_DIAGNOSTIC_TRUST_FETCH_FAILED}");
+                    } else {
+                        info!("result {e:?}");
+                    }
+                    return Err(PushError::CloudKitError(e));
                 }
                 Err(e) => return Err(e),
             };
@@ -1607,7 +1780,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 break;
             }
 
-            self.apply_changes(changes, &mut state);
+            self.apply_changes_with_options(changes, &mut state, lookup_only);
         }
 
         Ok(())
@@ -1723,58 +1896,91 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Err(PushError::NotInClique);
         }
 
+        self.sync_keychain_records(zones, false).await
+    }
+
+    /// Synchronizes keychain records without invoking the mutating trust path.
+    ///
+    /// This is used while decoding already-fetched semantic CloudKit records.
+    /// It may fetch Cuttlefish changes, recoverable TLK shares, and keychain
+    /// record changes, and may persist those results locally. It must not call
+    /// `is_in_clique`, `sync_trust`, `updateTrust`, or any CloudKit save/delete.
+    pub async fn sync_keychain_lookup_only(&self, zones: &[&str]) -> Result<(), PushError> {
+        self.sync_trust_lookup_only().await?;
+        self.sync_keychain_records(zones, true).await
+    }
+
+    async fn sync_keychain_records(
+        &self,
+        zones: &[&str],
+        lookup_only: bool,
+    ) -> Result<(), PushError> {
         let state = self.state.read().await;
         if state.keystore.0.is_empty() {
-            let shares = self
-                .fetch_shares_for(state.user_identity.as_ref().unwrap())
-                .await?;
+            let identity = state.user_identity.as_ref().ok_or(PushError::NotInClique)?;
+            let shares = if lookup_only {
+                self.fetch_shares_for_lookup_only(identity).await?
+            } else {
+                self.fetch_shares_for(identity).await?
+            };
             drop(state);
             self.store_keys(&shares).await?;
         } else {
             drop(state);
         }
 
-        let security_container = self.get_security_container().await?;
+        let security_container = if lookup_only {
+            self.get_security_container_lookup_only().await?
+        } else {
+            self.get_security_container().await?
+        };
 
         let mut state = self.state.write().await;
-        let mut result = FetchRecordChangesOperation::do_sync(
-            &security_container,
-            &zones
-                .iter()
-                .map(|zone| {
-                    (
-                        security_container.private_zone(zone.to_string()),
-                        state
-                            .items
-                            .get(*zone)
-                            .and_then(|z| z.change_tag.clone())
-                            .map(|z| z.into()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            &ALL_ASSETS,
-        )
-        .await;
-        if should_reset(result.as_ref().err()) {
-            state.items.clear();
-            result = FetchRecordChangesOperation::do_sync(
+        let zone_requests = zones
+            .iter()
+            .map(|zone| {
+                (
+                    security_container.private_zone(zone.to_string()),
+                    state
+                        .items
+                        .get(*zone)
+                        .and_then(|z| z.change_tag.clone())
+                        .map(|z| z.into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut result = if lookup_only {
+            FetchRecordChangesOperation::do_sync_lookup_only(
                 &security_container,
-                &zones
-                    .iter()
-                    .map(|zone| {
-                        (
-                            security_container.private_zone(zone.to_string()),
-                            state
-                                .items
-                                .get(*zone)
-                                .and_then(|z| z.change_tag.clone())
-                                .map(|z| z.into()),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
+                &zone_requests,
                 &ALL_ASSETS,
             )
-            .await;
+            .await
+        } else {
+            FetchRecordChangesOperation::do_sync(&security_container, &zone_requests, &ALL_ASSETS)
+                .await
+        };
+        if should_reset(result.as_ref().err()) {
+            state.items.clear();
+            let reset_zone_requests = zones
+                .iter()
+                .map(|zone| (security_container.private_zone(zone.to_string()), None))
+                .collect::<Vec<_>>();
+            result = if lookup_only {
+                FetchRecordChangesOperation::do_sync_lookup_only(
+                    &security_container,
+                    &reset_zone_requests,
+                    &ALL_ASSETS,
+                )
+                .await
+            } else {
+                FetchRecordChangesOperation::do_sync(
+                    &security_container,
+                    &reset_zone_requests,
+                    &ALL_ASSETS,
+                )
+                .await
+            };
         }
         let item = result?;
 
@@ -1786,45 +1992,52 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             let saved_keychain_zone = state.items.entry(zone.to_string()).or_default();
             saved_keychain_zone.change_tag = change.clone().map(|i| i.into());
             for change in changes {
-                let identifier = change
-                    .identifier
-                    .as_ref()
-                    .unwrap()
-                    .value
-                    .as_ref()
-                    .unwrap()
-                    .name()
-                    .to_string();
+                let identifier =
+                    remote_record_identifier_name(change.identifier.as_ref())?.to_string();
                 let Some(record) = change.record else {
                     saved_keychain_zone.keys.remove(&identifier);
                     saved_keychain_zone.current_keys.remove(&identifier);
                     continue;
                 };
-                if record.r#type.as_ref().unwrap().name() == CuttlefishEncItem::record_type() {
-                    let item = CuttlefishEncItem::from_record(&record.record_field);
+                let record_type = remote_record_type_name(&record)?;
+                if record_type == CuttlefishEncItem::record_type() {
+                    let item = match CuttlefishEncItem::try_from_record(&record.record_field) {
+                        Ok(item) => item,
+                        Err(error) => {
+                            if lookup_only {
+                                warn!("{LOOKUP_ONLY_DIAGNOSTIC_KEYCHAIN_DECRYPT_FAILED}");
+                                continue;
+                            }
+                            return Err(error.into());
+                        }
+                    };
                     let Ok(mut decoded) =
                         item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access)
                     else {
-                        warn!("Missing decryption key for {}", identifier);
+                        if lookup_only {
+                            warn!("{LOOKUP_ONLY_DIAGNOSTIC_KEYCHAIN_DECRYPT_FAILED}");
+                        } else {
+                            warn!("Missing decryption key for {}", identifier);
+                        }
                         continue;
                     };
 
                     encrypt_entry(&mut decoded, &keychain_access);
                     saved_keychain_zone.keys.insert(identifier, decoded);
-                } else if record.r#type.as_ref().unwrap().name()
-                    == CuttlefishCurrentItem::record_type()
-                {
-                    let item = CuttlefishCurrentItem::from_record(&record.record_field);
-                    let record = item
-                        .item
-                        .record_identifier
-                        .as_ref()
-                        .unwrap()
-                        .value
-                        .as_ref()
-                        .unwrap()
-                        .name()
-                        .to_string();
+                } else if record_type == CuttlefishCurrentItem::record_type() {
+                    let item = match CuttlefishCurrentItem::try_from_record(&record.record_field) {
+                        Ok(item) => item,
+                        Err(error) => {
+                            if lookup_only {
+                                warn!("{LOOKUP_ONLY_DIAGNOSTIC_KEYCHAIN_DECRYPT_FAILED}");
+                                continue;
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    let record =
+                        remote_record_identifier_name(item.item.record_identifier.as_ref())?
+                            .to_string();
 
                     saved_keychain_zone.current_keys.insert(identifier, record);
                 }
@@ -1837,12 +2050,27 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub fn apply_changes(&self, changes: CuttlefishChanges, state: &mut KeychainClientState) {
+        self.apply_changes_with_options(changes, state, false);
+    }
+
+    fn apply_changes_with_options(
+        &self,
+        changes: CuttlefishChanges,
+        state: &mut KeychainClientState,
+        redact_identifiers: bool,
+    ) {
         state.state_token = changes.sync_token;
         for change in changes.changes {
             if let Some(add) = change.add {
-                state
-                    .state
-                    .insert(add.hash.clone().unwrap(), EncodedPeer(add));
+                let Some(hash) = remote_peer_hash(&add) else {
+                    if redact_identifiers {
+                        warn!("{LOOKUP_ONLY_DIAGNOSTIC_PEER_MALFORMED}");
+                    } else {
+                        warn!("Ignoring trust update without a peer hash");
+                    }
+                    continue;
+                };
+                state.state.insert(hash.to_string(), EncodedPeer(add));
             }
         }
         (self.update_state)(&state);
@@ -2045,7 +2273,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Ok(());
         }
 
-        if self.fast_forward_trust(&mut state)? {
+        if self.fast_forward_trust(&mut state, false)? {
             let identity = state.user_identity.as_ref().unwrap();
             if let CuttlefishUpdateTrustResponse {
                 changes: Some(changes),
@@ -2074,8 +2302,43 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(())
     }
 
+    /// Fetches and locally projects trust state without calling updateTrust.
+    ///
+    /// A semantic lookup may use the resulting local state, but it must fail
+    /// closed when the identity or its current clique record is unavailable.
+    async fn sync_trust_lookup_only(&self) -> Result<(), PushError> {
+        self.sync_changes_lookup_only().await?;
+
+        let mut state = self.state.write().await;
+        let identity = state
+            .user_identity
+            .as_ref()
+            .ok_or(PushError::NotInClique)?
+            .identifier
+            .clone();
+        if !state.state.contains_key(&identity) {
+            return Err(PushError::NotInClique);
+        }
+
+        self.fast_forward_trust(&mut state, true)?;
+        if state
+            .user_identity
+            .as_ref()
+            .map(|identity| identity.is_in_clique())
+            != Some(true)
+        {
+            return Err(PushError::NotInClique);
+        }
+
+        Ok(())
+    }
+
     // apply updates to our trust list
-    fn fast_forward_trust(&self, state: &mut KeychainClientState) -> Result<bool, PushError> {
+    fn fast_forward_trust(
+        &self,
+        state: &mut KeychainClientState,
+        redact_identifiers: bool,
+    ) -> Result<bool, PushError> {
         // sync up our identity
         let mut current_state = state.user_identity.as_ref().unwrap().current_state.clone();
 
@@ -2089,9 +2352,18 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let mut modified = false;
 
         for (peer, trust) in forward {
+            let Some(peer_hash) = remote_peer_hash(&peer.0) else {
+                if redact_identifiers {
+                    warn!("{LOOKUP_ONLY_DIAGNOSTIC_PEER_MALFORMED}");
+                } else {
+                    warn!("Ignoring trust update without a peer hash");
+                }
+                continue;
+            };
             if !current_state
                 .includeds
-                .contains(&peer.0.hash.as_ref().unwrap())
+                .iter()
+                .any(|included| included == peer_hash)
             {
                 let mut has_valid_voucher = false;
                 // did they use a voucher?
@@ -2099,38 +2371,47 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                     if let Some(sponsor) = state.state.get(voucher.sponsor()) {
                         if current_state.includeds.contains(&voucher.sponsor().to_string()) && // do we trust the sponsor
                             sponsor.validate_voucher(&signed).is_ok() && // did they actually vouch
-                            voucher.beneficiary() == peer.0.hash.as_ref().unwrap() && // for the peer?
+                            voucher.beneficiary() == peer_hash && // for the peer?
                             !current_state.excludeds.contains(&voucher.beneficiary().to_string())
                         {
                             // and they weren't kicked out
                             has_valid_voucher = true;
-                            info!(
-                                "Trusting new peer {} on voucher from {}",
-                                voucher.beneficiary(),
-                                voucher.sponsor()
-                            );
+                            if redact_identifiers {
+                                info!("{LOOKUP_ONLY_DIAGNOSTIC_VOUCHED_PEER}");
+                            } else {
+                                info!(
+                                    "Trusting new peer {} on voucher from {}",
+                                    voucher.beneficiary(),
+                                    voucher.sponsor()
+                                );
+                            }
                         }
                     }
                 }
                 if !has_valid_voucher {
-                    warn!(
-                        "Ignoring trust update from excluded peer {}",
-                        peer.0.hash.as_ref().unwrap()
-                    );
+                    if redact_identifiers {
+                        warn!("{LOOKUP_ONLY_DIAGNOSTIC_EXCLUDED_PEER_IGNORED}");
+                    } else {
+                        warn!("Ignoring trust update from excluded peer {}", peer_hash);
+                    }
                     continue;
                 }
             }
-            info!(
-                "Applying trust update {} from {}",
-                trust.clock(),
-                peer.0.hash.as_ref().unwrap()
-            );
+            if redact_identifiers {
+                info!("Read-only trust applying stage {}", trust.clock());
+            } else {
+                info!("Applying trust update {} from {}", trust.clock(), peer_hash);
+            }
             for allowed in &trust.includeds {
                 if current_state.includeds.contains(allowed) {
                     continue;
                 }
                 current_state.includeds.push(allowed.clone());
-                info!("Adding new trusted peer {}", allowed);
+                if redact_identifiers {
+                    info!("{LOOKUP_ONLY_DIAGNOSTIC_ALLOWED_PEER_ADDED}");
+                } else {
+                    info!("Adding new trusted peer {}", allowed);
+                }
                 modified = true;
             }
 
@@ -2142,7 +2423,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                     current_state.includeds.retain(|a| a != excluded);
                 }
                 current_state.excludeds.push(excluded.clone());
-                info!("Excluding peer {}", excluded);
+                if redact_identifiers {
+                    info!("{LOOKUP_ONLY_DIAGNOSTIC_PEER_EXCLUDED}");
+                } else {
+                    info!("Excluding peer {}", excluded);
+                }
                 modified = true;
             }
             current_state.clock = trust.clock;
@@ -2354,7 +2639,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         current_state.clock = dynamic.clock;
         (self.update_state)(&state);
 
-        self.fast_forward_trust(&mut state)?;
+        self.fast_forward_trust(&mut state, false)?;
         info!("Synced Trust!");
         Ok(())
     }
@@ -2372,41 +2657,89 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         &self,
         user: &KeychainUserIdentity<impl KeystoreDeriveKey>,
     ) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
-        let response: CuttlefishFetchRecoverableTlkSharesResponse = self
-            .invoke_cuttlefish(
-                "fetchRecoverableTLKShares",
-                CuttlefishFetchRecoverableTlkSharesRequest {
-                    for_peer: Some(user.identifier.clone()),
-                },
-            )
-            .await?;
+        self.fetch_shares_for_with_method(user, None).await
+    }
+
+    async fn fetch_shares_for_lookup_only(
+        &self,
+        user: &KeychainUserIdentity<impl KeystoreDeriveKey>,
+    ) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
+        self.fetch_shares_for_with_method(
+            user,
+            Some(ReadOnlyCuttlefishMethod::FetchRecoverableTlkShares),
+        )
+        .await
+    }
+
+    async fn fetch_shares_for_with_method(
+        &self,
+        user: &KeychainUserIdentity<impl KeystoreDeriveKey>,
+        read_only_method: Option<ReadOnlyCuttlefishMethod>,
+    ) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
+        let request = CuttlefishFetchRecoverableTlkSharesRequest {
+            for_peer: Some(user.identifier.clone()),
+        };
+        let response: CuttlefishFetchRecoverableTlkSharesResponse = match read_only_method {
+            Some(method) => self.invoke_cuttlefish_read_only(method, request).await?,
+            None => {
+                self.invoke_cuttlefish("fetchRecoverableTLKShares", request)
+                    .await?
+            }
+        };
 
         let mut keys = vec![];
+        let redact_identifiers = read_only_method.is_some();
         let state = self.state.read().await;
         for share in response.shares {
-            info!("Entering on key {}", share.service());
+            if redact_identifiers {
+                info!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_RETURNED}");
+            } else {
+                info!("Entering on key {}", share.service());
+            }
             let Some(share_record) = &share.share else {
                 warn!("Missing key!");
                 continue;
             };
-            let item =
-                CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
-
-            let Some(sending_peer) = state.state.get(&item.sender) else {
-                warn!(
-                    "missing sender {} in state! {:?}",
-                    item.sender,
-                    state.state.keys().collect::<Vec<_>>()
-                );
+            let Some(share_record) = share_record.inner.as_ref() else {
+                if redact_identifiers {
+                    warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                } else {
+                    warn!("Missing key-share record!");
+                }
                 continue;
             };
+            let item = match CuttlefishTlkShare::try_from_record(&share_record.record_field) {
+                Ok(item) => item,
+                Err(error) => {
+                    if redact_identifiers {
+                        warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+            };
+
+            let Some(sending_peer) = state.state.get(&item.sender) else {
+                if redact_identifiers {
+                    warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_SENDER_MISSING}");
+                } else {
+                    warn!(
+                        "missing sender {} in state! {:?}",
+                        item.sender,
+                        state.state.keys().collect::<Vec<_>>()
+                    );
+                }
+                continue;
+            };
+            let signature = decode_remote_base64(&item.signature)?;
+            let wrapped_key = decode_remote_base64(&item.wrappedkey)?;
             sending_peer.verify_signature_dig(
                 MessageDigest::sha256(),
-                &item.data_for_signing(),
-                &base64_decode(&item.signature),
+                &item.data_for_signing(&wrapped_key),
+                &signature,
             )?;
 
-            let decoded = KeyedArchive::expand(&base64_decode(&item.wrappedkey))?;
+            let decoded = KeyedArchive::expand(&wrapped_key)?;
             let wrapped: IESCiphertext = plist::from_value(&plist::to_value(&decoded)?)?;
             let decrypted = wrapped.decrypt(&user.encryption_key)?;
 
@@ -2421,23 +2754,54 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             let items = [&viewkeys.class_a, &viewkeys.class_b];
             for key in items {
                 let Some(key) = key else { continue };
-                let key2 =
-                    CuttlefishSyncKey::from_record(&key.inner.as_ref().unwrap().record_field);
-                let rawkey = result_key.decrypt(&base64_decode(&key2.wrappedkey));
+                let Some(key_record) = key.inner.as_ref() else {
+                    if redact_identifiers {
+                        warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                    } else {
+                        warn!("Missing key-share view key record!");
+                    }
+                    continue;
+                };
+                let Ok(key_identifier) =
+                    remote_record_identifier_name(key_record.record_identifier.as_ref())
+                else {
+                    if redact_identifiers {
+                        warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                    } else {
+                        warn!("Missing key-share view key identifier!");
+                    }
+                    continue;
+                };
+                let key2 = match CuttlefishSyncKey::try_from_record(&key_record.record_field) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if redact_identifiers {
+                            warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                let wrapped_key = match decode_remote_base64(&key2.wrappedkey) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        if redact_identifiers {
+                            warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                        }
+                        continue;
+                    }
+                };
+                let rawkey = match result_key.try_decrypt(&wrapped_key) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        if redact_identifiers {
+                            warn!("{LOOKUP_ONLY_DIAGNOSTIC_SHARE_MALFORMED}");
+                        }
+                        continue;
+                    }
+                };
                 keys.push(CuttlefishSerializedKey {
-                    uuid: Some(
-                        key.inner
-                            .as_ref()
-                            .unwrap()
-                            .record_identifier
-                            .as_ref()
-                            .unwrap()
-                            .value
-                            .as_ref()
-                            .unwrap()
-                            .name()
-                            .to_string(),
-                    ),
+                    uuid: Some(key_identifier.to_string()),
                     zone_name: result.zone_name.clone(),
                     keyclass: Some(key2.class),
                     key: Some(rawkey),
@@ -3224,8 +3588,68 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::KeychainKeyStore;
+    use super::{
+        decode_remote_base64, ies_ciphertext_payload, remote_peer_hash,
+        remote_record_identifier_name, remote_record_type_name, CuttlefishEncItem,
+        KeychainKeyStore, ReadOnlyCuttlefishMethod, SivKey, LOOKUP_ONLY_CONTENT_FREE_DIAGNOSTICS,
+    };
     use crate::PushError;
+    use cloudkit_proto::{CuttlefishPeer, Record, RecordIdentifier};
+
+    #[test]
+    fn malformed_remote_record_identifier_is_a_typed_error_instead_of_a_panic() {
+        let malformed = RecordIdentifier::default();
+
+        let outcome = std::panic::catch_unwind(|| remote_record_identifier_name(Some(&malformed)));
+
+        assert!(matches!(outcome, Ok(Err(PushError::BadMsg))));
+        assert!(matches!(
+            remote_record_identifier_name(None),
+            Err(PushError::BadMsg)
+        ));
+    }
+
+    #[test]
+    fn malformed_remote_record_type_is_a_typed_error_instead_of_a_panic() {
+        let malformed = Record::default();
+
+        let outcome = std::panic::catch_unwind(|| remote_record_type_name(&malformed));
+
+        assert!(matches!(outcome, Ok(Err(PushError::BadMsg))));
+    }
+
+    #[test]
+    fn malformed_remote_peer_is_safely_skipped_without_a_panic() {
+        let malformed = CuttlefishPeer::default();
+
+        let outcome = std::panic::catch_unwind(|| remote_peer_hash(&malformed));
+
+        assert!(matches!(outcome, Ok(None)));
+    }
+
+    #[test]
+    fn malformed_remote_crypto_shapes_are_typed_errors_instead_of_panics() {
+        let missing_parent = std::panic::catch_unwind(|| {
+            CuttlefishEncItem::default()
+                .parent_key_id()
+                .map(str::to_owned)
+        });
+        assert!(matches!(missing_parent, Ok(Err(PushError::BadMsg))));
+
+        let invalid_base64 = std::panic::catch_unwind(|| decode_remote_base64("%%%sentinel%%%"));
+        assert!(matches!(invalid_base64, Ok(Err(PushError::BadMsg))));
+
+        let short_ies = std::panic::catch_unwind(|| ies_ciphertext_payload(b"sentinel"));
+        assert!(matches!(short_ies, Ok(Err(PushError::BadMsg))));
+
+        let invalid_siv_key =
+            std::panic::catch_unwind(|| SivKey(vec![0; 1]).try_decrypt(b"sentinel"));
+        assert!(matches!(invalid_siv_key, Ok(Err(PushError::BadMsg))));
+
+        let malformed_siv_payload =
+            std::panic::catch_unwind(|| SivKey(vec![0; 64]).try_decrypt(b"sentinel"));
+        assert!(matches!(malformed_siv_payload, Ok(Err(PushError::BadMsg))));
+    }
 
     #[test]
     fn missing_insert_class_key_is_a_typed_error_instead_of_a_panic() {
@@ -3240,5 +3664,63 @@ mod tests {
             PushError::CloudKeyNotFound { ref zone, ref class }
                 if zone == "ProtectedCloudStorage" && class == "classC"
         ));
+    }
+
+    #[test]
+    fn lookup_only_cuttlefish_allowlist_excludes_mutating_methods() {
+        assert_eq!(
+            ReadOnlyCuttlefishMethod::from_name("fetchChanges"),
+            Some(ReadOnlyCuttlefishMethod::FetchChanges)
+        );
+        assert_eq!(
+            ReadOnlyCuttlefishMethod::from_name("fetchRecoverableTLKShares"),
+            Some(ReadOnlyCuttlefishMethod::FetchRecoverableTlkShares)
+        );
+        for method in [
+            "updateTrust",
+            "reset",
+            "joinWithVoucher",
+            "createSubscription",
+            "deleteRecord",
+            "saveRecord",
+        ] {
+            assert_eq!(ReadOnlyCuttlefishMethod::from_name(method), None);
+        }
+    }
+
+    #[test]
+    fn lookup_only_diagnostics_and_typed_failures_do_not_expose_sentinel_secrets() {
+        let sentinels = [
+            "SENTINEL_MESSAGE_TEXT_DO_NOT_EXPOSE",
+            "SENTINEL_DSID_123456789",
+            "SENTINEL_CHANGE_TOKEN",
+            "SENTINEL_PEER_ID",
+            "SENTINEL_KEY_ID",
+            "SENTINEL_KEY_BYTES",
+            "SENTINEL_CIPHERTEXT_BYTES",
+        ];
+        for diagnostic in LOOKUP_ONLY_CONTENT_FREE_DIAGNOSTICS {
+            for sentinel in sentinels {
+                assert!(!diagnostic.contains(sentinel));
+            }
+        }
+
+        for error in [
+            PushError::NotInClique,
+            PushError::MasterKeyNotFound,
+            PushError::PCSRecordKeyMissing,
+            PushError::PCSCiphertextMalformed,
+            PushError::PCSKeyIdMismatch,
+            PushError::PCSDecryptionFailed,
+            PushError::BadMsg,
+            PushError::CloudKitWarmAuthenticationRequired,
+            PushError::CloudKitSemanticOperationDenied,
+            PushError::CloudKitChangeTokenExpired,
+        ] {
+            let formatted = format!("{error:?} {error}");
+            for sentinel in sentinels {
+                assert!(!formatted.contains(sentinel));
+            }
+        }
     }
 }
