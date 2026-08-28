@@ -44,8 +44,7 @@ use crate::{
     register,
     util::{
         base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize,
-        duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource,
-        ResourceManager,
+        duration_since_epoch, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager,
     },
     APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError,
 };
@@ -158,7 +157,7 @@ pub enum Raw {
 impl Debug for Raw {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Body(a) => write!(f, "body {}", encode_hex(a)),
+            Self::Body(a) => write!(f, "Body({} bytes)", a.len()),
             Self::None => write!(f, "No body"),
             Self::Builder(_) => write!(f, "Builder"),
         }
@@ -1253,7 +1252,7 @@ impl IdentityResource {
 
         self.manager().await.ensure_ready().await?;
         // find participants whose keys need to be fetched
-        debug!("Getting keys for {:?}", participants);
+        debug!("Resolving keys for {} participant(s)", participants.len());
         let key_cache = self.cache.lock().await;
         let fetch: Vec<String> = participants
             .iter()
@@ -1265,7 +1264,7 @@ impl IdentityResource {
         }
         drop(key_cache);
         for chunk in fetch.chunks(18) {
-            debug!("Fetching keys for chunk {:?}", chunk);
+            debug!("Fetching keys for {} participant(s)", chunk.len());
             let users = self.users.read().await;
             let results = match self
                 .user_by_handle(topic, &users, handle)
@@ -1329,10 +1328,8 @@ impl IdentityResource {
             c: u32,
         }
 
-        // just monitoring for now...
-        debug!("got IDS message {}", std::str::from_utf8(&payload).unwrap());
-
         let decoded: IDSPrivateMessage = serde_json::from_slice(&payload)?;
+        debug!("Received IDS private control command {}", decoded.c);
 
         match decoded.c {
             32 => {
@@ -1344,10 +1341,7 @@ impl IdentityResource {
                 let my_handles: HashSet<String> = self.get_handles().await.into_iter().collect();
                 let real_handles = self.get_possible_handles().await?;
                 if real_handles != my_handles {
-                    info!(
-                        "New handles; reregistering! {:?} {:?}",
-                        real_handles, my_handles
-                    );
+                    info!("IDS handle set changed; reregistering");
                     self.manager().await.refresh().await?;
                 }
             }
@@ -1387,7 +1381,7 @@ impl IdentityResource {
         let Some(topic) = topics.iter().find(|t| sha1(t.as_bytes()) == topic) else {
             return Ok(None);
         };
-        debug!("ID got message {topic} {:?}", &payload);
+        debug!("Received IDS message for {topic}");
 
         let mut payload = plist::from_value::<IDSRecvMessage>(&payload)?;
 
@@ -1671,9 +1665,12 @@ impl IdentityResource {
         }
 
         info!(
-            "ID send message {:?} to {} targets",
-            ids_message,
-            message_targets.len()
+            "IDS send command={} topic={} targets={} scheduled={} relay={}",
+            ids_message.command,
+            topic,
+            message_targets.len(),
+            ids_message.scheduled_ms.is_some(),
+            ids_message.relay.is_some()
         );
 
         if ids_message.queue_id.is_none() {
@@ -1885,7 +1882,6 @@ impl InnerSendJob {
         } else {
             self.topic
         };
-        debug!("send_uuid {}", encode_hex(&uuid));
         for (batch, group) in groups.into_iter().enumerate() {
             let complete = SendMessage {
                 batch: if !is_relay_message {
@@ -2049,14 +2045,14 @@ impl InnerSendJob {
                     for target in remain_targets {
                         let _ = self.status.send((target, SendResult::TimedOut));
                     }
-                    info!("Retry failed {}", encode_hex(&uuid));
+                    info!("IDS send retries exhausted");
                     return Ok(());
                 }
 
                 self.send_targets(remain_targets, retry_count + 1).await?;
             }
         }
-        info!("Sending done! {}", encode_hex(&uuid));
+        info!("IDS send completed");
         Ok(())
     }
 }

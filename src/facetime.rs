@@ -52,6 +52,7 @@ pub mod facetimep {
 
 const FACETIME_VIDEO_AV_MODE: i32 = 2;
 const DELEGATED_RESPONSE_RETENTION: Duration = Duration::from_secs(10 * 60);
+const TERMINAL_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 fn apply_conversation_message_metadata(
     session: &mut FTSession,
@@ -905,6 +906,7 @@ pub struct FTClient {
     // Operation-local only. Keep revisions outside the public/persisted
     // FTSession model so generated bridge decoders remain source-compatible.
     session_revisions: DebugMutex<HashMap<String, u64>>,
+    terminal_sessions: DebugMutex<TerminalSessions>,
     link_operation: DebugMutex<()>,
 }
 
@@ -913,6 +915,45 @@ struct SessionSnapshot {
     group_id: String,
     revision: u64,
     session: FTSession,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalSessionAction {
+    Declined,
+    Cancelled,
+}
+
+struct TerminalSessionReceipt {
+    action: TerminalSessionAction,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct TerminalSessions {
+    receipts: HashMap<String, TerminalSessionReceipt>,
+}
+
+impl TerminalSessions {
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.receipts.retain(|_, receipt| receipt.expires_at > now);
+    }
+
+    fn action(&mut self, group_id: &str) -> Option<TerminalSessionAction> {
+        self.prune_expired();
+        self.receipts.get(group_id).map(|receipt| receipt.action)
+    }
+
+    fn complete(&mut self, group_id: String, action: TerminalSessionAction) {
+        self.prune_expired();
+        self.receipts.insert(
+            group_id,
+            TerminalSessionReceipt {
+                action,
+                expires_at: Instant::now() + TERMINAL_SESSION_RETENTION,
+            },
+        );
+    }
 }
 
 async fn session_operation_for(
@@ -964,6 +1005,7 @@ impl FTClient {
             delegated_requests: DebugMutex::new(DelegatedRequests::default()),
             session_operations: DebugMutex::new(HashMap::new()),
             session_revisions: DebugMutex::new(HashMap::new()),
+            terminal_sessions: DebugMutex::new(TerminalSessions::default()),
             link_operation: DebugMutex::new(()),
         }
     }
@@ -1051,6 +1093,30 @@ impl FTClient {
             revision: next_revision,
             session,
         })
+    }
+
+    async fn terminal_session_completed(&self, group_id: &str) -> bool {
+        self.terminal_sessions
+            .lock()
+            .await
+            .action(group_id)
+            .is_some()
+    }
+
+    /// Records one successfully transmitted terminal operation and retires its
+    /// persisted session. Callers hold the matching per-session operation lock,
+    /// so a duplicate local request cannot race between transport completion
+    /// and this receipt.
+    async fn complete_terminal_session(&self, group_id: &str, action: TerminalSessionAction) {
+        let mut terminal_sessions = self.terminal_sessions.lock().await;
+        let mut revisions = self.session_revisions.lock().await;
+        let mut state = self.state.write().await;
+        let removed = state.sessions.remove(group_id).is_some();
+        revisions.remove(group_id);
+        terminal_sessions.complete(group_id.to_string(), action);
+        if removed {
+            (self.update_state)(&state);
+        }
     }
 
     async fn update_session_without_network<F>(
@@ -1885,11 +1951,15 @@ impl FTClient {
     pub async fn decline_session(&self, group_id: &str) -> Result<(), PushError> {
         let operation = self.operation_for_session(group_id).await;
         let _operation_guard = operation.lock().await;
+        if self.terminal_session_completed(group_id).await {
+            return Ok(());
+        }
         let snapshot = self.snapshot_session(group_id).await?;
         let mut session = snapshot.session.clone();
         self.ensure_allocations(&mut session, &[]).await?;
         self.decline_invite(&mut session).await?;
-        self.reconcile_session(snapshot, session).await?;
+        self.complete_terminal_session(group_id, TerminalSessionAction::Declined)
+            .await;
         Ok(())
     }
 
@@ -1990,10 +2060,14 @@ impl FTClient {
     pub async fn cancel_session(&self, group_id: &str) -> Result<(), PushError> {
         let operation = self.operation_for_session(group_id).await;
         let _operation_guard = operation.lock().await;
+        if self.terminal_session_completed(group_id).await {
+            return Ok(());
+        }
         let snapshot = self.snapshot_session(group_id).await?;
         let mut session = snapshot.session.clone();
         self.unprop_conv(&mut session).await?;
-        self.reconcile_session(snapshot, session).await?;
+        self.complete_terminal_session(group_id, TerminalSessionAction::Cancelled)
+            .await;
         Ok(())
     }
 
@@ -3000,6 +3074,46 @@ mod tests {
             requests.claim("delegation-fixture", None, true),
             Err(PushError::FaceTimeAdmissionMissing)
         ));
+    }
+
+    #[test]
+    fn terminal_session_receipt_is_idempotent_and_bounded() {
+        let mut terminal_sessions = TerminalSessions::default();
+        terminal_sessions.complete(
+            "terminal-session".to_string(),
+            TerminalSessionAction::Cancelled,
+        );
+
+        assert_eq!(
+            terminal_sessions.action("terminal-session"),
+            Some(TerminalSessionAction::Cancelled)
+        );
+        terminal_sessions
+            .receipts
+            .get_mut("terminal-session")
+            .expect("terminal receipt should exist")
+            .expires_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(terminal_sessions.action("terminal-session"), None);
+        assert!(terminal_sessions.receipts.is_empty());
+    }
+
+    #[test]
+    fn terminal_session_receipt_replaces_action_without_growing() {
+        let mut terminal_sessions = TerminalSessions::default();
+        terminal_sessions.complete(
+            "terminal-session".to_string(),
+            TerminalSessionAction::Declined,
+        );
+        terminal_sessions.complete(
+            "terminal-session".to_string(),
+            TerminalSessionAction::Cancelled,
+        );
+
+        assert_eq!(terminal_sessions.receipts.len(), 1);
+        assert_eq!(
+            terminal_sessions.action("terminal-session"),
+            Some(TerminalSessionAction::Cancelled)
+        );
     }
 
     #[test]
