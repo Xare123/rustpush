@@ -1821,6 +1821,9 @@ impl Resource for APSConnectionResource {
                 Ok(e) => e,
                 Err(err) => {
                     self.active_port.store(0, Ordering::Relaxed);
+                    if is_apns_route_failure(&err) {
+                        *self.last_successful_ip.write().await = None;
+                    }
                     error!("failed to connect to socket {err}!");
                     return Err(err);
                 }
@@ -1868,6 +1871,14 @@ impl Resource for APSConnectionResource {
 
         Ok(maintenence_handle)
     }
+}
+
+fn is_apns_route_failure(error: &PushError) -> bool {
+    matches!(
+        error,
+        PushError::IoError(error)
+            if error.kind() == std::io::ErrorKind::NetworkUnreachable
+    )
 }
 
 pub type APSConnection = Arc<ResourceManager<APSConnectionResource>>;
@@ -2327,9 +2338,10 @@ mod transport_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        ack_status_for_message, merge_apns_candidate_ips, APSMessage, APNS_CONNECT_TIMEOUT,
-        APNS_MAX_RESOLVED_ADDRESSES, APNS_PORTS,
+        ack_status_for_message, is_apns_route_failure, merge_apns_candidate_ips, APSMessage,
+        APNS_CONNECT_TIMEOUT, APNS_MAX_RESOLVED_ADDRESSES, APNS_PORTS,
     };
+    use crate::PushError;
 
     #[test]
     fn tries_standard_apns_before_https_fallback() {
@@ -2381,5 +2393,17 @@ mod transport_tests {
             merge_apns_candidate_ips(Vec::new(), Some(cached)),
             vec![cached]
         );
+    }
+
+    #[test]
+    fn network_unreachable_invalidates_cached_address_but_timeout_does_not() {
+        assert!(is_apns_route_failure(&PushError::IoError(std::io::Error::new(
+            std::io::ErrorKind::NetworkUnreachable,
+            "route unavailable",
+        ))));
+        assert!(!is_apns_route_failure(&PushError::IoError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "APNs timeout",
+        ))));
     }
 }
