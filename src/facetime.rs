@@ -276,10 +276,6 @@ pub struct FTSession {
     pub mode: Option<FTMode>,
     #[serde(skip)]
     pub recent_member_adds: HashMap<String, u64>,
-    // Operation-local only. Persisted FaceTime state remains backward
-    // compatible; this guards snapshot/reconcile against stale overwrites.
-    #[serde(skip)]
-    revision: u64,
 }
 
 // time to track recently added members
@@ -906,6 +902,9 @@ pub struct FTClient {
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<DelegatedRequests>,
     session_operations: DebugMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    // Operation-local only. Keep revisions outside the public/persisted
+    // FTSession model so generated bridge decoders remain source-compatible.
+    session_revisions: DebugMutex<HashMap<String, u64>>,
     link_operation: DebugMutex<()>,
 }
 
@@ -964,6 +963,7 @@ impl FTClient {
             update_state,
             delegated_requests: DebugMutex::new(DelegatedRequests::default()),
             session_operations: DebugMutex::new(HashMap::new()),
+            session_revisions: DebugMutex::new(HashMap::new()),
             link_operation: DebugMutex::new(()),
         }
     }
@@ -976,6 +976,7 @@ impl FTClient {
     }
 
     async fn snapshot_session(&self, group_id: &str) -> Result<SessionSnapshot, PushError> {
+        let revisions = self.session_revisions.lock().await;
         let state = self.state.read().await;
         let session = state
             .sessions
@@ -984,7 +985,7 @@ impl FTClient {
             .ok_or(PushError::FaceTimeSessionNotFound)?;
         Ok(SessionSnapshot {
             group_id: group_id.to_string(),
-            revision: session.revision,
+            revision: revisions.get(group_id).copied().unwrap_or_default(),
             session,
         })
     }
@@ -992,8 +993,9 @@ impl FTClient {
     /// Establishes the local shell for an inbound wire message. This does no
     /// network work and is only called after acquiring the per-session lock.
     async fn snapshot_or_insert_session(&self, group_id: &str, my_handle: &str) -> SessionSnapshot {
+        let mut revisions = self.session_revisions.lock().await;
         let mut state = self.state.write().await;
-        let (revision, session, changed) = {
+        let (session, changed) = {
             let session = state.sessions.entry(group_id.to_string()).or_default();
             let mut changed = false;
             if session.group_id != group_id {
@@ -1004,11 +1006,13 @@ impl FTClient {
                 session.my_handles.push(my_handle.to_string());
                 changed = true;
             }
-            if changed {
-                session.revision = session.revision.saturating_add(1);
-            }
-            (session.revision, session.clone(), changed)
+            (session.clone(), changed)
         };
+        let revision = revisions.entry(group_id.to_string()).or_default();
+        if changed {
+            *revision = revision.saturating_add(1);
+        }
+        let revision = *revision;
         if changed {
             (self.update_state)(&state);
         }
@@ -1025,21 +1029,26 @@ impl FTClient {
     async fn reconcile_session(
         &self,
         snapshot: SessionSnapshot,
-        mut session: FTSession,
+        session: FTSession,
     ) -> Result<SessionSnapshot, PushError> {
+        let mut revisions = self.session_revisions.lock().await;
         let mut state = self.state.write().await;
-        let current = state
-            .sessions
+        if !state.sessions.contains_key(&snapshot.group_id) {
+            return Err(PushError::FaceTimeStateChanged);
+        }
+        let current_revision = revisions
             .get(&snapshot.group_id)
-            .ok_or(PushError::FaceTimeStateChanged)?;
-        session.revision = next_session_revision(current.revision, snapshot.revision)?;
+            .copied()
+            .unwrap_or_default();
+        let next_revision = next_session_revision(current_revision, snapshot.revision)?;
         state
             .sessions
             .insert(snapshot.group_id.clone(), session.clone());
+        revisions.insert(snapshot.group_id.clone(), next_revision);
         (self.update_state)(&state);
         Ok(SessionSnapshot {
             group_id: snapshot.group_id,
-            revision: session.revision,
+            revision: next_revision,
             session,
         })
     }
@@ -1472,18 +1481,19 @@ impl FTClient {
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
-            revision: 0,
         };
 
         let group = session.group_id.clone();
         let operation = self.operation_for_session(&group).await;
         let _operation_guard = operation.lock().await;
         {
+            let mut revisions = self.session_revisions.lock().await;
             let mut state = self.state.write().await;
             if state.sessions.contains_key(&group) {
                 return Err(PushError::FaceTimeStateChanged);
             }
             state.sessions.insert(group.clone(), session);
+            revisions.insert(group.clone(), 0);
             (self.update_state)(&state);
         }
 
