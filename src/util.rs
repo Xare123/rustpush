@@ -1957,17 +1957,25 @@ impl CompactECKey<Private> {
 }
 
 impl<T: HasPublic> CompactECKey<T> {
-    pub fn compress(&self) -> [u8; 32] {
-        let mut ctx = BigNumContext::new().unwrap();
-        let mut x = BigNum::new().unwrap();
+    /// Fallible variant used by protocol handlers that process remote key
+    /// material. The legacy [`Self::compress`] API is kept for existing
+    /// persisted/protocol callers, but admission paths must propagate an
+    /// OpenSSL failure instead of panicking.
+    pub fn try_compress(&self) -> Result<[u8; 32], PushError> {
+        let mut ctx = BigNumContext::new()?;
+        let mut x = BigNum::new()?;
+        let mut y = BigNum::new()?;
         self.public_key()
-            .affine_coordinates(&self.group(), &mut x, &mut BigNum::new().unwrap(), &mut ctx)
-            .unwrap();
+            .affine_coordinates(&self.group(), &mut x, &mut y, &mut ctx)?;
 
-        x.to_vec_padded(32)
-            .unwrap()
+        x.to_vec_padded(32)?
             .try_into()
-            .expect("Bad compressed key size!")
+            .map_err(|_| PushError::BadCompactECKey)
+    }
+
+    pub fn compress(&self) -> [u8; 32] {
+        self.try_compress()
+            .expect("compact EC key should be serializable")
     }
 
     pub fn verify(
@@ -1992,6 +2000,11 @@ impl<T: HasPublic> CompactECKey<T> {
 
     pub fn get_pkey(&self) -> PKey<T> {
         PKey::from_ec_key(self.0.clone()).expect("Couldn't create pkey!")
+    }
+
+    /// Fallible variant for inbound FaceTime admission processing.
+    pub fn try_get_pkey(&self) -> Result<PKey<T>, PushError> {
+        Ok(PKey::from_ec_key(self.0.clone())?)
     }
 }
 
@@ -2046,38 +2059,44 @@ impl CompactECKey<Private> {
 }
 
 impl CompactECKey<Public> {
-    pub fn decompress(key: [u8; 32]) -> Self {
-        let mut ctx = BigNumContext::new().unwrap();
+    /// Parses the compact public-key form without panicking on remote input.
+    pub fn try_decompress(key: [u8; 32]) -> Result<Self, PushError> {
+        let mut decode_ctx = BigNumContext::new()?;
         let mut unpacked_key = [0u8; 33];
         unpacked_key[0] = 0x3;
         unpacked_key[1..].copy_from_slice(&key);
 
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut ctx)
-            .expect("Ec point decompress failed!");
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let mut point = EcPoint::from_bytes(&group, &unpacked_key, &mut decode_ctx)?;
 
-        let mut ctx = BigNumContext::new().expect("a failed");
-        let mut x = BigNum::new().expect("New bn failed!");
-        let mut y = BigNum::new().expect("b failed");
-        let mut p = BigNum::new().expect("c failed");
-        let mut scratch = BigNum::new().expect("New bn failed!");
-        group
-            .components_gfp(&mut p, &mut scratch, &mut BigNum::new().unwrap(), &mut ctx)
-            .expect("d failed");
-        point
-            .affine_coordinates(&group, &mut x, &mut y, &mut ctx)
-            .expect("e failed");
+        let mut coordinate_ctx = BigNumContext::new()?;
+        let mut x = BigNum::new()?;
+        let mut y = BigNum::new()?;
+        let mut p = BigNum::new()?;
+        let mut coefficient_a = BigNum::new()?;
+        let mut coefficient_b = BigNum::new()?;
+        group.components_gfp(
+            &mut p,
+            &mut coefficient_a,
+            &mut coefficient_b,
+            &mut coordinate_ctx,
+        )?;
+        point.affine_coordinates(&group, &mut x, &mut y, &mut coordinate_ctx)?;
 
-        let result = scratch.checked_sub(&p, &y);
-        y.mul_word(2).expect("What");
+        // Preserve the original coordinate for the reflected root before
+        // doubling it to choose the compact-key parity convention.
+        let mut reflected_y = BigNum::new()?;
+        reflected_y.checked_sub(&p, &y)?;
+        y.mul_word(2)?;
         if y >= p {
-            result.expect("Sub failed!");
-            point
-                .set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx)
-                .expect("Set affine coordinates failed!");
+            point.set_affine_coordinates_gfp(&group, &x, &reflected_y, &mut coordinate_ctx)?;
         }
 
-        Self(EcKey::from_public_key(&group, &point).unwrap())
+        Ok(Self(EcKey::from_public_key(&group, &point)?))
+    }
+
+    pub fn decompress(key: [u8; 32]) -> Self {
+        Self::try_decompress(key).expect("compact EC key should be valid")
     }
 }
 
@@ -2097,9 +2116,9 @@ impl<T> DerefMut for CompactECKey<T> {
 #[test]
 fn compact_test() -> Result<(), PushError> {
     let create = CompactECKey::new()?;
-    let public = CompactECKey::decompress(create.compress());
-    if !public.get_pkey().public_eq(&create.get_pkey()) {
-        panic!("Keys are not equal!")
+    let public = CompactECKey::try_decompress(create.try_compress()?)?;
+    if !public.try_get_pkey()?.public_eq(&create.try_get_pkey()?) {
+        return Err(PushError::BadCompactECKey);
     }
 
     let data: [u8; 32] = rand::random();

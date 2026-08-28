@@ -431,12 +431,10 @@ impl KeyCache {
         bridge_devices: &[PrivateDeviceInfo],
         bridge_device_uuid: &str,
     ) -> bool {
-        bridge_devices
-            .iter()
-            .any(|device| {
-                device.uuid.as_deref() == Some(bridge_device_uuid)
-                    && device.token.as_slice() == push_token
-            })
+        bridge_devices.iter().any(|device| {
+            device.uuid.as_deref() == Some(bridge_device_uuid)
+                && device.token.as_slice() == push_token
+        })
     }
 
     fn has_bridge_registration(
@@ -537,6 +535,9 @@ impl KeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    use tokio::time::timeout;
 
     fn bridge_device(token: &[u8], uuid: &str) -> PrivateDeviceInfo {
         PrivateDeviceInfo {
@@ -594,6 +595,39 @@ mod tests {
             &[2],
             &refreshed_cache,
             "bridge-device"
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_refresh_releases_cache_before_waiting_and_keeps_newer_nonforced_data() {
+        let cache = Arc::new(DebugMutex::new(Vec::<PrivateDeviceInfo>::new()));
+        let barrier = Arc::new(Barrier::new(2));
+        let updater_cache = cache.clone();
+        let updater_barrier = barrier.clone();
+        let updater = tokio::spawn(async move {
+            updater_barrier.wait().await;
+            updater_cache
+                .lock()
+                .await
+                .push(bridge_device(&[9], "bridge-device"));
+        });
+
+        let snapshot_before = { cache.lock().await.clone() };
+        assert!(snapshot_before.is_empty());
+        barrier.wait().await;
+        timeout(Duration::from_millis(100), updater)
+            .await
+            .expect("token updater must acquire the cache after snapshot")
+            .expect("token updater must not panic");
+
+        let snapshot_after = { cache.lock().await.clone() };
+        assert!(IdentityResource::keep_concurrent_private_self_refresh(
+            false,
+            &snapshot_after
+        ));
+        assert!(!IdentityResource::keep_concurrent_private_self_refresh(
+            true,
+            &snapshot_after
         ));
     }
 }
@@ -1004,38 +1038,69 @@ impl IdentityResource {
             .clone()
     }
 
-    pub async fn ensure_private_self(
-        &self,
-        cache_lock: &mut KeyCache,
+    fn cached_private_devices(
+        cache: &KeyCache,
         handle: &str,
-        refresh: bool,
-    ) -> Result<(), PushError> {
-        let my_cache = cache_lock
+    ) -> Result<Vec<PrivateDeviceInfo>, PushError> {
+        cache
             .cache
-            .get_mut("com.apple.madrid")
-            .unwrap()
-            .get_mut(handle)
-            .unwrap();
-        if my_cache.private_data.len() != 0 && !refresh {
+            .get("com.apple.madrid")
+            .and_then(|madrid| madrid.get(handle))
+            .map(|cached| cached.private_data.clone())
+            .ok_or_else(|| PushError::KeyNotFound(handle.to_string()))
+    }
+
+    fn keep_concurrent_private_self_refresh(
+        refresh: bool,
+        cached_now: &[PrivateDeviceInfo],
+    ) -> bool {
+        !refresh && !cached_now.is_empty()
+    }
+
+    /// Refreshes self-device registrations with a snapshot/operation/reconcile
+    /// sequence. The key cache is intentionally never held while querying IDS
+    /// or APS, so a slow token refresh cannot block FaceTime admission.
+    pub async fn ensure_private_self(&self, handle: &str, refresh: bool) -> Result<(), PushError> {
+        let cached_before = {
+            let cache = self.cache.lock().await;
+            Self::cached_private_devices(&cache, handle)?
+        };
+        if !refresh && !cached_before.is_empty() {
             return Ok(());
         }
-        let user_lock = self.users.read().await;
-        let my_user = Self::user_by_real_handle(&user_lock, handle)?;
-        let regs = my_user
-            .get_dependent_registrations(&*self.aps.state.read().await)
-            .await?;
-        if my_cache.private_data.len() != 0 && regs.len() != my_cache.private_data.len() {
-            // something changed, requery IDS too
-            cache_lock.invalidate(handle, handle);
+
+        let my_user = {
+            let users = self.users.read().await;
+            Self::user_by_real_handle(&users, handle)?.clone()
+        };
+        let aps_state = self.aps.state.read().await.clone();
+        let registrations = my_user.get_dependent_registrations(&aps_state).await?;
+
+        let mut cache = self.cache.lock().await;
+        let cached_now = Self::cached_private_devices(&cache, handle)?;
+        // A concurrent non-forced refresh succeeded while this request was in
+        // flight. Keep that newer cache rather than overwriting it with an
+        // older network response.
+        if Self::keep_concurrent_private_self_refresh(refresh, &cached_now) {
+            return Ok(());
         }
-        cache_lock
+        if !cached_now.is_empty() && registrations.len() != cached_now.len() {
+            // Requery recipient keys after a device list change. Avoid the
+            // old `invalidate` helper here because it panics when a service
+            // cache does not contain this handle.
+            for service_cache in cache.cache.values_mut() {
+                if let Some(handle_cache) = service_cache.get_mut(handle) {
+                    handle_cache.keys.remove(handle);
+                }
+            }
+        }
+        let madrid = cache
             .cache
             .get_mut("com.apple.madrid")
-            .unwrap()
-            .get_mut(handle)
-            .unwrap()
-            .private_data = regs;
-        cache_lock.save();
+            .and_then(|madrid| madrid.get_mut(handle))
+            .ok_or_else(|| PushError::KeyNotFound(handle.to_string()))?;
+        madrid.private_data = registrations;
+        cache.save();
         Ok(())
     }
 
@@ -1056,14 +1121,9 @@ impl IdentityResource {
         handle: &str,
         refresh: bool,
     ) -> Result<Vec<PrivateDeviceInfo>, PushError> {
-        let mut cache_lock = self.cache.lock().await;
-        self.ensure_private_self(&mut cache_lock, handle, refresh)
-            .await?;
-        let private_self = &cache_lock.cache["com.apple.madrid"]
-            .get(handle)
-            .unwrap()
-            .private_data;
-        Ok(private_self.clone())
+        self.ensure_private_self(handle, refresh).await?;
+        let cache = self.cache.lock().await;
+        Self::cached_private_devices(&cache, handle)
     }
 
     pub async fn get_participants_targets_excluding_bridge_devices(
@@ -1084,10 +1144,7 @@ impl IdentityResource {
                 .get("com.apple.madrid")
                 .and_then(|handles| handles.get(handle))
                 .map(|cached| {
-                    KeyCache::has_bridge_registration(
-                        &cached.private_data,
-                        &bridge_device_uuid,
-                    )
+                    KeyCache::has_bridge_registration(&cached.private_data, &bridge_device_uuid)
                 })
                 .unwrap_or(false)
         };
@@ -1127,22 +1184,20 @@ impl IdentityResource {
     }
 
     pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
-        let mut cache_lock = self.cache.lock().await;
-        let private_self = &cache_lock.cache["com.apple.madrid"]
-            .get(handle)
-            .unwrap()
-            .private_data;
+        let private_self = {
+            let cache = self.cache.lock().await;
+            Self::cached_private_devices(&cache, handle)?
+        };
         if let Some(found) = private_self.iter().find(|i| i.token == token) {
             if let Some(uuid) = &found.uuid {
                 return Ok(uuid.clone());
             }
         }
-        self.ensure_private_self(&mut cache_lock, handle, true)
-            .await?;
-        let private_self = &cache_lock.cache["com.apple.madrid"]
-            .get(handle)
-            .unwrap()
-            .private_data;
+        self.ensure_private_self(handle, true).await?;
+        let private_self = {
+            let cache = self.cache.lock().await;
+            Self::cached_private_devices(&cache, handle)?
+        };
         Ok(private_self
             .iter()
             .find(|i| i.token == token)

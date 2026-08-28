@@ -148,6 +148,14 @@ pub enum PushError {
     NoHandle,
     #[error("FaceTime session not found")]
     FaceTimeSessionNotFound,
+    #[error("FaceTime session changed while an operation was in flight")]
+    FaceTimeStateChanged,
+    #[error("FaceTime admission request no longer exists")]
+    FaceTimeAdmissionMissing,
+    #[error("FaceTime admission response is already in flight")]
+    FaceTimeAdmissionInFlight,
+    #[error("FaceTime admission response requires an explicit manual retry")]
+    FaceTimeAdmissionManualRetryRequired,
     #[error("NoParticipantTokenIndex")]
     NoParticipantTokenIndex,
     #[error("Resource generate timeout")]

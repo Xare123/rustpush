@@ -704,7 +704,7 @@ async fn main() {
     let handle = client.identity.get_handles().await[0].clone();
     client
         .identity
-        .ensure_private_self(&mut *client.identity.cache.lock().await, &handle, true)
+        .ensure_private_self(&handle, true)
         .await
         .unwrap();
 

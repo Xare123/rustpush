@@ -28,6 +28,7 @@ use plist::{Data, Dictionary, Value};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::{
@@ -157,7 +158,7 @@ fn canonicalize_ids_handle(handle: &str) -> String {
 
 const NONCE_COUNT: usize = 12;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FTLink {
     #[serde(
         serialize_with = "ec_serialize_priv",
@@ -175,17 +176,13 @@ pub struct FTLink {
 
 impl FTLink {
     pub fn get_link(&self) -> Result<String, PushError> {
-        let public = self.key.compress();
+        let public = self.key.try_compress()?;
         let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&public);
-        let pseudonym = self
-            .pseud
-            .strip_prefix("temp:")
-            .ok_or(PushError::BadMsg)?;
+        let pseudonym = self.pseud.strip_prefix("temp:").ok_or(PushError::BadMsg)?;
 
         Ok(format!(
             "https://facetime.apple.com/join#v=1&p={}&k={}",
-            pseudonym,
-            encoded
+            pseudonym, encoded
         ))
     }
 
@@ -278,6 +275,10 @@ pub struct FTSession {
     pub mode: Option<FTMode>,
     #[serde(skip)]
     pub recent_member_adds: HashMap<String, u64>,
+    // Operation-local only. Persisted FaceTime state remains backward
+    // compatible; this guards snapshot/reconcile against stale overwrites.
+    #[serde(skip)]
+    revision: u64,
 }
 
 // time to track recently added members
@@ -307,14 +308,12 @@ impl FTSession {
             .iter()
             .filter(|a| {
                 self.recent_member_adds.contains_key(&a.handle)
-                    && !members
-                        .iter()
-                        .any(|i| {
-                            i.handle
-                                .as_ref()
-                                .map(|handle| handle_to_ids(handle) == a.handle)
-                                .unwrap_or(false)
-                        })
+                    && !members.iter().any(|i| {
+                        i.handle
+                            .as_ref()
+                            .map(|handle| handle_to_ids(handle) == a.handle)
+                            .unwrap_or(false)
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -332,12 +331,15 @@ impl FTSession {
             .find(|p| &p.token == &base64_encoded)
     }
 
-    fn get_report(&self) -> ConversationReport {
-        ConversationReport {
+    fn get_report(&self) -> Result<ConversationReport, PushError> {
+        let start_time = self.start_time.ok_or(PushError::BadMsg)?;
+        let timebase = Duration::from_millis(start_time)
+            .checked_sub(UNIX_TO_2001)
+            .ok_or(PushError::BadMsg)?;
+        Ok(ConversationReport {
             conversation_id: self.report_id.clone(),
-            timebase: (Duration::from_millis(self.start_time.expect("Bad state!")) - UNIX_TO_2001)
-                .as_secs_f64(),
-        }
+            timebase: timebase.as_secs_f64(),
+        })
     }
 
     fn new_members(&mut self, members: &[ConversationMember]) -> HashSet<FTMember> {
@@ -754,6 +756,53 @@ impl DelegatedRequests {
         }
     }
 
+    /// Captures the original decision and claims the only permitted response
+    /// send in one mutex operation. Splitting `load` from `begin` allowed two
+    /// callers to both observe a retryable request before either claimed it.
+    fn claim(
+        &mut self,
+        delegation: &str,
+        requested_group: Option<&str>,
+        manual_retry: bool,
+    ) -> Result<(LetMeInRequest, Option<String>), PushError> {
+        let Some(entry) = self.requests.get_mut(delegation) else {
+            return Err(PushError::FaceTimeAdmissionMissing);
+        };
+
+        match entry.status {
+            DelegatedResponseStatus::Pending => {
+                if entry.approved_group.is_none() {
+                    entry.approved_group = Some(requested_group.map(str::to_owned));
+                }
+                entry.status = DelegatedResponseStatus::InFlight;
+            }
+            DelegatedResponseStatus::Failed(_) if manual_retry => {
+                entry.status = DelegatedResponseStatus::InFlight;
+            }
+            DelegatedResponseStatus::InFlight => {
+                return Err(PushError::FaceTimeAdmissionInFlight);
+            }
+            DelegatedResponseStatus::Failed(_) => {
+                return Err(PushError::FaceTimeAdmissionManualRetryRequired);
+            }
+        }
+
+        Ok((
+            entry.request.clone(),
+            entry.approved_group.clone().flatten(),
+        ))
+    }
+
+    fn remove_if_pending(&mut self, delegation: &str) {
+        if self
+            .requests
+            .get(delegation)
+            .is_some_and(|entry| entry.status == DelegatedResponseStatus::Pending)
+        {
+            self.requests.remove(delegation);
+        }
+    }
+
     fn complete(&mut self, delegation: &str) {
         self.requests.remove(delegation);
     }
@@ -762,6 +811,20 @@ impl DelegatedRequests {
         if let Some(entry) = self.requests.get_mut(delegation) {
             entry.status = DelegatedResponseStatus::Failed(failure);
         }
+    }
+
+    /// A claimed request can fail before its encrypted response reaches the
+    /// transport. Only that in-flight state may transition back to retained
+    /// failure. A completed request must never be resurrected and replayed.
+    fn fail_if_in_flight(&mut self, delegation: &str, failure: LetMeInResponseFailure) -> bool {
+        let Some(entry) = self.requests.get_mut(delegation) else {
+            return false;
+        };
+        if entry.status != DelegatedResponseStatus::InFlight {
+            return false;
+        }
+        entry.status = DelegatedResponseStatus::Failed(failure);
+        true
     }
 }
 
@@ -810,6 +873,35 @@ pub struct FTClient {
     pub state: DebugRwLock<FTState>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<DelegatedRequests>,
+    session_operations: DebugMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    link_operation: DebugMutex<()>,
+}
+
+#[derive(Clone)]
+struct SessionSnapshot {
+    group_id: String,
+    revision: u64,
+    session: FTSession,
+}
+
+async fn session_operation_for(
+    registry: &DebugMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    group_id: &str,
+) -> Arc<AsyncMutex<()>> {
+    let mut operations = registry.lock().await;
+    operations
+        .entry(group_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+fn next_session_revision(current: u64, snapshot: u64) -> Result<u64, PushError> {
+    if current != snapshot {
+        return Err(PushError::FaceTimeStateChanged);
+    }
+    snapshot
+        .checked_add(1)
+        .ok_or(PushError::FaceTimeStateChanged)
 }
 
 impl FTClient {
@@ -836,7 +928,113 @@ impl FTClient {
             state: DebugRwLock::new(state),
             update_state,
             delegated_requests: DebugMutex::new(DelegatedRequests::default()),
+            session_operations: DebugMutex::new(HashMap::new()),
+            link_operation: DebugMutex::new(()),
         }
+    }
+
+    /// Returns the operation lock for one conversation without retaining the
+    /// registry lock. Callers may hold the returned per-session lock across
+    /// network work, but must never retain `self.state` across an await.
+    async fn operation_for_session(&self, group_id: &str) -> Arc<AsyncMutex<()>> {
+        session_operation_for(&self.session_operations, group_id).await
+    }
+
+    async fn snapshot_session(&self, group_id: &str) -> Result<SessionSnapshot, PushError> {
+        let state = self.state.read().await;
+        let session = state
+            .sessions
+            .get(group_id)
+            .cloned()
+            .ok_or(PushError::FaceTimeSessionNotFound)?;
+        Ok(SessionSnapshot {
+            group_id: group_id.to_string(),
+            revision: session.revision,
+            session,
+        })
+    }
+
+    /// Establishes the local shell for an inbound wire message. This does no
+    /// network work and is only called after acquiring the per-session lock.
+    async fn snapshot_or_insert_session(&self, group_id: &str, my_handle: &str) -> SessionSnapshot {
+        let mut state = self.state.write().await;
+        let (revision, session, changed) = {
+            let session = state.sessions.entry(group_id.to_string()).or_default();
+            let mut changed = false;
+            if session.group_id != group_id {
+                session.group_id = group_id.to_string();
+                changed = true;
+            }
+            if !session.my_handles.iter().any(|handle| handle == my_handle) {
+                session.my_handles.push(my_handle.to_string());
+                changed = true;
+            }
+            if changed {
+                session.revision = session.revision.saturating_add(1);
+            }
+            (session.revision, session.clone(), changed)
+        };
+        if changed {
+            (self.update_state)(&state);
+        }
+        SessionSnapshot {
+            group_id: group_id.to_string(),
+            revision,
+            session,
+        }
+    }
+
+    /// Commits a session produced from a snapshot. A same-session operation
+    /// normally owns the per-session lock, but the revision check additionally
+    /// refuses an out-of-band overwrite rather than losing a newer update.
+    async fn reconcile_session(
+        &self,
+        snapshot: SessionSnapshot,
+        mut session: FTSession,
+    ) -> Result<SessionSnapshot, PushError> {
+        let mut state = self.state.write().await;
+        let current = state
+            .sessions
+            .get(&snapshot.group_id)
+            .ok_or(PushError::FaceTimeStateChanged)?;
+        session.revision = next_session_revision(current.revision, snapshot.revision)?;
+        state
+            .sessions
+            .insert(snapshot.group_id.clone(), session.clone());
+        (self.update_state)(&state);
+        Ok(SessionSnapshot {
+            group_id: snapshot.group_id,
+            revision: session.revision,
+            session,
+        })
+    }
+
+    async fn update_session_without_network<F>(
+        &self,
+        group_id: &str,
+        my_handle: Option<&str>,
+        update: F,
+    ) -> Result<(), PushError>
+    where
+        F: FnOnce(&mut FTSession),
+    {
+        let operation = self.operation_for_session(group_id).await;
+        let _operation_guard = operation.lock().await;
+        let snapshot = if let Some(my_handle) = my_handle {
+            self.snapshot_or_insert_session(group_id, my_handle).await
+        } else {
+            let Ok(snapshot) = self.snapshot_session(group_id).await else {
+                // Invitation/elsewhere hints may arrive before the matching
+                // conversation state. Preserve the old no-op behavior rather
+                // than manufacturing a partial session from that hint alone.
+                return Ok(());
+            };
+            snapshot
+        };
+        let mut working_session = snapshot.session.clone();
+        update(&mut working_session);
+        self.reconcile_session(snapshot, working_session).await?;
+        Ok(())
     }
 
     pub async fn ensure_allocations(
@@ -1028,19 +1226,32 @@ impl FTClient {
         }
 
         let mut state = self.state.write().await;
-        state.links.get_mut(&pseud).expect("No link??").usage = Some(usage.to_string());
+        let link = state.links.get_mut(&pseud).ok_or(PushError::BadMsg)?;
+        link.usage = Some(usage.to_string());
         (self.update_state)(&*state);
         Ok(())
     }
 
     pub async fn get_link_for_usage(&self, handle: &str, usage: &str) -> Result<String, PushError> {
-        let mut state = self.state.write().await;
-        state.links.retain(|_, l| !l.is_expired()); // remove expiredg links
-        if let Some(link) = state
-            .links
-            .values()
-            .find(|a| a.usage == Some(usage.to_string()))
-        {
+        // This only serializes link creation. It is deliberately separate from
+        // the persisted FaceTime state lock, which is never retained across the
+        // identity validation or pseudonym creation awaits below.
+        let _link_operation = self.link_operation.lock().await;
+        let existing = {
+            let mut state = self.state.write().await;
+            let before = state.links.len();
+            state.links.retain(|_, link| !link.is_expired());
+            if state.links.len() != before {
+                (self.update_state)(&state);
+            }
+            state
+                .links
+                .values()
+                .find(|link| link.usage.as_deref() == Some(usage))
+                .cloned()
+        };
+
+        if let Some(link) = existing {
             if self
                 .identity
                 .validate_pseudonym(
@@ -1050,20 +1261,9 @@ impl FTClient {
                 )
                 .await?
             {
-                return Ok(link.get_link()?);
-            } else {
-                warn!("Failed to validate pseudonym! {}", link.pseud);
+                return link.get_link();
             }
-        }
-
-        // disassociate any bad links, so we don't pull from them and we only have one link with this usage
-        // we don't delete because that is too error prone, we can just let them expire instead.
-        // after all, the point of this function is to get a link that works, not do pruning. (there may be many (hundreds) due past bug)
-        for (_, link) in &mut state.links {
-            if link.usage != Some(usage.to_string()) {
-                continue;
-            }
-            link.usage = None;
+            warn!("FaceTime link validation failed; creating a replacement");
         }
 
         let link_obj = self
@@ -1075,13 +1275,25 @@ impl FTClient {
             .await?;
         let link = link_obj.get_link()?;
 
+        let mut state = self.state.write().await;
+        // Disassociate unusable links rather than deleting remote pseudonyms.
+        // The per-link operation prevents another creator from racing this
+        // replacement; clear/delete operations still win if they ran first.
+        for existing in state.links.values_mut() {
+            if existing.usage.as_deref() == Some(usage) {
+                existing.usage = None;
+            }
+        }
         state.links.insert(link_obj.pseud.clone(), link_obj);
-        (self.update_state)(&*state);
+        (self.update_state)(&state);
 
         Ok(link)
     }
 
     pub async fn clear_links(&self) -> Result<(), PushError> {
+        // Serialize remote removal with link creation so a newly persisted
+        // local link cannot point at a pseudonym that this clear just removed.
+        let _link_operation = self.link_operation.lock().await;
         self.identity
             .clear_pseudonyms(
                 "Gondola",
@@ -1098,6 +1310,9 @@ impl FTClient {
     }
 
     pub async fn delete_link(&self, pseud: &str) -> Result<(), PushError> {
+        // See `clear_links`: this is an operation lock, never the persisted
+        // FaceTime state lock, so the remote await cannot block state users.
+        let _link_operation = self.link_operation.lock().await;
         self.identity
             .delete_pseudonym(
                 "Gondola",
@@ -1115,23 +1330,22 @@ impl FTClient {
     }
 
     pub async fn get_session_link(&self, guid: &str) -> Result<String, PushError> {
-        let (my_handle, group_id, members, existing_link) = {
-            let state = self.state.read().await;
-            let session = state
-                .sessions
-                .get(guid)
-                .ok_or(PushError::FaceTimeSessionNotFound)?;
-            (
-                session
-                    .my_handles
-                    .first()
-                    .cloned()
-                    .ok_or(PushError::NoHandle)?,
-                session.group_id.clone(),
-                session.members.clone(),
-                session.link.clone(),
-            )
-        };
+        let operation = self.operation_for_session(guid).await;
+        let _operation_guard = operation.lock().await;
+        // Link creation is serialized independently of persisted state. Hold
+        // this operation guard while the remote pseudonym is created so link
+        // replacement cannot race another link-producing path.
+        let _link_operation = self.link_operation.lock().await;
+        let snapshot = self.snapshot_session(guid).await?;
+        let my_handle = snapshot
+            .session
+            .my_handles
+            .first()
+            .cloned()
+            .ok_or(PushError::NoHandle)?;
+        let group_id = snapshot.session.group_id.clone();
+        let members = snapshot.session.members.clone();
+        let existing_link = snapshot.session.link.clone();
 
         if let Some(link) = existing_link {
             let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
@@ -1157,7 +1371,7 @@ impl FTClient {
         link_obj.session_link = Some(group_id.clone());
         let conversation_link = ConversationLink {
             pseudonym: link_obj.pseud.clone(),
-            public_key: link_obj.key.compress().to_vec(),
+            public_key: link_obj.key.try_compress()?.to_vec(),
             private_key: vec![],
             invited_handles: members
                 .into_iter()
@@ -1180,27 +1394,16 @@ impl FTClient {
         message.conversation_group_uuid_string = group_id;
 
         let link = link_obj.get_link()?;
-        let session_for_message = {
-            let mut state = self.state.write().await;
-            if let Some(existing) = state.sessions.get(guid).and_then(|s| s.link.as_ref()) {
-                let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&existing.public_key);
-                let pseudonym = existing
-                    .pseudonym
-                    .strip_prefix("temp:")
-                    .ok_or(PushError::BadMsg)?;
-                return Ok(format!(
-                    "https://facetime.apple.com/join#v=1&p={}&k={}",
-                    pseudonym, encoded
-                ));
-            }
-            let session_for_message = {
-                let session = session_mut(&mut state.sessions, guid)?;
-                session.link = Some(conversation_link);
-                session.clone()
-            };
-            state.links.insert(link_obj.pseud.clone(), link_obj);
-            session_for_message
-        };
+        let mut updated_session = snapshot.session.clone();
+        updated_session.link = Some(conversation_link);
+        let session_for_message = self
+            .reconcile_session(snapshot, updated_session)
+            .await?
+            .session;
+        let mut state = self.state.write().await;
+        state.links.insert(link_obj.pseud.clone(), link_obj);
+        (self.update_state)(&state);
+        drop(state);
 
         self.message_session(my_handle, message, &session_for_message, None)
             .await?;
@@ -1237,17 +1440,26 @@ impl FTClient {
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
+            revision: 0,
         };
 
-        let mut my_session = self.state.write().await;
         let group = session.group_id.clone();
-        my_session.sessions.insert(group.clone(), session);
+        let operation = self.operation_for_session(&group).await;
+        let _operation_guard = operation.lock().await;
+        {
+            let mut state = self.state.write().await;
+            if state.sessions.contains_key(&group) {
+                return Err(PushError::FaceTimeStateChanged);
+            }
+            state.sessions.insert(group.clone(), session);
+            (self.update_state)(&state);
+        }
 
-        let session = my_session.sessions.get_mut(&group).unwrap();
-
-        self.ensure_allocations(session, &[]).await?;
-
-        self.prop_up_conv(session, true).await?;
+        let snapshot = self.snapshot_session(&group).await?;
+        let mut working_session = snapshot.session.clone();
+        self.ensure_allocations(&mut working_session, &[]).await?;
+        self.prop_up_conv(&mut working_session, true).await?;
+        self.reconcile_session(snapshot, working_session).await?;
 
         Ok(())
     }
@@ -1409,11 +1621,7 @@ impl FTClient {
 
             let targets = self
                 .identity
-                .get_participants_targets_excluding_bridge_devices(
-                    topic,
-                    handle,
-                    &relevant_people,
-                )
+                .get_participants_targets_excluding_bridge_devices(topic, handle, &relevant_people)
                 .await?;
             self.identity
                 .send_message(
@@ -1453,6 +1661,7 @@ impl FTClient {
             .await?;
 
         let builder_session = session.clone();
+        let report = builder_session.get_report()?;
         let my_participant = builder_session
             .participants
             .values()
@@ -1484,7 +1693,7 @@ impl FTClient {
                             message.set_type(ConversationMessageType::Invitation);
                         }
                         message.link = builder_session.link.clone();
-                        message.report_data = Some(builder_session.get_report());
+                        message.report_data = Some(report.clone());
                         message.invitation_preferences = vec![
                             ConversationInvitationPreference {
                                 version: 0,
@@ -1551,7 +1760,13 @@ impl FTClient {
                             )),
                             uri_to_participant_id_key: Some(participant_map),
                         };
-                        Some(plist_to_bin(&wire_message).expect("Failed to serialize plist"))
+                        match plist_to_bin(&wire_message) {
+                            Ok(payload) => Some(payload),
+                            Err(_) => {
+                                warn!("FaceTime command 207 serialization failed");
+                                None
+                            }
+                        }
                     })),
                     send_delivered: false,
                     command: 207,
@@ -1750,7 +1965,7 @@ impl FTClient {
         message.conversation_group_uuid_string = session.group_id.clone();
         message.added_members = new_members.iter().map(|a| a.to_conversation()).collect();
         message.link = session.link.clone();
-        message.report_data = Some(session.get_report());
+        message.report_data = Some(session.get_report()?);
         message.is_let_me_in_approved = if letmein { Some(true) } else { None };
         message.invitation_preferences = vec![
             ConversationInvitationPreference {
@@ -1836,10 +2051,15 @@ impl FTClient {
         token: Vec<u8>,
         encrypted: EncryptedConversationMessage,
     ) -> Result<LetMeInRequest, PushError> {
-        let state = self.state.read().await;
-        let Some(link) = &state.links.get(target) else {
-            warn!("Link not found!");
-            return Err(PushError::BadMsg);
+        let (link, delegated_session) = {
+            let state = self.state.read().await;
+            let link = state.links.get(target).cloned().ok_or(PushError::BadMsg)?;
+            let delegated_session = link
+                .session_link
+                .as_ref()
+                .and_then(|session| state.sessions.get(session))
+                .cloned();
+            (link, delegated_session)
         };
 
         let public_key: [u8; 32] = encrypted
@@ -1847,23 +2067,18 @@ impl FTClient {
             .as_slice()
             .try_into()
             .map_err(|_| PushError::BadMsg)?;
-        let other_pubkey = std::panic::catch_unwind(|| CompactECKey::decompress(public_key))
-            .map_err(|_| PushError::BadMsg)?;
-        info!("A");
-
-        let a = link.key.get_pkey();
-        let b = other_pubkey.get_pkey();
+        let other_pubkey =
+            CompactECKey::try_decompress(public_key).map_err(|_| PushError::BadMsg)?;
+        let a = link.key.try_get_pkey()?;
+        let b = other_pubkey.try_get_pkey()?;
         let mut deriver = Deriver::new(&a)?;
         deriver.set_peer(&b)?;
         let letmein_secret = deriver.derive_to_vec()?;
 
-        info!("B");
-
         let hk = Hkdf::<Sha256>::new(None, &letmein_secret);
         let mut key = [0u8; 32];
         hk.expand("FT-LMI-RequestKey".as_bytes(), &mut key)
-            .expect("Failed to expand key!");
-        info!("C");
+            .map_err(|_| PushError::BadMsg)?;
 
         if encrypted.conversation_message_bytes.len() < NONCE_COUNT {
             return Err(PushError::BadMsg);
@@ -1892,11 +2107,7 @@ impl FTClient {
             usage: link.usage.clone(),
         };
 
-        if let Some(session) = link
-            .session_link
-            .as_ref()
-            .and_then(|session| state.sessions.get(session))
-        {
+        if let Some(session) = delegated_session {
             // delegate
             let delegate_uuid = Uuid::new_v4().to_string().to_uppercase();
 
@@ -1906,16 +2117,33 @@ impl FTClient {
             delegate.conversation_group_uuid_string = session.group_id.clone();
             delegate.let_me_in_delegation_handle = request.requestor.clone();
             delegate.let_me_in_delegation_uuid = delegate_uuid.clone();
-            let my_handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+            let my_handle = session
+                .my_handles
+                .first()
+                .cloned()
+                .ok_or(PushError::NoHandle)?;
             // context if missing is
             //  6045   0    callservicesd: [com.apple.calls.callservicesd:Default] [WARN] Dropping let me in delegation request or response because it has the wrong intent {publicIntentAction: (null)}
-            self.message_session(my_handle.clone(), delegate, session, Some(20001))
-                .await?;
-
             request.delegation_uuid = Some(delegate_uuid.clone());
-
-            let mut delegated_lock = self.delegated_requests.lock().await;
-            delegated_lock.insert(delegate_uuid, request.clone());
+            {
+                // Insert before sending to close the fast-response race. If a
+                // response arrives while the send is still completing, it can
+                // atomically claim this request exactly once.
+                let mut delegated = self.delegated_requests.lock().await;
+                delegated.insert(delegate_uuid.clone(), request.clone());
+            }
+            if let Err(error) = self
+                .message_session(my_handle, delegate, &session, Some(20001))
+                .await
+            {
+                let mut delegated = self.delegated_requests.lock().await;
+                // A response may already be in flight after an ambiguous
+                // transport result. Do not erase it; otherwise roll back the
+                // entry so a later unsolicited response is ignored.
+                delegated.remove_if_pending(&delegate_uuid);
+                warn!("FaceTime admission delegation failed before completion");
+                return Err(error);
+            }
         }
 
         Ok(request)
@@ -1958,7 +2186,7 @@ impl FTClient {
             .await
             .get(delegation_uuid)
             .cloned()
-            .ok_or(PushError::FaceTimeSessionNotFound)?;
+            .ok_or(PushError::FaceTimeAdmissionMissing)?;
         self.retry_letmein_manually(request, None).await
     }
 
@@ -1971,37 +2199,66 @@ impl FTClient {
         let delegation = letmein.delegation_uuid.clone();
         let mut effective_approved_group = approved_group.map(str::to_owned);
         if let Some(delegation) = delegation.as_deref() {
-            let mut shared_lock = self.delegated_requests.lock().await;
-            match shared_lock.load(delegation, approved_group, manual_retry) {
-                BeginDelegatedResponse::Ready {
-                    request: pending,
-                    approved_group: pending_group,
-                } => {
-                    // The retained request is authoritative after a failed
-                    // transport attempt. A manual retry must reuse the same
-                    // admission material rather than a possibly stale copy.
-                    letmein = pending;
-                    effective_approved_group = pending_group;
-                }
-                BeginDelegatedResponse::Missing => {
-                    warn!("FaceTime admission response skipped: stage=begin error_type=missing");
-                    return Ok(());
-                }
-                BeginDelegatedResponse::AlreadyInFlight => {
-                    warn!("FaceTime admission response skipped: stage=begin error_type=in_flight");
-                    return Ok(());
-                }
-                BeginDelegatedResponse::AwaitingManualRetry => {
+            let (pending, pending_group) = self.delegated_requests.lock().await.claim(
+                delegation,
+                approved_group,
+                manual_retry,
+            )?;
+            // The retained request and the original decision are authoritative
+            // after an ambiguous transport outcome. A retry cannot change who
+            // was admitted, and an unclaimed request never reports success.
+            letmein = pending;
+            effective_approved_group = pending_group;
+        }
+
+        let result = self
+            .respond_claimed_letmein(letmein, effective_approved_group, delegation.as_deref())
+            .await;
+        if let Err(error) = result {
+            if let Some(delegation) = delegation.as_deref() {
+                let failure = classify_letmein_response_failure(&error);
+                let failed_before_send = self
+                    .delegated_requests
+                    .lock()
+                    .await
+                    .fail_if_in_flight(delegation, failure);
+                if failed_before_send {
+                    // Retain exactly the originally claimed request and
+                    // decision, so only an explicit manual retry can resend.
                     warn!(
-                        "FaceTime admission response skipped: stage=begin error_type=manual_retry_required"
+                        "FaceTime admission response failed before send: error_type={}",
+                        failure.log_name()
                     );
-                    return Ok(());
                 }
             }
+            return Err(error);
         }
-        if let Some(approved) = effective_approved_group.as_deref() {
-            let mut state = self.state.write().await;
-            let session = session_mut(&mut state.sessions, approved)?;
+        Ok(())
+    }
+
+    /// Runs a request that was atomically claimed by
+    /// [`Self::respond_letmein_internal`]. Any error before the encrypted
+    /// response is accepted by the transport is reconciled by the wrapper;
+    /// after that response succeeds the retained request is consumed before
+    /// optional follow-up ringing can fail.
+    async fn respond_claimed_letmein(
+        &self,
+        letmein: LetMeInRequest,
+        effective_approved_group: Option<String>,
+        delegation: Option<&str>,
+    ) -> Result<(), PushError> {
+        let session_operation = match effective_approved_group.as_deref() {
+            Some(group) => Some(self.operation_for_session(group).await),
+            None => None,
+        };
+        let _session_operation_guard = match session_operation.as_ref() {
+            Some(operation) => Some(operation.lock().await),
+            None => None,
+        };
+
+        let mut approved_snapshot = if let Some(approved) = effective_approved_group.as_deref() {
+            let snapshot = self.snapshot_session(approved).await?;
+            let mut session = snapshot.session.clone();
             // MUST prop before we create a session link so caller associates our session properly
 
             // this is for when the call is in a OneOnOne mode AND there is only ONE participant in the call
@@ -2011,7 +2268,8 @@ impl FTClient {
             // thus the condition fails; OneOnOne mode is not exited, and the call fails. We solve this by "joining" the call until the web client
             // has an opportunity to join, and then leaving ASAP.
             // AFAICT this condition is only triggered when ringing
-            let needs_prop = session.is_ringing_inaccurate
+            let needs_prop = !session.is_propped
+                && session.is_ringing_inaccurate
                 && session
                     .participants
                     .values()
@@ -2020,21 +2278,25 @@ impl FTClient {
                     == 1;
             if needs_prop {
                 info!("Propping conversation");
-                self.ensure_allocations(session, &[]).await?;
-                self.prop_up_conv(session, false).await?;
-                // return Err(PushError::AESGCMError);
+                self.ensure_allocations(&mut session, &[]).await?;
+                self.prop_up_conv(&mut session, false).await?;
             }
-            drop(state);
+            if needs_prop {
+                Some(self.reconcile_session(snapshot, session).await?)
+            } else {
+                Some(snapshot)
+            }
+        } else {
+            None
+        };
 
-            // for native links
-            // info!("Ensuring letmein group has link!");
-            // let a = self.get_session_link(approved).await?;
-            // info!("Adding to group with link {a}");
-        }
-        let mut state = self.state.write().await;
-        let Some(link) = &state.links.get(&letmein.pseud) else {
-            warn!("Link not found!");
-            return Err(PushError::BadMsg);
+        let link = {
+            let state = self.state.read().await;
+            state
+                .links
+                .get(&letmein.pseud)
+                .cloned()
+                .ok_or(PushError::BadMsg)?
         };
         let mut response = ConversationMessage::default();
         response.is_let_me_in_approved = Some(effective_approved_group.is_some());
@@ -2042,7 +2304,8 @@ impl FTClient {
         let mut link_data = ConversationLink::default();
         link_data.set_link_lifetime_scope(ConversationLinkLifetimeScope::Indefinite);
         link_data.pseudonym = link.pseud.clone();
-        link_data.public_key = link.key.compress().to_vec();
+        let link_public_key = link.key.try_compress()?.to_vec();
+        link_data.public_key = link_public_key.clone();
         if let Some(to_group) = effective_approved_group.as_deref() {
             response.conversation_group_uuid_string = to_group.to_string();
             link_data.group_uuid_string = to_group.to_string();
@@ -2054,7 +2317,7 @@ impl FTClient {
         let hk = Hkdf::<Sha256>::new(None, &letmein.shared_secret);
         let mut key = [0u8; 32];
         hk.expand("FT-LMI-ResponseKey".as_bytes(), &mut key)
-            .expect("Failed to expand key!");
+            .map_err(|_| PushError::BadMsg)?;
 
         let nonce: [u8; NONCE_COUNT] = rand::random();
         let cipher = Aes256Gcm::new(&key.into());
@@ -2069,68 +2332,30 @@ impl FTClient {
         link_data.group_uuid_string = "".to_string();
         encrypted_message.link = Some(link_data);
         encrypted_message.encrypted_message = Some(EncryptedConversationMessage {
-            public_key: link.key.compress().to_vec(),
+            public_key: link_public_key,
             conversation_message_bytes: [nonce.to_vec(), encrypted].concat(),
         });
 
         let topic = "com.apple.private.alloy.facetime.multi";
-        let targets = self.identity.cache.lock().await.get_targets(
-            &topic,
-            &letmein.pseud,
-            &[letmein.requestor.clone()],
-            &[MessageTarget::Token(letmein.token)],
-        )?;
+        let targets = {
+            let cache = self.identity.cache.lock().await;
+            cache.get_targets(
+                &topic,
+                &letmein.pseud,
+                &[letmein.requestor.clone()],
+                &[MessageTarget::Token(letmein.token)],
+            )?
+        };
 
-        if let Some(delegation) = delegation.as_deref() {
-            let mut delegated_lock = self.delegated_requests.lock().await;
-            match delegated_lock.begin(delegation, manual_retry) {
-                BeginDelegatedResponse::Ready { .. } => {}
-                BeginDelegatedResponse::Missing => {
-                    warn!("FaceTime admission response skipped: stage=send error_type=missing");
-                    return Ok(());
-                }
-                BeginDelegatedResponse::AlreadyInFlight => {
-                    warn!("FaceTime admission response skipped: stage=send error_type=in_flight");
-                    return Ok(());
-                }
-                BeginDelegatedResponse::AwaitingManualRetry => {
-                    warn!(
-                        "FaceTime admission response skipped: stage=send error_type=manual_retry_required"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        let send_result = self
-            .identity
+        self.identity
             .send_message(
                 topic,
                 send_for_message(letmein.pseud.clone(), encrypted_message, None),
                 targets,
             )
-            .await;
+            .await?;
 
-        if let Err(error) = send_result {
-            if let Some(delegation) = delegation.as_deref() {
-                let failure = classify_letmein_response_failure(&error);
-                let mut delegated_lock = self.delegated_requests.lock().await;
-                // Keep the request available for an explicit retry. In
-                // particular, a timeout does not prove that Apple did not
-                // receive the response, so it must never be replayed
-                // automatically by a duplicate delegation event.
-                delegated_lock.fail(delegation, failure);
-                warn!(
-                    "FaceTime admission response failed: stage=send error_type={}",
-                    failure.log_name()
-                );
-            } else {
-                warn!("FaceTime admission response failed: stage=send error_type=transport_error");
-            }
-            return Err(error);
-        }
-
-        if let Some(delegation) = delegation.as_deref() {
+        if let Some(delegation) = delegation {
             let mut delegated_lock = self.delegated_requests.lock().await;
             delegated_lock.complete(delegation);
         }
@@ -2143,17 +2368,21 @@ impl FTClient {
         // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
         // but we don't currently assign our link to the conversation. FT Web doesn't care
 
-        let session = session_mut(&mut state.sessions, to_group)?;
         let member = FTMember {
             handle: letmein.requestor.clone(),
             nickname: letmein.nickname.clone(),
         };
+        let snapshot = approved_snapshot
+            .take()
+            .ok_or(PushError::FaceTimeStateChanged)?;
+        let mut session = snapshot.session.clone();
         if session.members.contains(&member) {
-            self.ring(session, &[letmein.requestor.clone()], true)
+            self.ring(&session, &[letmein.requestor.clone()], true)
                 .await?;
         } else {
-            self.add_members(session, vec![member], true, None).await?;
-            (self.update_state)(&state);
+            self.add_members(&mut session, vec![member], true, None)
+                .await?;
+            self.reconcile_session(snapshot, session).await?;
         }
         Ok(())
     }
@@ -2187,7 +2416,7 @@ impl FTClient {
             },
         ];
 
-        let handle = session.my_handles.first().unwrap();
+        let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity
             .cache_keys(
@@ -2252,14 +2481,12 @@ impl FTClient {
 
             match decoded.r#type() {
                 ConversationMessageType::LinkChanged | ConversationMessageType::LinkCreated => {
-                    let mut state = self.state.write().await;
-                    let session = state
-                        .sessions
-                        .entry(decoded.conversation_group_uuid_string.clone())
-                        .or_default();
-                    session.link = decoded.link.clone();
-                    let guid = session.group_id.clone();
-                    (self.update_state)(&state);
+                    let guid = decoded.conversation_group_uuid_string.clone();
+                    let link = decoded.link.clone();
+                    self.update_session_without_network(&guid, Some(&target), |session| {
+                        session.link = link;
+                    })
+                    .await?;
                     Some(FTMessage::LinkChanged { guid })
                 }
                 ConversationMessageType::EncryptedMessage => {
@@ -2270,10 +2497,7 @@ impl FTClient {
                                     &target,
                                     &sender,
                                     token,
-                                    decoded
-                                        .encrypted_message
-                                        .clone()
-                                        .ok_or(PushError::BadMsg)?,
+                                    decoded.encrypted_message.clone().ok_or(PushError::BadMsg)?,
                                 )
                                 .await?;
                             Some(FTMessage::LetMeInRequest(request))
@@ -2285,19 +2509,19 @@ impl FTClient {
                     }
                 }
                 ConversationMessageType::Decline => {
-                    let mut state = self.state.write().await;
-                    if let Some(session) = state
-                        .sessions
-                        .get_mut(&decoded.conversation_group_uuid_string)
-                    {
+                    let guid = decoded.conversation_group_uuid_string.clone();
+                    let operation = self.operation_for_session(&guid).await;
+                    let _operation_guard = operation.lock().await;
+                    if let Ok(snapshot) = self.snapshot_session(&guid).await {
+                        let mut session = snapshot.session.clone();
                         session.is_ringing_inaccurate = false;
-                        session.mode = Some(FTMode::MissedOutgoing); // mark as incoming
-                        self.unprop_conv(session).await?;
-                        (self.update_state)(&state);
+                        session.mode = Some(FTMode::MissedOutgoing);
+                        if session.is_propped {
+                            self.unprop_conv(&mut session).await?;
+                        }
+                        self.reconcile_session(snapshot, session).await?;
                     }
-                    Some(FTMessage::Decline {
-                        guid: decoded.conversation_group_uuid_string.clone(),
-                    })
+                    Some(FTMessage::Decline { guid })
                 }
                 ConversationMessageType::LetMeInDelegationResponse => {
                     let requests = self.delegated_requests.lock().await;
@@ -2319,31 +2543,21 @@ impl FTClient {
                     None
                 }
                 ConversationMessageType::Invitation => {
-                    let mut state = self.state.write().await;
-                    if let Some(session) = state
-                        .sessions
-                        .get_mut(&decoded.conversation_group_uuid_string)
-                    {
+                    let guid = decoded.conversation_group_uuid_string.clone();
+                    self.update_session_without_network(&guid, None, |session| {
                         session.is_ringing_inaccurate = true;
-                        session.mode = Some(FTMode::Incoming); // mark as incoming
-                        (self.update_state)(&state);
-                    }
-                    Some(FTMessage::Ring {
-                        guid: decoded.conversation_group_uuid_string.clone(),
+                        session.mode = Some(FTMode::Incoming);
                     })
+                    .await?;
+                    Some(FTMessage::Ring { guid })
                 }
                 ConversationMessageType::RespondedElsewhere => {
-                    let mut state = self.state.write().await;
-                    if let Some(session) = state
-                        .sessions
-                        .get_mut(&decoded.conversation_group_uuid_string)
-                    {
+                    let guid = decoded.conversation_group_uuid_string.clone();
+                    self.update_session_without_network(&guid, None, |session| {
                         session.is_ringing_inaccurate = false;
-                        (self.update_state)(&state);
-                    }
-                    Some(FTMessage::RespondedElsewhere {
-                        guid: decoded.conversation_group_uuid_string.clone(),
                     })
+                    .await?;
+                    Some(FTMessage::RespondedElsewhere { guid })
                 }
                 _type => {
                     // `r#type()` is prost's accessor, which maps any wire value
@@ -2363,15 +2577,14 @@ impl FTClient {
         } else {
             let received: Value = message.plist()?;
             let mut received: FTWireMessage = plist::from_value(&received)?;
-            let mut state = self.state.write().await;
-            let session = state.sessions.entry(received.session.clone()).or_default();
-            session.group_id = received.session.clone();
-            if !session.my_handles.contains(&target) {
-                session.my_handles.push(target.clone());
-            }
+            let group_id = received.session.clone();
+            let operation = self.operation_for_session(&group_id).await;
+            let _operation_guard = operation.lock().await;
+            let snapshot = self.snapshot_or_insert_session(&group_id, &target).await;
+            let mut session = snapshot.session.clone();
             let context = received.client_context_data_key.take();
             let participant_meta = received.participant_data_key.take(); // BORING
-            match (command, context, participant_meta, &received) {
+            let result = match (command, context, participant_meta, &received) {
                 (
                     207,
                     context,
@@ -2438,7 +2651,7 @@ impl FTClient {
                     // so we don't need to prop it anymore
                     // make sure web client to not hang up on people who are picking up for us
                     if session.is_propped && canonical_sender.starts_with("temp:") {
-                        self.unprop_conv(session).await?;
+                        self.unprop_conv(&mut session).await?;
                     }
 
                     if message_type == ConversationMessageType::Invitation {
@@ -2450,7 +2663,6 @@ impl FTClient {
                     }
 
                     let guid = session.group_id.clone();
-                    (self.update_state)(&state);
 
                     Some(FTMessage::JoinEvent {
                         guid,
@@ -2475,12 +2687,10 @@ impl FTClient {
                         // generic BadMsg error and losing the snapshot.
                         warn!("FaceTime command 209 omitted conversation metadata");
                     }
-                    let message_type = apply_conversation_message_metadata(session, message);
+                    let message_type = apply_conversation_message_metadata(&mut session, message);
                     if let Some(message) = message {
-                        session.unpack_participants(
-                            &message.active_participants,
-                            &self.conn.get_token().await,
-                        );
+                        let self_token = self.conn.get_token().await;
+                        session.unpack_participants(&message.active_participants, &self_token);
                     }
                     warn!(
                         "FaceTime signal command=209 nested_message={} message_type={} snapshot_participants={} participants={} active={}",
@@ -2504,7 +2714,7 @@ impl FTClient {
                                 // if some members we recently added were left out of this state change, we must tell
                                 // the new member that these members *do* exist and should be included in the session
                                 self.add_members(
-                                    session,
+                                    &mut session,
                                     stand_up_for,
                                     false,
                                     Some(new.iter().map(|a| a.handle.clone()).collect()),
@@ -2530,14 +2740,11 @@ impl FTClient {
                         }
                         _ => None,
                     };
-                    (self.update_state)(&state);
-
                     result
                 }
                 (210, _, _, _) => {
                     // we don't have any realtime connection so we use the peridic rekeys as heartbeats
                     session.last_rekey = Some(ns_since_epoch / 1000000);
-                    (self.update_state)(&state);
                     None
                 }
                 (
@@ -2615,7 +2822,6 @@ impl FTClient {
                             .filter(|participant| participant.active.is_some())
                             .count(),
                     );
-                    (self.update_state)(&state);
                     Some(FTMessage::LeaveEvent {
                         guid,
                         participant: id.into(),
@@ -2659,7 +2865,9 @@ impl FTClient {
                     );
                     None
                 }
-            }
+            };
+            self.reconcile_session(snapshot, session).await?;
+            result
         })
     }
 }
@@ -2667,6 +2875,9 @@ impl FTClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::{oneshot, Barrier};
+    use tokio::time::timeout;
 
     fn delegated_request() -> LetMeInRequest {
         LetMeInRequest {
@@ -2863,6 +3074,174 @@ mod tests {
             requests.load("delegation-fixture", None, true),
             BeginDelegatedResponse::Missing
         ));
+    }
+
+    #[test]
+    fn admission_claim_returns_typed_errors_without_claiming_a_second_send() {
+        let mut requests = DelegatedRequests::default();
+        assert!(matches!(
+            requests.claim("missing", None, false),
+            Err(PushError::FaceTimeAdmissionMissing)
+        ));
+
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+        requests
+            .claim("delegation-fixture", Some("group-original"), false)
+            .expect("first response should claim the request");
+        assert!(matches!(
+            requests.claim("delegation-fixture", None, false),
+            Err(PushError::FaceTimeAdmissionInFlight)
+        ));
+
+        requests.fail(
+            "delegation-fixture",
+            LetMeInResponseFailure::UnknownAfterTimeout,
+        );
+        assert!(matches!(
+            requests.claim("delegation-fixture", None, false),
+            Err(PushError::FaceTimeAdmissionManualRetryRequired)
+        ));
+        assert!(matches!(
+            requests.claim("delegation-fixture", Some("different-group"), true),
+            Ok((_, Some(group))) if group == "group-original"
+        ));
+    }
+
+    #[tokio::test]
+    async fn per_session_operation_does_not_hold_the_global_state_lock() {
+        let operations = DebugMutex::new(HashMap::new());
+        let session_operation = session_operation_for(&operations, "fixture-session").await;
+        let _session_guard = session_operation.lock().await;
+        let state = Arc::new(DebugRwLock::new(FTState::default()));
+
+        let state_writer = async {
+            let mut state = state.write().await;
+            state
+                .sessions
+                .insert("different-session".to_string(), FTSession::default());
+        };
+        timeout(Duration::from_millis(100), state_writer)
+            .await
+            .expect("per-session network serialization must not block state writers");
+    }
+
+    #[tokio::test]
+    async fn stale_session_reconciliation_fails_closed_before_overwrite() {
+        let revision = Arc::new(DebugRwLock::new(1_u64));
+        let barrier = Arc::new(Barrier::new(2));
+        let (updated_tx, updated_rx) = oneshot::channel();
+        let writer_revision = revision.clone();
+        let writer_barrier = barrier.clone();
+        let writer = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            *writer_revision.write().await = 2;
+            let _ = updated_tx.send(());
+        });
+
+        let snapshot_revision = *revision.read().await;
+        barrier.wait().await;
+        timeout(Duration::from_millis(100), updated_rx)
+            .await
+            .expect("concurrent session change must complete")
+            .expect("session-change signal must be delivered");
+        let current_revision = *revision.read().await;
+        assert!(matches!(
+            next_session_revision(current_revision, snapshot_revision),
+            Err(PushError::FaceTimeStateChanged)
+        ));
+        timeout(Duration::from_millis(100), writer)
+            .await
+            .expect("session writer must finish")
+            .expect("session writer must not panic");
+    }
+
+    #[tokio::test]
+    async fn delegation_response_can_claim_request_before_delegation_send_completes() {
+        let requests = Arc::new(DebugMutex::new(DelegatedRequests::default()));
+        let barrier = Arc::new(Barrier::new(2));
+        let (send_completion_tx, send_completion_rx) = oneshot::channel();
+        let producer_requests = requests.clone();
+        let producer_barrier = barrier.clone();
+        let producer = tokio::spawn(async move {
+            let mut requests = producer_requests.lock().await;
+            requests.insert("delegation-fixture".to_string(), delegated_request());
+            drop(requests);
+            producer_barrier.wait().await;
+            let _ = send_completion_rx.await;
+        });
+
+        barrier.wait().await;
+        let response = timeout(Duration::from_millis(100), async {
+            requests
+                .lock()
+                .await
+                .claim("delegation-fixture", Some("group-original"), false)
+        })
+        .await
+        .expect("a fast delegation response must not wait for send completion")
+        .expect("inserted delegation must be claimable exactly once");
+        assert_eq!(response.1.as_deref(), Some("group-original"));
+        assert!(matches!(
+            requests
+                .lock()
+                .await
+                .claim("delegation-fixture", Some("other-group"), false),
+            Err(PushError::FaceTimeAdmissionInFlight)
+        ));
+        let _ = send_completion_tx.send(());
+        timeout(Duration::from_millis(100), producer)
+            .await
+            .expect("simulated delegation send must complete")
+            .expect("delegation task must not panic");
+    }
+
+    #[tokio::test]
+    async fn concurrent_manual_retries_are_exactly_once_and_auto_retry_fails_closed() {
+        let requests = Arc::new(DebugMutex::new(DelegatedRequests::default()));
+        {
+            let mut requests_guard = requests.lock().await;
+            requests_guard.insert("delegation-fixture".to_string(), delegated_request());
+            requests_guard
+                .claim("delegation-fixture", Some("group-original"), false)
+                .expect("initial response may claim the request");
+            requests_guard.fail(
+                "delegation-fixture",
+                LetMeInResponseFailure::UnknownAfterTimeout,
+            );
+            assert!(matches!(
+                requests_guard.claim("delegation-fixture", None, false),
+                Err(PushError::FaceTimeAdmissionManualRetryRequired)
+            ));
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut retries = Vec::new();
+        for _ in 0..2 {
+            let requests = requests.clone();
+            let barrier = barrier.clone();
+            retries.push(tokio::spawn(async move {
+                barrier.wait().await;
+                requests
+                    .lock()
+                    .await
+                    .claim("delegation-fixture", None, true)
+            }));
+        }
+        barrier.wait().await;
+
+        let first = timeout(Duration::from_millis(100), retries.remove(0))
+            .await
+            .expect("first retry task must finish")
+            .expect("first retry task must not panic");
+        let second = timeout(Duration::from_millis(100), retries.remove(0))
+            .await
+            .expect("second retry task must finish")
+            .expect("second retry task must not panic");
+        assert!(first.is_ok() ^ second.is_ok());
+        assert!(
+            matches!(&first, Err(PushError::FaceTimeAdmissionInFlight))
+                || matches!(&second, Err(PushError::FaceTimeAdmissionInFlight))
+        );
     }
 
     #[test]
