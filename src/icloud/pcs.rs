@@ -75,13 +75,7 @@ fn share_key_not_found() -> PushError {
 
 fn decode_compact_public_key(key: &[u8]) -> Result<CompactECKey<Public>, PushError> {
     let key: [u8; 32] = key.try_into().map_err(|_| PushError::BadMsg)?;
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-    let mut context = BigNumContext::new()?;
-    let mut encoded = [0u8; 33];
-    encoded[0] = 0x03;
-    encoded[1..].copy_from_slice(&key);
-    let point = EcPoint::from_bytes(&group, &encoded, &mut context)?;
-    CompactECKey::try_from(EcKey::from_public_key(&group, &point)?)
+    CompactECKey::try_decompress(key)
 }
 
 fn decode_compact_private_key(key: &[u8]) -> Result<CompactECKey<Private>, PushError> {
@@ -1543,14 +1537,14 @@ impl PCSShareProtection {
 #[cfg(test)]
 mod tests {
     use super::{
-        require_existing_service_key_dict, share_key_not_found, PCSDigestData, PCSEncryptor,
-        PCSKey, PCSService, PCSShareProtection, PCSShareProtectionKeySet, PCSSignature,
-        MASTER_SERVICE,
+        decode_compact_public_key, require_existing_service_key_dict, share_key_not_found,
+        PCSDigestData, PCSEncryptor, PCSKey, PCSService, PCSShareProtection,
+        PCSShareProtectionKeySet, PCSSignature, MASTER_SERVICE,
     };
     use crate::{
         cloudkit::{public_zone, record_identifier},
         keychain::SavedKeychainZone,
-        util::{encode_hex, CompactECKey},
+        util::{decode_hex, encode_hex, CompactECKey},
         PushError,
     };
     use cloudkit_proto::{CloudKitEncryptor, ProtectionInfo};
@@ -1566,6 +1560,18 @@ mod tests {
                 "loggable error exposed sentinel material"
             );
         }
+    }
+
+    #[test]
+    fn compact_public_key_normalizes_the_high_y_sec1_root() -> Result<(), PushError> {
+        // The x-coordinate of 7 * P-256's generator has a low even-y root.
+        // Reconstructing it with SEC1 prefix 0x03 therefore selects the high
+        // root, which must be normalized before CompactECKey validation.
+        let bytes = decode_hex("8e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a3")?;
+        let decoded = decode_compact_public_key(&bytes)?;
+
+        assert_eq!(decoded.compress().as_slice(), bytes.as_slice());
+        Ok(())
     }
 
     #[test]
