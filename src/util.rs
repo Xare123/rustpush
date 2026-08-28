@@ -2117,14 +2117,15 @@ impl<T> DerefMut for CompactECKey<T> {
 fn compact_test() -> Result<(), PushError> {
     let create = CompactECKey::new()?;
     let public = CompactECKey::try_decompress(create.try_compress()?)?;
-    if !public.try_get_pkey()?.public_eq(&create.try_get_pkey()?) {
+    let public_pkey = public.try_get_pkey()?;
+    let private_pkey = create.try_get_pkey()?;
+    if !public_pkey.public_eq(private_pkey.as_ref()) {
         return Err(PushError::BadCompactECKey);
     }
 
     let data: [u8; 32] = rand::random();
 
     let sig = create.sign_raw(MessageDigest::sha256(), &data)?;
-    println!("what");
     public.verify(MessageDigest::sha256(), &data, sig)?;
 
     Ok(())
