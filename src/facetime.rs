@@ -612,6 +612,143 @@ pub struct LetMeInRequest {
     pub usage: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LetMeInResponseFailure {
+    UnknownAfterTimeout,
+    ConfirmedRejection,
+    TransportError,
+}
+
+impl LetMeInResponseFailure {
+    fn log_name(self) -> &'static str {
+        match self {
+            Self::UnknownAfterTimeout => "unknown_after_timeout",
+            Self::ConfirmedRejection => "confirmed_rejection",
+            Self::TransportError => "transport_error",
+        }
+    }
+}
+
+fn classify_letmein_response_failure(error: &PushError) -> LetMeInResponseFailure {
+    match error {
+        PushError::SendTimedOut => LetMeInResponseFailure::UnknownAfterTimeout,
+        PushError::APSAckError(_) => LetMeInResponseFailure::ConfirmedRejection,
+        _ => LetMeInResponseFailure::TransportError,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DelegatedResponseStatus {
+    Pending,
+    InFlight,
+    Failed(LetMeInResponseFailure),
+}
+
+struct DelegatedResponseEntry {
+    request: LetMeInRequest,
+    status: DelegatedResponseStatus,
+    // `Some(None)` is an explicit denial; `Some(Some(group))` is an
+    // acceptance. `None` means the first attempt has not captured its
+    // decision yet.
+    approved_group: Option<Option<String>>,
+}
+
+#[derive(Default)]
+pub struct DelegatedRequests {
+    requests: HashMap<String, DelegatedResponseEntry>,
+}
+
+enum BeginDelegatedResponse {
+    Ready {
+        request: LetMeInRequest,
+        approved_group: Option<String>,
+    },
+    Missing,
+    AlreadyInFlight,
+    AwaitingManualRetry,
+}
+
+impl DelegatedRequests {
+    fn insert(&mut self, delegation: String, request: LetMeInRequest) {
+        self.requests.insert(
+            delegation,
+            DelegatedResponseEntry {
+                request,
+                status: DelegatedResponseStatus::Pending,
+                approved_group: None,
+            },
+        );
+    }
+
+    fn get(&self, delegation: &str) -> Option<&LetMeInRequest> {
+        self.requests.get(delegation).map(|entry| &entry.request)
+    }
+
+    fn load(
+        &mut self,
+        delegation: &str,
+        requested_group: Option<&str>,
+        manual_retry: bool,
+    ) -> BeginDelegatedResponse {
+        let Some(entry) = self.requests.get_mut(delegation) else {
+            return BeginDelegatedResponse::Missing;
+        };
+
+        match entry.status {
+            DelegatedResponseStatus::Pending => {
+                if entry.approved_group.is_none() {
+                    entry.approved_group = Some(requested_group.map(str::to_owned));
+                }
+                BeginDelegatedResponse::Ready {
+                    request: entry.request.clone(),
+                    approved_group: entry.approved_group.clone().flatten(),
+                }
+            }
+            DelegatedResponseStatus::InFlight => BeginDelegatedResponse::AlreadyInFlight,
+            DelegatedResponseStatus::Failed(_) if manual_retry => BeginDelegatedResponse::Ready {
+                request: entry.request.clone(),
+                approved_group: entry.approved_group.clone().flatten(),
+            },
+            DelegatedResponseStatus::Failed(_) => BeginDelegatedResponse::AwaitingManualRetry,
+        }
+    }
+
+    fn begin(&mut self, delegation: &str, manual_retry: bool) -> BeginDelegatedResponse {
+        let Some(entry) = self.requests.get_mut(delegation) else {
+            return BeginDelegatedResponse::Missing;
+        };
+
+        match entry.status {
+            DelegatedResponseStatus::Pending => {
+                entry.status = DelegatedResponseStatus::InFlight;
+                BeginDelegatedResponse::Ready {
+                    request: entry.request.clone(),
+                    approved_group: entry.approved_group.clone().flatten(),
+                }
+            }
+            DelegatedResponseStatus::Failed(_) if manual_retry => {
+                entry.status = DelegatedResponseStatus::InFlight;
+                BeginDelegatedResponse::Ready {
+                    request: entry.request.clone(),
+                    approved_group: entry.approved_group.clone().flatten(),
+                }
+            }
+            DelegatedResponseStatus::InFlight => BeginDelegatedResponse::AlreadyInFlight,
+            DelegatedResponseStatus::Failed(_) => BeginDelegatedResponse::AwaitingManualRetry,
+        }
+    }
+
+    fn complete(&mut self, delegation: &str) {
+        self.requests.remove(delegation);
+    }
+
+    fn fail(&mut self, delegation: &str, failure: LetMeInResponseFailure) {
+        if let Some(entry) = self.requests.get_mut(delegation) {
+            entry.status = DelegatedResponseStatus::Failed(failure);
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct FTState {
     pub links: HashMap<String, FTLink>,
@@ -647,7 +784,7 @@ pub struct FTClient {
     _interest_token: APSInterestToken,
     pub state: DebugRwLock<FTState>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
-    pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
+    pub delegated_requests: DebugMutex<DelegatedRequests>,
 }
 
 impl FTClient {
@@ -673,7 +810,7 @@ impl FTClient {
             os_config: config,
             state: DebugRwLock::new(state),
             update_state,
-            delegated_requests: DebugMutex::new(HashMap::new()),
+            delegated_requests: DebugMutex::new(DelegatedRequests::default()),
         }
     }
 
@@ -1713,15 +1850,62 @@ impl FTClient {
         letmein: LetMeInRequest,
         approved_group: Option<&str>,
     ) -> Result<(), PushError> {
-        if let Some(delegation) = letmein.delegation_uuid {
+        self.respond_letmein_internal(letmein, approved_group, false)
+            .await
+    }
+
+    /// Retry a retained delegated admission only after an explicit user action.
+    ///
+    /// This is intentionally separate from [`Self::respond_letmein`], which is
+    /// used by automatic APS/Dart handling and must never replay a failed or
+    /// unknown response. No current FRB or UI path calls this method.
+    pub async fn retry_letmein_manually(
+        &self,
+        letmein: LetMeInRequest,
+        approved_group: Option<&str>,
+    ) -> Result<(), PushError> {
+        self.respond_letmein_internal(letmein, approved_group, true)
+            .await
+    }
+
+    async fn respond_letmein_internal(
+        &self,
+        mut letmein: LetMeInRequest,
+        approved_group: Option<&str>,
+        manual_retry: bool,
+    ) -> Result<(), PushError> {
+        let delegation = letmein.delegation_uuid.clone();
+        let mut effective_approved_group = approved_group.map(str::to_owned);
+        if let Some(delegation) = delegation.as_deref() {
             let mut shared_lock = self.delegated_requests.lock().await;
-            let removed = shared_lock.remove(&delegation);
-            if removed.is_none() {
-                warn!("Already responded to letmein, ignoring request!");
-                return Ok(()); // already responded
+            match shared_lock.load(delegation, approved_group, manual_retry) {
+                BeginDelegatedResponse::Ready {
+                    request: pending,
+                    approved_group: pending_group,
+                } => {
+                    // The retained request is authoritative after a failed
+                    // transport attempt. A manual retry must reuse the same
+                    // admission material rather than a possibly stale copy.
+                    letmein = pending;
+                    effective_approved_group = pending_group;
+                }
+                BeginDelegatedResponse::Missing => {
+                    warn!("FaceTime admission response skipped: stage=begin error_type=missing");
+                    return Ok(());
+                }
+                BeginDelegatedResponse::AlreadyInFlight => {
+                    warn!("FaceTime admission response skipped: stage=begin error_type=in_flight");
+                    return Ok(());
+                }
+                BeginDelegatedResponse::AwaitingManualRetry => {
+                    warn!(
+                        "FaceTime admission response skipped: stage=begin error_type=manual_retry_required"
+                    );
+                    return Ok(());
+                }
             }
         }
-        if let Some(approved) = approved_group {
+        if let Some(approved) = effective_approved_group.as_deref() {
             let mut state = self.state.write().await;
             let session = state
                 .sessions
@@ -1762,13 +1946,13 @@ impl FTClient {
             return Err(PushError::BadMsg);
         };
         let mut response = ConversationMessage::default();
-        response.is_let_me_in_approved = Some(approved_group.is_some());
+        response.is_let_me_in_approved = Some(effective_approved_group.is_some());
         response.set_type(ConversationMessageType::LetMeInResponse);
         let mut link_data = ConversationLink::default();
         link_data.set_link_lifetime_scope(ConversationLinkLifetimeScope::Indefinite);
         link_data.pseudonym = link.pseud.clone();
         link_data.public_key = link.key.compress().to_vec();
-        if let Some(to_group) = approved_group {
+        if let Some(to_group) = effective_approved_group.as_deref() {
             response.conversation_group_uuid_string = to_group.to_string();
             link_data.group_uuid_string = to_group.to_string();
             link_data.originator_handle = Some(handle_from_ids(&link.handle));
@@ -1805,15 +1989,62 @@ impl FTClient {
             &[letmein.requestor.clone()],
             &[MessageTarget::Token(letmein.token)],
         )?;
-        self.identity
+
+        if let Some(delegation) = delegation.as_deref() {
+            let mut delegated_lock = self.delegated_requests.lock().await;
+            match delegated_lock.begin(delegation, manual_retry) {
+                BeginDelegatedResponse::Ready { .. } => {}
+                BeginDelegatedResponse::Missing => {
+                    warn!("FaceTime admission response skipped: stage=send error_type=missing");
+                    return Ok(());
+                }
+                BeginDelegatedResponse::AlreadyInFlight => {
+                    warn!("FaceTime admission response skipped: stage=send error_type=in_flight");
+                    return Ok(());
+                }
+                BeginDelegatedResponse::AwaitingManualRetry => {
+                    warn!(
+                        "FaceTime admission response skipped: stage=send error_type=manual_retry_required"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        let send_result = self
+            .identity
             .send_message(
                 topic,
                 send_for_message(letmein.pseud.clone(), encrypted_message, None),
                 targets,
             )
-            .await?;
+            .await;
 
-        let Some(to_group) = approved_group else {
+        if let Err(error) = send_result {
+            if let Some(delegation) = delegation.as_deref() {
+                let failure = classify_letmein_response_failure(&error);
+                let mut delegated_lock = self.delegated_requests.lock().await;
+                // Keep the request available for an explicit retry. In
+                // particular, a timeout does not prove that Apple did not
+                // receive the response, so it must never be replayed
+                // automatically by a duplicate delegation event.
+                delegated_lock.fail(delegation, failure);
+                warn!(
+                    "FaceTime admission response failed: stage=send error_type={}",
+                    failure.log_name()
+                );
+            } else {
+                warn!("FaceTime admission response failed: stage=send error_type=transport_error");
+            }
+            return Err(error);
+        }
+
+        if let Some(delegation) = delegation.as_deref() {
+            let mut delegated_lock = self.delegated_requests.lock().await;
+            delegated_lock.complete(delegation);
+        }
+
+        let Some(to_group) = effective_approved_group.as_deref() else {
             return Ok(());
         };
 
@@ -2342,6 +2573,184 @@ impl FTClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delegated_request() -> LetMeInRequest {
+        LetMeInRequest {
+            shared_secret: vec![1, 2, 3],
+            pseud: "temp:fixture".to_string(),
+            requestor: "mailto:fixture@example.invalid".to_string(),
+            nickname: Some("fixture".to_string()),
+            token: vec![4, 5, 6],
+            delegation_uuid: Some("delegation-fixture".to_string()),
+            usage: Some("incomingcall".to_string()),
+        }
+    }
+
+    #[test]
+    fn admission_failure_classification_distinguishes_timeout_rejection_and_transport() {
+        assert_eq!(
+            classify_letmein_response_failure(&PushError::SendTimedOut),
+            LetMeInResponseFailure::UnknownAfterTimeout
+        );
+        assert_eq!(
+            classify_letmein_response_failure(&PushError::APSAckError(7)),
+            LetMeInResponseFailure::ConfirmedRejection
+        );
+        assert_eq!(
+            classify_letmein_response_failure(&PushError::BadMsg),
+            LetMeInResponseFailure::TransportError
+        );
+    }
+
+    #[test]
+    fn generic_retry_cannot_turn_first_attempt_accept_into_denial_after_timeout() {
+        let mut requests = DelegatedRequests::default();
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+
+        let first = requests.load("delegation-fixture", Some("group-original"), false);
+        let BeginDelegatedResponse::Ready {
+            approved_group: first_group,
+            ..
+        } = first
+        else {
+            panic!("first admission attempt should be prepared");
+        };
+        assert_eq!(first_group.as_deref(), Some("group-original"));
+
+        let claimed = requests.begin("delegation-fixture", false);
+        assert!(matches!(claimed, BeginDelegatedResponse::Ready { .. }));
+        assert!(matches!(
+            requests.begin("delegation-fixture", false),
+            BeginDelegatedResponse::AlreadyInFlight
+        ));
+
+        requests.fail(
+            "delegation-fixture",
+            LetMeInResponseFailure::UnknownAfterTimeout,
+        );
+
+        // A generic dispatcher retry may see a now-missing room and request a
+        // denial. It must stop at the retained unknown outcome instead.
+        assert!(matches!(
+            requests.load("delegation-fixture", None, false),
+            BeginDelegatedResponse::AwaitingManualRetry
+        ));
+
+        let manual = requests.load("delegation-fixture", None, true);
+        let BeginDelegatedResponse::Ready {
+            approved_group: manual_group,
+            ..
+        } = manual
+        else {
+            panic!("manual retry should reuse retained admission decision");
+        };
+        assert_eq!(manual_group.as_deref(), Some("group-original"));
+    }
+
+    #[test]
+    fn confirmed_rejection_and_transport_failure_are_retained_for_manual_retry() {
+        for failure in [
+            LetMeInResponseFailure::ConfirmedRejection,
+            LetMeInResponseFailure::TransportError,
+        ] {
+            let mut requests = DelegatedRequests::default();
+            requests.insert("delegation-fixture".to_string(), delegated_request());
+            assert!(matches!(
+                requests.load("delegation-fixture", Some("group-original"), false),
+                BeginDelegatedResponse::Ready { .. }
+            ));
+            assert!(matches!(
+                requests.begin("delegation-fixture", false),
+                BeginDelegatedResponse::Ready { .. }
+            ));
+            requests.fail("delegation-fixture", failure);
+            assert!(matches!(
+                requests.load("delegation-fixture", None, true),
+                BeginDelegatedResponse::Ready {
+                    approved_group: Some(_),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn fresh_ordinary_response_after_failure_still_requires_manual_retry() {
+        let mut requests = DelegatedRequests::default();
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+
+        assert!(matches!(
+            requests.load("delegation-fixture", Some("group-original"), false),
+            BeginDelegatedResponse::Ready { .. }
+        ));
+        assert!(matches!(
+            requests.begin("delegation-fixture", false),
+            BeginDelegatedResponse::Ready { .. }
+        ));
+        requests.fail(
+            "delegation-fixture",
+            LetMeInResponseFailure::UnknownAfterTimeout,
+        );
+
+        // A redelivered APS message can look like a fresh dispatcher event
+        // with retryCount=0. It is still an ordinary automatic response path,
+        // so neither preparing nor claiming it may replay the retained send.
+        assert!(matches!(
+            requests.load("delegation-fixture", None, false),
+            BeginDelegatedResponse::AwaitingManualRetry
+        ));
+        assert!(matches!(
+            requests.begin("delegation-fixture", false),
+            BeginDelegatedResponse::AwaitingManualRetry
+        ));
+    }
+
+    #[test]
+    fn successful_response_consumes_pending_request_and_duplicate_is_ignored() {
+        let mut requests = DelegatedRequests::default();
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+        assert!(matches!(
+            requests.load("delegation-fixture", None, false),
+            BeginDelegatedResponse::Ready { .. }
+        ));
+        assert!(matches!(
+            requests.begin("delegation-fixture", false),
+            BeginDelegatedResponse::Ready { .. }
+        ));
+        requests.complete("delegation-fixture");
+        assert!(matches!(
+            requests.load("delegation-fixture", None, true),
+            BeginDelegatedResponse::Missing
+        ));
+    }
+
+    #[test]
+    fn admission_diagnostic_log_values_are_fixed_non_sensitive_categories() {
+        for failure in [
+            LetMeInResponseFailure::UnknownAfterTimeout,
+            LetMeInResponseFailure::ConfirmedRejection,
+            LetMeInResponseFailure::TransportError,
+        ] {
+            let value = failure.log_name();
+            assert!(value
+                .chars()
+                .all(|character| { character.is_ascii_lowercase() || character == '_' }));
+            for forbidden in ["http", "guid", "token", "secret", "message", "@"] {
+                assert!(!value.contains(forbidden));
+            }
+        }
+
+        for line in include_str!("facetime.rs")
+            .lines()
+            .filter(|line| line.contains("FaceTime admission response"))
+        {
+            assert!(!line.contains("{:?}"));
+            assert!(!line.contains("{error}"));
+            assert!(!line.contains("{id}"));
+            assert!(!line.contains("{token}"));
+            assert!(!line.contains("{secret}"));
+        }
+    }
 
     #[test]
     fn outgoing_video_invitation_sets_consistent_av_metadata() {
