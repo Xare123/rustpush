@@ -1567,7 +1567,8 @@ mod tests {
         // The x-coordinate of 7 * P-256's generator has a low even-y root.
         // Reconstructing it with SEC1 prefix 0x03 therefore selects the high
         // root, which must be normalized before CompactECKey validation.
-        let bytes = decode_hex("8e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a3")?;
+        let bytes = decode_hex("8e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a3")
+            .expect("valid fixed P-256 x-coordinate");
         let decoded = decode_compact_public_key(&bytes)?;
 
         assert_eq!(decoded.compress().as_slice(), bytes.as_slice());
