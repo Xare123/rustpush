@@ -1838,6 +1838,19 @@ impl FTClient {
         Ok(())
     }
 
+    /// Declines one conversation without retaining the global FaceTime state
+    /// lock across allocation, key lookup, or transport work.
+    pub async fn decline_session(&self, group_id: &str) -> Result<(), PushError> {
+        let operation = self.operation_for_session(group_id).await;
+        let _operation_guard = operation.lock().await;
+        let snapshot = self.snapshot_session(group_id).await?;
+        let mut session = snapshot.session.clone();
+        self.ensure_allocations(&mut session, &[]).await?;
+        self.decline_invite(&mut session).await?;
+        self.reconcile_session(snapshot, session).await?;
+        Ok(())
+    }
+
     pub async fn unprop_conv(&self, session: &mut FTSession) -> Result<(), PushError> {
         let my_participant = session
             .get_participant(self.conn.get_token().await)
@@ -1927,6 +1940,18 @@ impl FTClient {
         my_participant.active = None; // we left, remember?
 
         session.is_propped = false;
+        Ok(())
+    }
+
+    /// Leaves one conversation without retaining the global FaceTime state
+    /// lock across key lookup or transport work.
+    pub async fn cancel_session(&self, group_id: &str) -> Result<(), PushError> {
+        let operation = self.operation_for_session(group_id).await;
+        let _operation_guard = operation.lock().await;
+        let snapshot = self.snapshot_session(group_id).await?;
+        let mut session = snapshot.session.clone();
+        self.unprop_conv(&mut session).await?;
+        self.reconcile_session(snapshot, session).await?;
         Ok(())
     }
 
