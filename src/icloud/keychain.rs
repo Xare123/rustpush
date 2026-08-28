@@ -865,7 +865,9 @@ pub struct KeychainClient<P: AnisetteProvider> {
     pub config: Arc<dyn OSConfig>,
     pub update_state: Box<dyn Fn(&KeychainClientState) + Send + Sync>,
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    pub container_initialization: Mutex<()>,
     pub security_container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    pub security_container_initialization: Mutex<()>,
     pub client: Arc<CloudKitClient<P>>,
 }
 
@@ -1618,14 +1620,16 @@ impl ReadOnlyCuttlefishMethod {
 
 impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        let mut locked = self.container.lock().await;
-        if let Some(container) = &*locked {
-            return Ok(container.clone());
+        if let Some(container) = self.container.lock().await.as_ref().cloned() {
+            return Ok(container);
         }
-        *locked = Some(Arc::new(
-            CUTTLEFISH_CONTAINER.init(self.client.clone()).await?,
-        ));
-        return Ok(locked.clone().unwrap());
+        let _initialization = self.container_initialization.lock().await;
+        if let Some(container) = self.container.lock().await.as_ref().cloned() {
+            return Ok(container);
+        }
+        let container = Arc::new(CUTTLEFISH_CONTAINER.init(self.client.clone()).await?);
+        *self.container.lock().await = Some(container.clone());
+        Ok(container)
     }
 
     /// Returns only an already-open Cuttlefish container. Semantic decode must
@@ -1644,14 +1648,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn get_security_container(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        let mut locked = self.security_container.lock().await;
-        if let Some(container) = &*locked {
-            return Ok(container.clone());
+        if let Some(container) = self.security_container.lock().await.as_ref().cloned() {
+            return Ok(container);
         }
-        *locked = Some(Arc::new(
-            SECURITYD_CONTAINER.init(self.client.clone()).await?,
-        ));
-        return Ok(locked.clone().unwrap());
+        let _initialization = self.security_container_initialization.lock().await;
+        if let Some(container) = self.security_container.lock().await.as_ref().cloned() {
+            return Ok(container);
+        }
+        let container = Arc::new(SECURITYD_CONTAINER.init(self.client.clone()).await?);
+        *self.security_container.lock().await = Some(container.clone());
+        Ok(container)
     }
 
     /// Returns only an already-open keychain database container. It never

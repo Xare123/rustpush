@@ -1919,6 +1919,7 @@ mod cloud_message_save_tests {
 
 pub struct CloudMessagesClient<P: AnisetteProvider> {
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    container_initialization: Mutex<()>,
     pub client: Arc<CloudKitClient<P>>,
     pub keychain: Arc<KeychainClient<P>>,
 }
@@ -1927,6 +1928,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     pub fn new(client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>) -> Self {
         Self {
             container: Mutex::new(None),
+            container_initialization: Mutex::new(()),
             client,
             keychain,
         }
@@ -1940,6 +1942,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     ) -> Self {
         Self {
             container: Mutex::new(Some(container)),
+            container_initialization: Mutex::new(()),
             client,
             keychain,
         }
@@ -1958,17 +1961,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        let mut locked = self.container.lock().await;
-        if let Some(container) = &*locked {
-            return Ok(container.clone());
+        if let Some(container) = self.container.lock().await.as_ref().cloned() {
+            return Ok(container);
+        }
+        let _initialization = self.container_initialization.lock().await;
+        if let Some(container) = self.container.lock().await.as_ref().cloned() {
+            return Ok(container);
         }
         let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
-        *locked = Some(container.clone());
+        *self.container.lock().await = Some(container.clone());
         Ok(container)
     }
 
-    /// Returns only a container opened by explicit prior authentication.
-    /// Semantic decode must not invoke `ckAppInit` or refresh login state.
+    /// Returns only a container opened by the explicit Cloud Sync V2 auth
+    /// snapshot (or another reviewed authentication path). Semantic fetch and
+    /// decode must not invoke `ckAppInit` or refresh login state themselves.
     pub async fn get_container_lookup_only(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
@@ -1983,7 +1990,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     /// Fetches one stable MessageEncryptedV3 record for ambiguous-write
     /// reconciliation. The read-only CloudKit primitive may retry safely, but
     /// only an explicit per-record NOT_FOUND is evidence that create replay is
-    /// safe. Every other failure remains unresolved.
+    /// safe. Every other failure remains unresolved. Container and PCS state
+    /// must already be warm; reconciliation never initializes CloudKit,
+    /// creates a zone, or mutates Cuttlefish trust.
     pub async fn lookup_message_record(
         &self,
         server_record_name: &str,
@@ -1991,10 +2000,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         if server_record_name.is_empty() || server_record_name.len() > 4096 {
             return Err(PushError::BadMsg);
         }
-        let container = self.get_container().await?;
+        let container = self.get_container_lookup_only().await?;
         let zone = container.private_zone("messageManateeZone".to_string());
         let key = container
-            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
             .await?;
         let operations = [FetchRecordOperation::new(
             &NO_ASSETS,
@@ -2049,6 +2058,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     /// ambiguity boundary. Existing mapped-record updates are unsupported
     /// until predecessor ETag binding is fixture-proven and durably persisted.
     ///
+    /// Container and PCS state must already be warm. Preparation may refresh
+    /// the submission authentication token, but it never initializes a
+    /// CloudKit container, creates a zone, or mutates Cuttlefish trust.
+    ///
     /// `messages` is deliberately an ordered vector instead of a map. Its
     /// local operation IDs, server record names, message payloads, and the
     /// caller's persisted operation UUIDs are paired by position. Only local
@@ -2064,10 +2077,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             return Err(PushError::BadMsg);
         }
         let ordered_pairs = ordered_message_save_pairs(&messages, &request_identity)?;
-        let container = self.get_container().await?;
+        let container = self.get_container_lookup_only().await?;
         let zone = container.private_zone("messageManateeZone".to_string());
         let key = container
-            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
             .await?;
 
         let mut operations = Vec::with_capacity(messages.len());

@@ -807,7 +807,9 @@ async fn main() {
             plist::to_file_xml(&id_path, update).unwrap();
         }),
         container: tokio::sync::Mutex::new(None),
+        container_initialization: tokio::sync::Mutex::new(()),
         security_container: tokio::sync::Mutex::new(None),
+        security_container_initialization: tokio::sync::Mutex::new(()),
         client: cloudkit.clone(),
     });
 

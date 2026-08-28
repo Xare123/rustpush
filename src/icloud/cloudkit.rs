@@ -2803,6 +2803,30 @@ pub struct CloudKitContainer<'t> {
     pub env: cloudkit_proto::request_operation::header::ContainerEnvironment,
 }
 
+#[derive(Default)]
+struct CkAppInitRetryBudget {
+    attempts: u8,
+    refreshes: u8,
+}
+
+impl CkAppInitRetryBudget {
+    fn begin_attempt(&mut self) -> Result<(), PushError> {
+        if self.attempts >= 2 {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        self.attempts += 1;
+        Ok(())
+    }
+
+    fn authorize_refresh(&mut self) -> Result<(), PushError> {
+        if self.attempts != 1 || self.refreshes != 0 {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        self.refreshes = 1;
+        Ok(())
+    }
+}
+
 impl<'t> CloudKitContainer<'t> {
     async fn headers<T: AnisetteProvider>(
         &self,
@@ -2858,7 +2882,7 @@ impl<'t> CloudKitContainer<'t> {
         client: Arc<CloudKitClient<T>>,
     ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
         let session = CloudKitSession::new();
-        let state = client.state.read().await;
+        let dsid = client.state.read().await.dsid.clone();
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -2866,31 +2890,34 @@ impl<'t> CloudKitContainer<'t> {
             cloud_kit_user_id: String,
         }
 
-        let mme_token = client.token_provider.get_mme_token("mmeAuthToken").await?;
-        let init_request_uuid = Uuid::new_v4().to_string().to_uppercase();
+        let mut retry_budget = CkAppInitRetryBudget::default();
+        let response = loop {
+            retry_budget.begin_attempt()?;
+            let mme_token = client.token_provider.get_mme_token("mmeAuthToken").await?;
+            let init_request_uuid = Uuid::new_v4().to_string().to_uppercase();
+            let response = self
+                .headers(
+                    &client,
+                    REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"),
+                    &session,
+                    &self.database_type,
+                    &init_request_uuid,
+                    None,
+                )
+                .await?
+                .query(&[("container", &self.containerid)])
+                .basic_auth(&dsid, Some(&mme_token))
+                .send()
+                .await?;
 
-        let response = self
-            .headers(
-                &client,
-                REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"),
-                &session,
-                &self.database_type,
-                &init_request_uuid,
-                None,
-            )
-            .await?
-            .query(&[("container", &self.containerid)])
-            .basic_auth(&state.dsid, Some(&mme_token))
-            .send()
-            .await?;
-
-        if response.status().as_u16() == 401 {
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                break response;
+            }
+            retry_budget.authorize_refresh()?;
             client.token_provider.refresh_mme().await?;
-        }
+        };
 
         let response: CkInitResponse = response.json().await?;
-
-        drop(state);
 
         Ok(CloudKitOpenContainer {
             database_type: self.database_type,
@@ -4823,7 +4850,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 mod cloud_sync_transport_tests {
     use super::*;
     use crate::{
-        cloud_messages::{CloudMessageRecordKind, CloudMessagesClient},
+        cloud_messages::{
+            CloudMessage, CloudMessageRecordKind, CloudMessageSaveInput, CloudMessagesClient,
+        },
         keychain::KeychainClientState,
         util::ungzip,
     };
@@ -5066,7 +5095,9 @@ mod cloud_sync_transport_tests {
             config: open.client.config.clone(),
             update_state: Box::new(|_| {}),
             container: tokio::sync::Mutex::new(None),
+            container_initialization: tokio::sync::Mutex::new(()),
             security_container: tokio::sync::Mutex::new(None),
+            security_container_initialization: tokio::sync::Mutex::new(()),
             client: open.client.clone(),
         })
     }
@@ -5317,6 +5348,71 @@ mod cloud_sync_transport_tests {
         fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
             Some(SemanticReadOperation::FetchRecordChanges)
         }
+    }
+
+    #[test]
+    fn ck_app_init_unauthorized_retry_is_bounded_to_two_attempts_and_one_refresh() {
+        let mut budget = CkAppInitRetryBudget::default();
+
+        budget.begin_attempt().expect("first request");
+        budget.authorize_refresh().expect("one refresh");
+        budget.begin_attempt().expect("single retry");
+
+        assert_eq!(budget.attempts, 2);
+        assert_eq!(budget.refreshes, 1);
+        assert!(matches!(
+            budget.authorize_refresh(),
+            Err(PushError::UnauthorizedAccountError)
+        ));
+        assert!(matches!(
+            budget.begin_attempt(),
+            Err(PushError::UnauthorizedAccountError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cold_v2_prepare_and_reconcile_never_implicitly_warm_or_mutate() {
+        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER));
+        let keychain = semantic_test_keychain(&open);
+        let cloud_messages = CloudMessagesClient::new(open.client.clone(), keychain);
+        let transport = FaithfulSemanticTransport::default();
+        let operation_uuid = "AAAAAAAA-BBBB-4CCC-8DDD-000000000001";
+        let request_identity = CloudKitRequestIdentity::new(
+            "11111111-2222-4ABC-8DEF-555555555555".to_owned(),
+            vec![operation_uuid.to_owned()],
+        )
+        .expect("request identity");
+        let input = CloudMessageSaveInput {
+            local_operation_id: "local-operation".to_owned(),
+            server_record_name: "stable-server-record".to_owned(),
+            apple_operation_uuid: operation_uuid.to_owned(),
+            message: CloudMessage::default(),
+        };
+
+        let (lookup, prepare) = with_cloudkit_test_transport(transport.transport(), async {
+            let lookup = cloud_messages
+                .lookup_message_record("stable-server-record")
+                .await;
+            let prepare = cloud_messages
+                .prepare_message_save_submission(
+                    vec![input],
+                    request_identity,
+                    Duration::from_secs(30),
+                )
+                .await;
+            (lookup, prepare)
+        })
+        .await;
+
+        assert!(matches!(
+            lookup,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(matches!(
+            prepare,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(transport.recorded().is_empty());
     }
 
     #[tokio::test]
