@@ -426,6 +426,48 @@ impl KeyCache {
             .collect()
     }
 
+    fn is_bridge_owned_push_token(
+        push_token: &[u8],
+        bridge_devices: &[PrivateDeviceInfo],
+        bridge_device_uuid: &str,
+    ) -> bool {
+        bridge_devices
+            .iter()
+            .any(|device| {
+                device.uuid.as_deref() == Some(bridge_device_uuid)
+                    && device.token.as_slice() == push_token
+            })
+    }
+
+    /// Build targets for the own-handle admission update without fanning out
+    /// to any current or stale registration belonging to this bridge.
+    pub fn get_participants_targets_excluding_bridge_devices(
+        &self,
+        service: &str,
+        handle: &str,
+        participants: &[String],
+        bridge_device_uuid: &str,
+    ) -> Vec<DeliveryHandle> {
+        let targets = self.get_participants_targets(service, handle, participants);
+        let bridge_devices = self
+            .cache
+            .get("com.apple.madrid")
+            .and_then(|handles| handles.get(handle))
+            .map(|cached| cached.private_data.as_slice())
+            .unwrap_or(&[]);
+
+        targets
+            .into_iter()
+            .filter(|target| {
+                !Self::is_bridge_owned_push_token(
+                    &target.delivery_data.push_token,
+                    bridge_devices,
+                    bridge_device_uuid,
+                )
+            })
+            .collect()
+    }
+
     pub fn get_keys(&self, service: &str, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
         let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
             return vec![];
@@ -480,6 +522,47 @@ impl KeyCache {
             },
         );
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bridge_device(token: &[u8], uuid: &str) -> PrivateDeviceInfo {
+        PrivateDeviceInfo {
+            uuid: Some(uuid.to_string()),
+            device_name: None,
+            token: token.to_vec(),
+            is_hsa_trusted: true,
+            identites: vec![],
+            sub_services: vec![],
+        }
+    }
+
+    #[test]
+    fn responded_elsewhere_excludes_current_and_stale_bridge_identities() {
+        let bridge_devices = [
+            bridge_device(&[1], "bridge-device"),
+            bridge_device(&[2], "bridge-device"),
+            bridge_device(&[3], "other-device"),
+        ];
+
+        assert!(KeyCache::is_bridge_owned_push_token(
+            &[1],
+            &bridge_devices,
+            "bridge-device"
+        ));
+        assert!(KeyCache::is_bridge_owned_push_token(
+            &[2],
+            &bridge_devices,
+            "bridge-device"
+        ));
+        assert!(!KeyCache::is_bridge_owned_push_token(
+            &[3],
+            &bridge_devices,
+            "bridge-device"
+        ));
     }
 }
 
@@ -949,6 +1032,23 @@ impl IdentityResource {
             .unwrap()
             .private_data;
         Ok(private_self.clone())
+    }
+
+    pub async fn get_participants_targets_excluding_bridge_devices(
+        &self,
+        service: &str,
+        handle: &str,
+        participants: &[String],
+    ) -> Result<Vec<DeliveryHandle>, PushError> {
+        self.get_sms_targets(handle, false).await?;
+        let bridge_device_uuid = self.config.get_device_uuid();
+        let cache = self.cache.lock().await;
+        Ok(cache.get_participants_targets_excluding_bridge_devices(
+            service,
+            handle,
+            participants,
+            &bridge_device_uuid,
+        ))
     }
 
     // gets phone handles *REGISTERED BY THIS DEVICE*

@@ -146,6 +146,8 @@ pub enum PushError {
     AESGCMError,
     #[error("Missing handle")]
     NoHandle,
+    #[error("FaceTime session not found")]
+    FaceTimeSessionNotFound,
     #[error("NoParticipantTokenIndex")]
     NoParticipantTokenIndex,
     #[error("Resource generate timeout")]

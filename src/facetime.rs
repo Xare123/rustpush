@@ -755,6 +755,15 @@ pub struct FTState {
     pub sessions: HashMap<String, FTSession>,
 }
 
+fn session_mut<'a>(
+    sessions: &'a mut HashMap<String, FTSession>,
+    group: &str,
+) -> Result<&'a mut FTSession, PushError> {
+    sessions
+        .get_mut(group)
+        .ok_or(PushError::FaceTimeSessionNotFound)
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct FTWireMessage {
@@ -1346,11 +1355,14 @@ impl FTClient {
                 )
                 .await?;
 
-            let targets = self.identity.cache.lock().await.get_participants_targets(
-                &topic,
-                handle,
-                &relevant_people,
-            );
+            let targets = self
+                .identity
+                .get_participants_targets_excluding_bridge_devices(
+                    topic,
+                    handle,
+                    &relevant_people,
+                )
+                .await?;
             self.identity
                 .send_message(
                     topic,
@@ -1907,10 +1919,7 @@ impl FTClient {
         }
         if let Some(approved) = effective_approved_group.as_deref() {
             let mut state = self.state.write().await;
-            let session = state
-                .sessions
-                .get_mut(approved)
-                .expect("Approved session not found!");
+            let session = session_mut(&mut state.sessions, approved)?;
             // MUST prop before we create a session link so caller associates our session properly
 
             // this is for when the call is in a OneOnOne mode AND there is only ONE participant in the call
@@ -2052,7 +2061,7 @@ impl FTClient {
         // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
         // but we don't currently assign our link to the conversation. FT Web doesn't care
 
-        let session = state.sessions.get_mut(to_group).expect("No session");
+        let session = session_mut(&mut state.sessions, to_group)?;
         let member = FTMember {
             handle: letmein.requestor.clone(),
             nickname: letmein.nickname.clone(),
@@ -2600,6 +2609,53 @@ mod tests {
             classify_letmein_response_failure(&PushError::BadMsg),
             LetMeInResponseFailure::TransportError
         );
+    }
+
+    #[test]
+    fn missing_admission_session_returns_typed_error() {
+        let mut sessions = HashMap::new();
+        let result = session_mut(&mut sessions, "missing-group");
+
+        match result {
+            Err(PushError::FaceTimeSessionNotFound) => {}
+            _ => panic!("missing FaceTime session must return a typed error"),
+        }
+    }
+
+    #[test]
+    fn retained_letmein_approval_survives_mutable_room_state_changes() {
+        let mut requests = DelegatedRequests::default();
+        requests.insert("delegation-fixture".to_string(), delegated_request());
+
+        assert!(matches!(
+            requests.load("delegation-fixture", Some("group-original"), false),
+            BeginDelegatedResponse::Ready {
+                approved_group: Some(group),
+                ..
+            } if group == "group-original"
+        ));
+        assert!(matches!(
+            requests.begin("delegation-fixture", false),
+            BeginDelegatedResponse::Ready { .. }
+        ));
+        requests.fail(
+            "delegation-fixture",
+            LetMeInResponseFailure::UnknownAfterTimeout,
+        );
+
+        // The room may disappear or the UI may now propose denial. The
+        // retained admission decision remains authoritative.
+        assert!(matches!(
+            requests.load("delegation-fixture", None, false),
+            BeginDelegatedResponse::AwaitingManualRetry
+        ));
+        assert!(matches!(
+            requests.load("delegation-fixture", None, true),
+            BeginDelegatedResponse::Ready {
+                approved_group: Some(group),
+                ..
+            } if group == "group-original"
+        ));
     }
 
     #[test]
