@@ -580,12 +580,8 @@ pub struct PasswordManagerMetaDataCtx {
 
 impl PasswordManagerMeta {
     pub fn get_password_data(&self) -> Result<PasswordManagerMetaData, PushError> {
-        if let Err(e) = plist::from_bytes::<PasswordManagerMetaData>(self.data.as_ref()) {
-            warn!(
-                "Err decoding password data {e} {:?} {:?}",
-                plist::from_bytes::<Value>(self.data.as_ref()),
-                self
-            );
+        if plist::from_bytes::<PasswordManagerMetaData>(self.data.as_ref()).is_err() {
+            warn!("Unable to decode one iCloud password metadata payload");
         }
         Ok(plist::from_bytes(self.data.as_ref())?)
     }
