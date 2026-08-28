@@ -177,10 +177,14 @@ impl FTLink {
     pub fn get_link(&self) -> Result<String, PushError> {
         let public = self.key.compress();
         let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&public);
+        let pseudonym = self
+            .pseud
+            .strip_prefix("temp:")
+            .ok_or(PushError::BadMsg)?;
 
         Ok(format!(
             "https://facetime.apple.com/join#v=1&p={}&k={}",
-            &self.pseud[6..],
+            pseudonym,
             encoded
         ))
     }
@@ -305,7 +309,12 @@ impl FTSession {
                 self.recent_member_adds.contains_key(&a.handle)
                     && !members
                         .iter()
-                        .any(|i| handle_to_ids(i.handle.as_ref().expect("No handle?")) == a.handle)
+                        .any(|i| {
+                            i.handle
+                                .as_ref()
+                                .map(|handle| handle_to_ids(handle) == a.handle)
+                                .unwrap_or(false)
+                        })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -334,9 +343,11 @@ impl FTSession {
     fn new_members(&mut self, members: &[ConversationMember]) -> HashSet<FTMember> {
         let mut new_items: HashSet<FTMember> = members
             .iter()
-            .map(|a| FTMember {
-                nickname: a.nickname.clone(),
-                handle: handle_to_ids(a.handle.as_ref().expect("No handle?")),
+            .filter_map(|a| {
+                Some(FTMember {
+                    nickname: a.nickname.clone(),
+                    handle: handle_to_ids(a.handle.as_ref()?),
+                })
             })
             .collect();
         new_items.retain(|i| !self.members.contains(i));
@@ -347,9 +358,11 @@ impl FTSession {
     fn remove_members(&mut self, members: &[ConversationMember]) -> HashSet<FTMember> {
         let mut removed_members: HashSet<FTMember> = members
             .iter()
-            .map(|a| FTMember {
-                nickname: a.nickname.clone(),
-                handle: handle_to_ids(a.handle.as_ref().expect("No handle?")),
+            .filter_map(|a| {
+                Some(FTMember {
+                    nickname: a.nickname.clone(),
+                    handle: handle_to_ids(a.handle.as_ref()?),
+                })
             })
             .collect();
         removed_members.retain(|i| self.members.contains(i));
@@ -366,11 +379,14 @@ impl FTSession {
         // A non-empty participant list may still be a partial subset. Merge
         // listed participants and let command 208 own active-state removal.
         for participant in participants {
+            let Some(handle) = participant.handle.as_ref() else {
+                continue;
+            };
             let ftparticipant = self
                 .participants
                 .entry(participant.identifier.to_string())
                 .or_default();
-            ftparticipant.handle = handle_to_ids(participant.handle.as_ref().expect("No handle?"));
+            ftparticipant.handle = handle_to_ids(handle);
             ftparticipant.participant_id = participant.identifier;
             // don't let other participants tell us whether we are active or not
             if Some(base64_encode(&token)) != ftparticipant.token {
@@ -1099,19 +1115,38 @@ impl FTClient {
     }
 
     pub async fn get_session_link(&self, guid: &str) -> Result<String, PushError> {
-        let mut state = self.state.write().await;
-        let state = &mut *state;
-        let session = state.sessions.get_mut(guid).expect("No session found!");
-        let my_handle = session.my_handles.first().expect("No handle").clone();
-        if let Some(link) = &session.link {
+        let (my_handle, group_id, members, existing_link) = {
+            let state = self.state.read().await;
+            let session = state
+                .sessions
+                .get(guid)
+                .ok_or(PushError::FaceTimeSessionNotFound)?;
+            (
+                session
+                    .my_handles
+                    .first()
+                    .cloned()
+                    .ok_or(PushError::NoHandle)?,
+                session.group_id.clone(),
+                session.members.clone(),
+                session.link.clone(),
+            )
+        };
+
+        if let Some(link) = existing_link {
             let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
+            let pseudonym = link
+                .pseudonym
+                .strip_prefix("temp:")
+                .ok_or(PushError::BadMsg)?;
             return Ok(format!(
                 "https://facetime.apple.com/join#v=1&p={}&k={}",
-                &link.pseudonym[6..],
-                encoded
+                pseudonym, encoded
             ));
         }
 
+        // Pseudonym creation is network-bound. Do not hold the FaceTime state
+        // lock while waiting for Apple.
         let mut link_obj = self
             .new_link(
                 &my_handle,
@@ -1119,20 +1154,18 @@ impl FTClient {
                 Duration::from_secs(31536000), /* year */
             )
             .await?;
-        link_obj.session_link = Some(session.group_id.clone());
+        link_obj.session_link = Some(group_id.clone());
         let conversation_link = ConversationLink {
             pseudonym: link_obj.pseud.clone(),
             public_key: link_obj.key.compress().to_vec(),
             private_key: vec![],
-            invited_handles: session
-                .members
-                .clone()
+            invited_handles: members
                 .into_iter()
                 .filter(|a| a.handle != my_handle)
                 .map(|a| handle_from_ids(&a.handle))
                 .collect(),
             creation_date_epoch_time: link_obj.creation_time as f64 / 1000f64,
-            group_uuid_string: session.group_id.clone(),
+            group_uuid_string: group_id.clone(),
             originator_handle: Some(handle_from_ids(&my_handle)),
             pseudonym_expiration_date_epoch_time: link_obj.expiry_time as f64 / 1000f64,
             is_activated: true,
@@ -1144,13 +1177,32 @@ impl FTClient {
         let mut message = ConversationMessage::default();
         message.link = Some(conversation_link.clone());
         message.set_type(ConversationMessageType::LinkCreated);
-        message.conversation_group_uuid_string = session.group_id.clone();
+        message.conversation_group_uuid_string = group_id;
 
         let link = link_obj.get_link()?;
-        session.link = Some(conversation_link);
-        state.links.insert(link_obj.pseud.clone(), link_obj);
+        let session_for_message = {
+            let mut state = self.state.write().await;
+            if let Some(existing) = state.sessions.get(guid).and_then(|s| s.link.as_ref()) {
+                let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&existing.public_key);
+                let pseudonym = existing
+                    .pseudonym
+                    .strip_prefix("temp:")
+                    .ok_or(PushError::BadMsg)?;
+                return Ok(format!(
+                    "https://facetime.apple.com/join#v=1&p={}&k={}",
+                    pseudonym, encoded
+                ));
+            }
+            let session_for_message = {
+                let session = session_mut(&mut state.sessions, guid)?;
+                session.link = Some(conversation_link);
+                session.clone()
+            };
+            state.links.insert(link_obj.pseud.clone(), link_obj);
+            session_for_message
+        };
 
-        self.message_session(my_handle, message, session, None)
+        self.message_session(my_handle, message, &session_for_message, None)
             .await?;
 
         Ok(link)
@@ -1527,7 +1579,11 @@ impl FTClient {
         message.set_type(ConversationMessageType::Decline);
         message.conversation_group_uuid_string = session.group_id.clone();
 
-        let my_handle = session.my_handles.first().expect("No Handle??").clone();
+        let my_handle = session
+            .my_handles
+            .first()
+            .cloned()
+            .ok_or(PushError::NoHandle)?;
 
         let alive_tokens: Vec<MessageTarget> = session
             .participants
@@ -1786,8 +1842,13 @@ impl FTClient {
             return Err(PushError::BadMsg);
         };
 
-        let other_pubkey =
-            CompactECKey::decompress(encrypted.public_key.try_into().expect("Bad pubkey length!"));
+        let public_key: [u8; 32] = encrypted
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| PushError::BadMsg)?;
+        let other_pubkey = std::panic::catch_unwind(|| CompactECKey::decompress(public_key))
+            .map_err(|_| PushError::BadMsg)?;
         info!("A");
 
         let a = link.key.get_pkey();
@@ -1804,6 +1865,9 @@ impl FTClient {
             .expect("Failed to expand key!");
         info!("C");
 
+        if encrypted.conversation_message_bytes.len() < NONCE_COUNT {
+            return Err(PushError::BadMsg);
+        }
         let nonce = &encrypted.conversation_message_bytes[..NONCE_COUNT];
         let body = &encrypted.conversation_message_bytes[NONCE_COUNT..];
 
@@ -1842,7 +1906,7 @@ impl FTClient {
             delegate.conversation_group_uuid_string = session.group_id.clone();
             delegate.let_me_in_delegation_handle = request.requestor.clone();
             delegate.let_me_in_delegation_uuid = delegate_uuid.clone();
-            let my_handle = session.my_handles.first().expect("No Handle??");
+            let my_handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
             // context if missing is
             //  6045   0    callservicesd: [com.apple.calls.callservicesd:Default] [WARN] Dropping let me in delegation request or response because it has the wrong intent {publicIntentAction: (null)}
             self.message_session(my_handle.clone(), delegate, session, Some(20001))
@@ -1870,7 +1934,8 @@ impl FTClient {
     ///
     /// This is intentionally separate from [`Self::respond_letmein`], which is
     /// used by automatic APS/Dart handling and must never replay a failed or
-    /// unknown response. No current FRB or UI path calls this method.
+    /// unknown response. The UI reaches this only through the retained UUID
+    /// wrapper below.
     pub async fn retry_letmein_manually(
         &self,
         letmein: LetMeInRequest,
@@ -1878,6 +1943,23 @@ impl FTClient {
     ) -> Result<(), PushError> {
         self.respond_letmein_internal(letmein, approved_group, true)
             .await
+    }
+
+    /// Retry a retained delegated admission using the original request and
+    /// the original approval decision. The caller supplies only the opaque
+    /// delegation identifier, so a retry cannot change admission ownership.
+    pub async fn retry_retained_letmein_manually(
+        &self,
+        delegation_uuid: &str,
+    ) -> Result<(), PushError> {
+        let request = self
+            .delegated_requests
+            .lock()
+            .await
+            .get(delegation_uuid)
+            .cloned()
+            .ok_or(PushError::FaceTimeSessionNotFound)?;
+        self.retry_letmein_manually(request, None).await
     }
 
     async fn respond_letmein_internal(
@@ -2188,7 +2270,10 @@ impl FTClient {
                                     &target,
                                     &sender,
                                     token,
-                                    decoded.encrypted_message.clone().expect("No encrypted?"),
+                                    decoded
+                                        .encrypted_message
+                                        .clone()
+                                        .ok_or(PushError::BadMsg)?,
                                 )
                                 .await?;
                             Some(FTMessage::LetMeInRequest(request))

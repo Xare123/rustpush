@@ -439,6 +439,15 @@ impl KeyCache {
             })
     }
 
+    fn has_bridge_registration(
+        bridge_devices: &[PrivateDeviceInfo],
+        bridge_device_uuid: &str,
+    ) -> bool {
+        bridge_devices
+            .iter()
+            .any(|device| device.uuid.as_deref() == Some(bridge_device_uuid))
+    }
+
     /// Build targets for the own-handle admission update without fanning out
     /// to any current or stale registration belonging to this bridge.
     pub fn get_participants_targets_excluding_bridge_devices(
@@ -561,6 +570,29 @@ mod tests {
         assert!(!KeyCache::is_bridge_owned_push_token(
             &[3],
             &bridge_devices,
+            "bridge-device"
+        ));
+    }
+
+    #[test]
+    fn rotated_registration_requires_refresh_before_self_exclusion_is_trusted() {
+        let stale_cache = [bridge_device(&[1], "old-bridge-device")];
+        let refreshed_cache = [
+            bridge_device(&[1], "old-bridge-device"),
+            bridge_device(&[2], "bridge-device"),
+        ];
+
+        assert!(!KeyCache::has_bridge_registration(
+            &stale_cache,
+            "bridge-device"
+        ));
+        assert!(KeyCache::has_bridge_registration(
+            &refreshed_cache,
+            "bridge-device"
+        ));
+        assert!(KeyCache::is_bridge_owned_push_token(
+            &[2],
+            &refreshed_cache,
             "bridge-device"
         ));
     }
@@ -1042,7 +1074,40 @@ impl IdentityResource {
     ) -> Result<Vec<DeliveryHandle>, PushError> {
         self.get_sms_targets(handle, false).await?;
         let bridge_device_uuid = self.config.get_device_uuid();
+        if bridge_device_uuid.is_empty() {
+            return Err(PushError::BadMsg);
+        }
+
+        let cache_has_bridge_registration = |cache: &KeyCache| {
+            cache
+                .cache
+                .get("com.apple.madrid")
+                .and_then(|handles| handles.get(handle))
+                .map(|cached| {
+                    KeyCache::has_bridge_registration(
+                        &cached.private_data,
+                        &bridge_device_uuid,
+                    )
+                })
+                .unwrap_or(false)
+        };
+
+        // A cached token can be stale after this bridge rotates its IDS
+        // registration. Refresh once before deciding which self tokens to
+        // exclude. If ownership is still unproven, fail closed rather than
+        // fan out an admission update to this bridge.
+        let cache_needs_refresh = {
+            let cache = self.cache.lock().await;
+            !cache_has_bridge_registration(&cache)
+        };
+        if cache_needs_refresh {
+            self.get_sms_targets(handle, true).await?;
+        }
+
         let cache = self.cache.lock().await;
+        if !cache_has_bridge_registration(&cache) {
+            return Err(PushError::BadMsg);
+        }
         Ok(cache.get_participants_targets_excluding_bridge_devices(
             service,
             handle,
