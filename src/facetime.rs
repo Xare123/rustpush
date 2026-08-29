@@ -242,6 +242,13 @@ pub struct FTSession {
     pub connection: Option<Arc<AVSession>>,
     #[serde(skip)]
     pub av_config: Option<AVConfig>,
+    // this is not fully right/correct, when the initiator leaves
+    // it is not reassigned to me even if it probably should be.
+    // I don't think that affects any of our existing flows, but could be
+    // relevant in the future. The main issue is a false positive rather
+    // than a false negative, which we avoid at this time.
+    #[serde(skip)]
+    pub is_initiator: bool,
 }
 
 // time to track recently added members
@@ -415,6 +422,12 @@ fn merge_session_operation(
 
     if current.is_video == baseline.is_video && prepared.is_video != baseline.is_video {
         current.is_video = prepared.is_video;
+    }
+
+    if current.is_initiator == baseline.is_initiator
+        && prepared.is_initiator != baseline.is_initiator
+    {
+        current.is_initiator = prepared.is_initiator;
     }
 
     if same_av_connection(&current.connection, &baseline.connection)
@@ -851,6 +864,13 @@ impl FTClient {
         )
         .await?;
 
+        let no_active_remote_participants = relay_session
+            .state
+            .lock()
+            .await
+            .active_participants
+            .is_empty();
+
         session.import_allocations(&relay_session.state.lock().await.configuration);
         let av_config = session.av_config.get_or_insert_with(AVConfig::new).clone();
         let interfaces = self
@@ -889,6 +909,9 @@ impl FTClient {
         }
 
         session.connection = Some(connection);
+        if no_active_remote_participants {
+            session.is_initiator = true;
+        }
         info!("FaceTime relay media session connected");
         Ok(())
     }
@@ -1190,6 +1213,7 @@ impl FTClient {
             recent_member_adds: HashMap::new(),
             connection: None,
             av_config: Some(AVConfig::new()),
+            is_initiator: true,
             is_video: true,
         };
 
@@ -1277,7 +1301,7 @@ impl FTClient {
             .get_participant(self.conn.get_token().await)
             .ok_or(PushError::NoParticipantTokenIndex)?;
 
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator; // todo, what does this mean
         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
@@ -1396,7 +1420,7 @@ impl FTClient {
             Some(link.get_public_key().await?.into())
         } else { None };
 
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
 
         let relevant_people: Vec<String> = session
@@ -1625,7 +1649,7 @@ impl FTClient {
         let my_participant = session
             .get_participant(self.conn.get_token().await)
             .ok_or(PushError::NoParticipantTokenIndex)?;
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator;
         let is_u_plus_one = true; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
@@ -1648,6 +1672,8 @@ impl FTClient {
             )),
             ..Default::default()
         };
+
+        session.is_initiator = false;
 
         let relevant_people: Vec<String> = session
             .members
@@ -1709,6 +1735,19 @@ impl FTClient {
         my_participant.active = None; // we left, remember?
 
         Ok(())
+    }
+
+    pub async fn set_local_interfaces(&self, interfaces: &[IpAddr]) {
+        let mut stored_interfaces = self.interfaces.write().await;
+        *stored_interfaces = Some(interfaces.to_vec());
+        drop(stored_interfaces);
+
+        for session in self.state.read().await.sessions.values() {
+            let Some(connection) = &session.connection else {
+                continue;
+            };
+            connection.link.update_local_interfaces(interfaces).await;
+        }
     }
 
     pub async fn add_members(
@@ -2598,7 +2637,11 @@ mod tests {
             is_propped: false,
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
+            is_video: true,
             recent_member_adds: HashMap::new(),
+            connection: None,
+            av_config: None,
+            is_initiator: false,
         }
     }
 
