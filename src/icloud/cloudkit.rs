@@ -5171,6 +5171,25 @@ mod cloud_sync_transport_tests {
     static UNAUTHORIZED_ENDPOINT: OnceLock<String> = OnceLock::new();
     static SERVER_ERROR_ENDPOINT: OnceLock<String> = OnceLock::new();
 
+    async fn read_complete_http_headers(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::with_capacity(1024);
+        loop {
+            let mut chunk = [0u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "loopback client closed before sending headers");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(
+                request.len() <= 64 * 1024,
+                "loopback request headers too large"
+            );
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8_lossy(&request).into_owned();
+            }
+        }
+    }
+
     macro_rules! one_shot_loopback_operation {
         ($name:ident, $endpoint:ident) => {
             struct $name;
@@ -6314,8 +6333,6 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn public_one_shot_times_out_before_headers_without_replay() {
-        use tokio::io::AsyncReadExt;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         BEFORE_HEADERS_ENDPOINT
@@ -6323,12 +6340,10 @@ mod cloud_sync_transport_tests {
             .unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 8192];
-            let read = socket.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
+            let request = read_complete_http_headers(&mut socket).await;
             assert!(request.contains(HTTP_REQUEST_UUID));
 
-            let replay = tokio::time::timeout(Duration::from_millis(700), listener.accept()).await;
+            let replay = tokio::time::timeout(Duration::from_millis(900), listener.accept()).await;
             drop(socket);
             replay.is_ok()
         });
@@ -6342,7 +6357,7 @@ mod cloud_sync_transport_tests {
         .unwrap();
         let policy = CloudKitRetryPolicy {
             max_attempts: 4,
-            request_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_millis(400),
             ..CloudKitRetryPolicy::default()
         };
         let result = open
@@ -6370,7 +6385,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn public_one_shot_shares_one_deadline_across_headers_and_body() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -6379,21 +6394,19 @@ mod cloud_sync_transport_tests {
             .unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 8192];
-            let read = socket.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
+            let request = read_complete_http_headers(&mut socket).await;
             assert!(request.contains(HTTP_REQUEST_UUID));
 
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
             socket.flush().await.unwrap();
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
             let _ = socket.write_all(b"body").await;
-            let replay = tokio::time::timeout(Duration::from_millis(400), listener.accept()).await;
+            let replay = tokio::time::timeout(Duration::from_millis(800), listener.accept()).await;
             replay.is_ok()
         });
 
@@ -6406,7 +6419,7 @@ mod cloud_sync_transport_tests {
         .unwrap();
         let policy = CloudKitRetryPolicy {
             max_attempts: 4,
-            request_timeout: Duration::from_millis(600),
+            request_timeout: Duration::from_millis(800),
             ..CloudKitRetryPolicy::default()
         };
         let result = open
