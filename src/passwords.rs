@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
-    io::Cursor,
-    sync::Arc,
+    io::{Cursor, ErrorKind},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -56,6 +59,7 @@ use openssl::{
 use plist::{Data, Date, Dictionary, Value};
 use prost::Message;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
 use crate::{keychain::KeychainClient, PushError};
@@ -102,6 +106,234 @@ pub struct PasswordState {
 
 fn zone_identifier_key(id: &RecordZoneIdentifier) -> String {
     base64_encode(&id.encode_to_vec())
+}
+
+const PASSWORD_CLOUDKIT_PAUSE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+const PASSWORD_CLOUDKIT_OPERATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+struct PasswordCloudKitPause {
+    token: u64,
+    _permit: OwnedRwLockWriteGuard<()>,
+}
+
+struct PasswordCloudKitOperationGate {
+    operations: Arc<RwLock<()>>,
+    pause: Mutex<Option<PasswordCloudKitPause>>,
+    next_token: AtomicU64,
+    pause_acquire_timeout: Duration,
+    operation_acquire_timeout: Duration,
+}
+
+impl PasswordCloudKitOperationGate {
+    fn new(pause_acquire_timeout: Duration, operation_acquire_timeout: Duration) -> Self {
+        Self {
+            operations: Arc::new(RwLock::new(())),
+            pause: Mutex::new(None),
+            next_token: AtomicU64::new(rand::random::<u64>().max(1)),
+            pause_acquire_timeout,
+            operation_acquire_timeout,
+        }
+    }
+
+    fn next_token(&self) -> u64 {
+        loop {
+            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+            if token != 0 {
+                return token;
+            }
+        }
+    }
+
+    async fn acquire_operation(&self) -> Result<OwnedRwLockReadGuard<()>, PushError> {
+        tokio::time::timeout(
+            self.operation_acquire_timeout,
+            self.operations.clone().read_owned(),
+        )
+        .await
+        .map_err(|_| {
+            PushError::IoError(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "password CloudKit operations are paused",
+            ))
+        })
+    }
+
+    async fn pause(&self) -> Result<u64, PushError> {
+        let deadline = tokio::time::Instant::now() + self.pause_acquire_timeout;
+        let mut pause = tokio::time::timeout_at(deadline, self.pause.lock())
+            .await
+            .map_err(|_| {
+                PushError::IoError(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out waiting to pause password CloudKit operations",
+                ))
+            })?;
+        if pause.is_some() {
+            return Err(PushError::IoError(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                "password CloudKit operations are already paused",
+            )));
+        }
+
+        let permit = tokio::time::timeout_at(deadline, self.operations.clone().write_owned())
+            .await
+            .map_err(|_| {
+                PushError::IoError(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out waiting to pause password CloudKit operations",
+                ))
+            })?;
+
+        let token = self.next_token();
+        *pause = Some(PasswordCloudKitPause {
+            token,
+            _permit: permit,
+        });
+        Ok(token)
+    }
+
+    async fn resume(&self, token: u64) -> Result<(), PushError> {
+        let mut pause = self.pause.lock().await;
+        if token == 0 || pause.as_ref().map(|active| active.token) != Some(token) {
+            return Err(PushError::IoError(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "invalid password CloudKit pause token",
+            )));
+        }
+
+        pause.take();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+    const TEST_WAIT: Duration = Duration::from_millis(20);
+
+    fn test_gate() -> Arc<PasswordCloudKitOperationGate> {
+        Arc::new(PasswordCloudKitOperationGate::new(
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+        ))
+    }
+
+    #[tokio::test]
+    async fn pause_waits_for_active_operation() {
+        let gate = test_gate();
+        let operation = gate.acquire_operation().await.unwrap();
+        let pause_gate = gate.clone();
+        let mut pause_task = tokio::spawn(async move { pause_gate.pause().await });
+
+        assert!(tokio::time::timeout(TEST_WAIT, &mut pause_task)
+            .await
+            .is_err());
+
+        drop(operation);
+        let token = tokio::time::timeout(TEST_TIMEOUT, pause_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        gate.resume(token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_gate_blocks_new_operations() {
+        let gate = test_gate();
+        let token = gate.pause().await.unwrap();
+        let operation_gate = gate.clone();
+        let mut operation_task =
+            tokio::spawn(async move { operation_gate.acquire_operation().await });
+
+        assert!(tokio::time::timeout(TEST_WAIT, &mut operation_task)
+            .await
+            .is_err());
+
+        gate.resume(token).await.unwrap();
+        let operation = tokio::time::timeout(TEST_TIMEOUT, operation_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(operation);
+    }
+
+    #[tokio::test]
+    async fn resume_releases_exactly_one_pause_token() {
+        let gate = test_gate();
+        let first_token = gate.pause().await.unwrap();
+        gate.resume(first_token).await.unwrap();
+
+        let second_token = gate.pause().await.unwrap();
+        assert_ne!(first_token, second_token);
+        assert!(matches!(
+            gate.resume(first_token).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        gate.resume(second_token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_and_double_resume_fail() {
+        let gate = test_gate();
+        assert!(matches!(
+            gate.resume(0).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+
+        let token = gate.pause().await.unwrap();
+        assert!(matches!(
+            gate.resume(token.wrapping_add(1)).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        gate.resume(token).await.unwrap();
+        assert!(matches!(
+            gate.resume(token).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[tokio::test]
+    async fn pause_timeout_leaves_no_orphan_pause() {
+        let gate = Arc::new(PasswordCloudKitOperationGate::new(TEST_WAIT, TEST_TIMEOUT));
+        let operation = gate.acquire_operation().await.unwrap();
+
+        assert!(matches!(
+            gate.pause().await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::TimedOut
+        ));
+
+        drop(operation);
+        let operation = tokio::time::timeout(TEST_TIMEOUT, gate.acquire_operation())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(operation);
+
+        let token = gate.pause().await.unwrap();
+        gate.resume(token).await.unwrap();
+    }
+}
+
+static PASSWORD_CLOUDKIT_OPERATION_GATE: LazyLock<PasswordCloudKitOperationGate> =
+    LazyLock::new(|| {
+        PasswordCloudKitOperationGate::new(
+            PASSWORD_CLOUDKIT_PAUSE_ACQUIRE_TIMEOUT,
+            PASSWORD_CLOUDKIT_OPERATION_ACQUIRE_TIMEOUT,
+        )
+    });
+
+/// Pauses Passwords and Keychain CloudKit work after in-flight operations finish.
+pub async fn pause_password_cloudkit_operations() -> Result<u64, PushError> {
+    PASSWORD_CLOUDKIT_OPERATION_GATE.pause().await
+}
+
+/// Resumes Passwords and Keychain CloudKit work paused by the matching token.
+pub async fn resume_password_cloudkit_operations(token: u64) -> Result<(), PushError> {
+    PASSWORD_CLOUDKIT_OPERATION_GATE.resume(token).await
 }
 
 pub struct PasswordManager<P: AnisetteProvider> {
@@ -1327,6 +1559,16 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                 let msg_copy = msg.clone();
                 let self_copy = self.clone();
                 tokio::task::spawn(async move {
+                    let _operation = match PASSWORD_CLOUDKIT_OPERATION_GATE
+                        .acquire_operation()
+                        .await
+                    {
+                        Ok(operation) => operation,
+                        Err(e) => {
+                            warn!("Skipped password/keychain sync while CloudKit operations are paused {e}");
+                            return;
+                        }
+                    };
                     if let Err(e) = self_copy.handle_notif(&msg_copy).await {
                         warn!("Failed to sync in response to update {e}");
                     }
@@ -1369,6 +1611,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn accept_invite(&self, invite_id: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let container = self.get_shared_container().await?;
         let mut groups = self.state.write().await;
         let group = groups
@@ -1388,6 +1631,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn decline_invite(&self, invite_id: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let container = self.get_shared_container().await?;
         let mut groups = self.state.write().await;
         let group = groups
@@ -1658,6 +1902,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn remove_group(&self, id: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let mut groups = self.state.write().await;
         let group = groups.groups.get(id).expect("Zone not found!");
 
@@ -1679,6 +1924,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn create_group(&self, name: &str) -> Result<String, PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let container = self.get_container().await?;
         let group = Uuid::new_v4().to_string().to_uppercase();
         let zone = container.private_zone(format!("group-{group}"));
@@ -1727,6 +1973,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn rename_group(&self, id: &str, new_name: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let mut groups = self.state.write().await;
         let group = groups.groups.get_mut(id).expect("Zone not found!");
         let share = group.share.as_mut().expect("no share");
@@ -1816,6 +2063,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn remove_user(&self, group: &str, send_handle: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let container = self.get_container().await?;
 
         let mut groups = self.state.write().await;
@@ -1878,6 +2126,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn invite_user(&self, group_id: &str, send_handle: &str) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let container = self.get_container().await?;
 
         let mut groups = self.state.write().await;
@@ -1940,6 +2189,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn sync_passwords(&self, connection: &APSConnection) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         self.prepare_watch(connection).await?;
         self.keychain
             .sync_keychain(&["WiFi", "Passwords", "CreditCards"])
@@ -2057,6 +2307,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         apply: impl FnOnce(&mut T),
         default_group: Option<String>,
     ) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         let pwstate = self.state.read().await;
         let state = self.keychain.state.read().await;
         let mut existing = self
@@ -2074,11 +2325,21 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
         apply(&mut existing.1 .1);
 
-        self.insert_password_entry(&existing.0, &existing.1 .1, existing.1 .0)
+        self.insert_password_entry_inner(&existing.0, &existing.1 .1, existing.1 .0)
             .await
     }
 
     pub async fn insert_password_entry<T: PasswordEntry>(
+        &self,
+        id: &str,
+        entry: &T,
+        group: Option<String>,
+    ) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
+        self.insert_password_entry_inner(id, entry, group).await
+    }
+
+    async fn insert_password_entry_inner<T: PasswordEntry>(
         &self,
         id: &str,
         entry: &T,
@@ -2153,6 +2414,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         id: &str,
         group: Option<String>,
     ) -> Result<(), PushError> {
+        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
         if let Some(group) = group {
             let mut groups = self.state.write().await;
 
