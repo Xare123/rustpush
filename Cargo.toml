@@ -51,7 +51,7 @@ sha2 = "0.10.8"
 hkdf = "0.12.4"
 aes-gcm = "0.10.3"
 h3 = "0.0.8"
-h3-quinn = "0.0.10"
+h3-quinn = { path = "./third_party/h3-quinn" }
 http = "1"
 cloudkit-proto = { path = "./cloudkit-proto" }
 cloudkit-derive = { path = "./cloudkit-derive" }
