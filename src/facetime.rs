@@ -2414,7 +2414,7 @@ impl FTClient {
                             active: Some(participant_from_meta(
                                 participant,
                                 &sender,
-                                avc_data.into(),
+                                avc_data.clone().into(),
                                 message,
                                 &decoded_context,
                             )),
@@ -2430,6 +2430,17 @@ impl FTClient {
                     }
 
                     let guid = session.group_id.clone();
+                    // AVC metadata can arrive after the relay session exists. Keep it in
+                    // the persisted participant state first, then import it into the live
+                    // media session after releasing the shared state lock.
+                    let media_import = session.connection.as_ref().map(|connection| {
+                        (
+                            connection.clone(),
+                            participant.into(),
+                            sender.clone(),
+                            avc_data.to_vec(),
+                        )
+                    });
                     // Persist the received participant event before network I/O,
                     // then unprop a snapshot and merge only its operation fields.
                     // This keeps the shared state write lock out of IDS waits.
@@ -2440,6 +2451,12 @@ impl FTClient {
                     };
                     (self.update_state)(&state);
                     drop(state);
+
+                    if let Some((connection, participant, handle, avc_data)) = media_import {
+                        connection
+                            .import_avc(participant, handle, &avc_data)
+                            .await?;
+                    }
 
                     if let Some((baseline, mut prepared)) = unprop_work {
                         self.unprop_conv(&mut prepared).await?;
