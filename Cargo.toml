@@ -68,7 +68,7 @@ rtc-shared = { path = "./third_party/rtc/rtc-shared" }
 rtc-srtp = { path = "./third_party/rtc/rtc-srtp" }
 rtc-stun = { path = "./third_party/rtc/rtc-stun" }
 rustls_psk = { package = "rustls", path = "./third_party/rustls/rustls" }
-mio = { version = "1.2.2", features = ["os-poll", "net"] }
+mio = { version = "=1.0.3", features = ["os-poll", "net"] }
 sansio = "1.0.1"
 
 [patch.crates-io]
