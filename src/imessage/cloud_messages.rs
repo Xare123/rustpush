@@ -54,8 +54,8 @@ use crate::util::{
     StreamTypedCoder,
 };
 use crate::{
-    cloudkit::{CloudKitClient, CloudKitContainer},
-    cloudkit_operation_gate::with_cloudkit_writer_operation,
+    cloudkit::{CloudKitClient, CloudKitContainer, CloudKitReadAuthenticationContainer},
+    cloudkit_operation_gate::{with_cloudkit_writer_operation, CloudKitReadAuthenticationPermit},
     PushError,
 };
 use crate::{Attachment, AttachmentType, FileContainer};
@@ -1970,6 +1970,49 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             return Ok(container);
         }
         let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
+        *self.container.lock().await = Some(container.clone());
+        Ok(container)
+    }
+
+    /// Opens only the Messages container under the exact writer-pause permit
+    /// supplied by the Cloud Sync V2 read-authentication bridge. The permit is
+    /// validated even when the container is already cached.
+    pub async fn get_container_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        permit.validate()?;
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let _initialization = self.container_initialization.lock().await;
+        permit.validate()?;
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let container = Arc::new(
+            MESSAGES_CONTAINER
+                .init_for_read_authentication(
+                    self.client.clone(),
+                    permit,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await?,
+        );
         *self.container.lock().await = Some(container.clone());
         Ok(container)
     }

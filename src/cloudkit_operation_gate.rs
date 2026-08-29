@@ -25,14 +25,52 @@ pub struct CloudKitWriterOperationPermit {
 
 struct CloudKitWriterPause {
     token: u64,
+    generation: u64,
     _permit: OwnedRwLockWriteGuard<()>,
 }
 
 struct CloudKitWriterPauseState {
     pending: Option<u64>,
     active: Option<CloudKitWriterPause>,
+    active_read_authentication_scopes: usize,
+    next_pause_generation: u64,
     terminal_tokens: VecDeque<u64>,
     last_terminal_token: Option<u64>,
+}
+
+/// Non-cloneable capability for the three allowlisted CloudKit read-auth
+/// container initializations owned by one exact native writer pause.
+pub struct CloudKitReadAuthenticationPermit<'a> {
+    gate: &'a CloudKitWriterOperationGate,
+    token: u64,
+    generation: u64,
+}
+
+impl CloudKitReadAuthenticationPermit<'_> {
+    pub(crate) fn validate(&self) -> Result<(), PushError> {
+        self.gate
+            .validate_read_authentication(self.token, self.generation)
+    }
+}
+
+impl Drop for CloudKitReadAuthenticationPermit<'_> {
+    fn drop(&mut self) {
+        let mut pause = self.gate.pause_state();
+        let still_owned = pause.active.as_ref().is_some_and(|active| {
+            active.token == self.token && active.generation == self.generation
+        });
+        debug_assert!(
+            still_owned,
+            "CloudKit read-authentication permit lost its pause"
+        );
+        if !still_owned {
+            return;
+        }
+        pause.active_read_authentication_scopes = pause
+            .active_read_authentication_scopes
+            .checked_sub(1)
+            .expect("CloudKit read-authentication scope underflow");
+    }
 }
 
 impl CloudKitWriterPauseState {
@@ -93,6 +131,8 @@ impl CloudKitWriterOperationGate {
             pause: Mutex::new(CloudKitWriterPauseState {
                 pending: None,
                 active: None,
+                active_read_authentication_scopes: 0,
+                next_pause_generation: 0,
                 terminal_tokens: VecDeque::new(),
                 last_terminal_token: None,
             }),
@@ -182,6 +222,47 @@ impl CloudKitWriterOperationGate {
             })
     }
 
+    fn begin_read_authentication(
+        &self,
+        token: u64,
+    ) -> Result<CloudKitReadAuthenticationPermit<'_>, PushError> {
+        if token == 0 {
+            return invalid_pause_token();
+        }
+        let mut pause = self.pause_state();
+        let generation = match pause.active.as_ref() {
+            Some(active) if active.token == token => active.generation,
+            _ => return invalid_pause_token(),
+        };
+        pause.active_read_authentication_scopes = pause
+            .active_read_authentication_scopes
+            .checked_add(1)
+            .ok_or_else(|| {
+                PushError::IoError(std::io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "too many CloudKit read-authentication scopes",
+                ))
+            })?;
+        Ok(CloudKitReadAuthenticationPermit {
+            gate: self,
+            token,
+            generation,
+        })
+    }
+
+    fn validate_read_authentication(&self, token: u64, generation: u64) -> Result<(), PushError> {
+        let pause = self.pause_state();
+        if pause.active_read_authentication_scopes == 0
+            || !pause
+                .active
+                .as_ref()
+                .is_some_and(|active| active.token == token && active.generation == generation)
+        {
+            return invalid_pause_token();
+        }
+        Ok(())
+    }
+
     async fn pause(&self, token: u64) -> Result<u64, PushError> {
         if token == 0 {
             return invalid_pause_token();
@@ -204,9 +285,17 @@ impl CloudKitWriterOperationGate {
         {
             let mut pause = self.pause_state();
             if pause.pending == Some(token) && pause.active.is_none() {
+                let generation = pause.next_pause_generation.checked_add(1).ok_or_else(|| {
+                    PushError::IoError(std::io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "CloudKit writer pause generation exhausted",
+                    ))
+                })?;
+                pause.next_pause_generation = generation;
                 pause.pending = None;
                 pause.active = Some(CloudKitWriterPause {
                     token,
+                    generation,
                     _permit: permit,
                 });
                 pending.disarm();
@@ -227,6 +316,12 @@ impl CloudKitWriterOperationGate {
         }
 
         if pause.active.as_ref().map(|active| active.token) == Some(token) {
+            if pause.active_read_authentication_scopes != 0 {
+                return Err(PushError::IoError(std::io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "CloudKit read authentication is still active",
+                )));
+            }
             drop(pause.active.take());
             pause.remember_terminal_token(token);
             return Ok(());
@@ -317,6 +412,15 @@ where
     })
 }
 
+/// Acquires a non-cloneable read-authentication capability for one exact,
+/// already-active writer pause. Absence, pending state, stale tokens, and
+/// tokens owned by another pause all fail before any authentication work runs.
+pub fn acquire_cloudkit_read_authentication(
+    token: u64,
+) -> Result<CloudKitReadAuthenticationPermit<'static>, PushError> {
+    CLOUDKIT_WRITER_OPERATION_GATE.begin_read_authentication(token)
+}
+
 /// Fails immediately when a native CloudKit writer pause is pending or active.
 pub fn try_acquire_cloudkit_operation() -> Result<CloudKitWriterOperationPermit, PushError> {
     CLOUDKIT_WRITER_OPERATION_GATE.try_acquire_operation()
@@ -397,6 +501,95 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(operation);
+    }
+
+    #[tokio::test]
+    async fn read_authentication_scope_requires_pause_and_delays_resume() {
+        let gate = test_gate();
+        assert!(matches!(
+            gate.begin_read_authentication(110),
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+
+        let token = gate.pause(110).await.unwrap();
+        assert!(matches!(
+            gate.begin_read_authentication(111),
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        let permit = gate
+            .begin_read_authentication(token)
+            .expect("an exact active pause token must admit read authentication");
+        permit.validate().unwrap();
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 1);
+        assert!(matches!(
+            gate.resume(token).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::WouldBlock
+        ));
+
+        drop(permit);
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 0);
+        gate.resume(token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_read_authentication_permits_remain_bound_to_one_pause() {
+        let gate = test_gate();
+        let token = gate.pause(112).await.unwrap();
+        let first = gate.begin_read_authentication(token).unwrap();
+        let second = gate.begin_read_authentication(token).unwrap();
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 2);
+
+        drop(first);
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 1);
+        assert!(matches!(
+            gate.resume(token).await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::WouldBlock
+        ));
+
+        drop(second);
+        gate.resume(token).await.unwrap();
+        assert!(matches!(
+            gate.begin_read_authentication(token),
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[tokio::test]
+    async fn canceled_read_authentication_future_releases_its_permit() {
+        let gate = test_gate();
+        let token = gate.pause(113).await.unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let authentication_gate = gate.clone();
+        let mut pending_authentication = Box::pin(async move {
+            let _permit = authentication_gate
+                .begin_read_authentication(token)
+                .unwrap();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        tokio::select! {
+            _ = pending_authentication.as_mut() => panic!("authentication unexpectedly completed"),
+            started = &mut started_rx => started.unwrap(),
+        }
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 1);
+        drop(pending_authentication);
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 0);
+        gate.resume(token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicking_read_authentication_scope_releases_its_permit() {
+        let gate = test_gate();
+        let token = gate.pause(114).await.unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = gate.begin_read_authentication(token).unwrap();
+            panic!("test panic while read authentication owns its permit");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(gate.pause_state().active_read_authentication_scopes, 0);
+        gate.resume(token).await.unwrap();
     }
 
     #[tokio::test]

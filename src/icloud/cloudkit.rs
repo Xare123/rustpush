@@ -13,7 +13,10 @@ use std::{
 
 use crate::{
     aps::APSInterestToken,
-    cloudkit_operation_gate::{cloudkit_writer_operation_is_held, try_acquire_cloudkit_operation},
+    cloudkit_operation_gate::{
+        cloudkit_writer_operation_is_held, try_acquire_cloudkit_operation,
+        CloudKitReadAuthenticationPermit,
+    },
     util::{
         bin_deserialize, bin_serialize, proto_deserialize, proto_deserialize_opt, proto_serialize,
         proto_serialize_opt, DebugMutex, DebugRwLock,
@@ -2951,6 +2954,32 @@ pub struct CloudKitContainer<'t> {
     pub env: cloudkit_proto::request_operation::header::ContainerEnvironment,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CloudKitReadAuthenticationContainer {
+    Messages,
+    Cuttlefish,
+    Securityd,
+}
+
+impl CloudKitReadAuthenticationContainer {
+    fn matches(self, container: &CloudKitContainer<'_>) -> bool {
+        let (bundle_id, container_id) = match self {
+            Self::Messages => ("com.apple.imagent", "com.apple.messages.cloud"),
+            Self::Cuttlefish => (
+                "com.apple.security.cuttlefish",
+                "com.apple.security.keychain",
+            ),
+            Self::Securityd => ("com.apple.securityd", "com.apple.security.keychain"),
+        };
+        container.bundleid == bundle_id
+            && container.containerid == container_id
+            && container.database_type
+                == cloudkit_proto::request_operation::header::Database::PrivateDb
+            && container.env
+                == cloudkit_proto::request_operation::header::ContainerEnvironment::Production
+    }
+}
+
 #[derive(Default)]
 struct CkAppInitRetryBudget {
     attempts: u8,
@@ -3039,8 +3068,36 @@ impl<'t> CloudKitContainer<'t> {
         } else {
             Some(try_acquire_cloudkit_operation()?)
         };
+        self.init_after_admission(client).await
+    }
+
+    pub(crate) async fn init_for_read_authentication<T: AnisetteProvider>(
+        &'t self,
+        client: Arc<CloudKitClient<T>>,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        allowed_container: CloudKitReadAuthenticationContainer,
+    ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
+        permit.validate()?;
+        if !allowed_container.matches(self) {
+            return Err(PushError::IoError(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "CloudKit container is not allowed for read authentication",
+            )));
+        }
+        let container = self.init_after_admission(client.clone()).await?;
+        permit.validate()?;
+        container
+            .validate_read_authentication_identity(&client, allowed_container)
+            .await?;
+        Ok(container)
+    }
+
+    async fn init_after_admission<T: AnisetteProvider>(
+        &'t self,
+        client: Arc<CloudKitClient<T>>,
+    ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
         let session = CloudKitSession::new();
-        let dsid = client.state.read().await.dsid.clone();
+        let account_dsid = client.state.read().await.dsid.clone();
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -3064,7 +3121,7 @@ impl<'t> CloudKitContainer<'t> {
                 )
                 .await?
                 .query(&[("container", &self.containerid)])
-                .basic_auth(&dsid, Some(&mme_token))
+                .basic_auth(&account_dsid, Some(&mme_token))
                 .send()
                 .await?;
 
@@ -3076,12 +3133,16 @@ impl<'t> CloudKitContainer<'t> {
         };
 
         let response: CkInitResponse = response.json().await?;
+        if client.state.read().await.dsid != account_dsid {
+            return Err(PushError::UnauthorizedAccountError);
+        }
 
         Ok(CloudKitOpenContainer {
             database_type: self.database_type,
             container: self,
             user_id: response.cloud_kit_user_id,
             client,
+            account_dsid,
             keys: DebugMutex::new(HashMap::new()),
         })
     }
@@ -3146,6 +3207,7 @@ pub struct CloudKitOpenContainer<'t, T: AnisetteProvider> {
     container: &'t CloudKitContainer<'t>,
     pub user_id: String,
     pub client: Arc<CloudKitClient<T>>,
+    account_dsid: String,
     pub keys: DebugMutex<HashMap<String, PCSZoneConfig>>,
     pub database_type: cloudkit_proto::request_operation::header::Database,
 }
@@ -3158,6 +3220,24 @@ impl<'t, T: AnisetteProvider> Deref for CloudKitOpenContainer<'t, T> {
 }
 
 impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
+    pub(crate) async fn validate_read_authentication_identity(
+        &self,
+        expected_client: &Arc<CloudKitClient<T>>,
+        allowed_container: CloudKitReadAuthenticationContainer,
+    ) -> Result<(), PushError> {
+        let exact_container = allowed_container.matches(self.container)
+            && self.database_type == cloudkit_proto::request_operation::header::Database::PrivateDb;
+        let exact_client = Arc::ptr_eq(&self.client, expected_client);
+        let exact_account = expected_client.state.read().await.dsid == self.account_dsid;
+        if !exact_container || !exact_client || !exact_account {
+            return Err(PushError::IoError(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "cached CloudKit read-authentication identity mismatch",
+            )));
+        }
+        Ok(())
+    }
+
     pub fn private_zone(&self, name: String) -> cloudkit_proto::RecordZoneIdentifier {
         cloudkit_proto::RecordZoneIdentifier {
             value: Some(cloudkit_proto::Identifier {
@@ -3545,6 +3625,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             container: self.container,
             user_id: self.user_id.clone(),
             client: self.client.clone(),
+            account_dsid: self.account_dsid.clone(),
             keys: DebugMutex::new(HashMap::new()),
             database_type: Database::SharedDb,
         }
@@ -5260,6 +5341,7 @@ mod cloud_sync_transport_tests {
             container,
             user_id: "test-cloudkit-user".to_owned(),
             client,
+            account_dsid: "test-dsid".to_owned(),
             keys: DebugMutex::new(HashMap::new()),
             database_type: container.database_type,
         }
@@ -5286,6 +5368,120 @@ mod cloud_sync_transport_tests {
             containerid: "com.example.cloudkit-deadline-test",
             env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
         }
+    }
+
+    #[test]
+    fn read_authentication_container_allowlist_requires_exact_identity() {
+        let approved = [
+            (
+                CloudKitReadAuthenticationContainer::Messages,
+                "com.apple.imagent",
+                "com.apple.messages.cloud",
+            ),
+            (
+                CloudKitReadAuthenticationContainer::Cuttlefish,
+                "com.apple.security.cuttlefish",
+                "com.apple.security.keychain",
+            ),
+            (
+                CloudKitReadAuthenticationContainer::Securityd,
+                "com.apple.securityd",
+                "com.apple.security.keychain",
+            ),
+        ];
+
+        for (allowed, bundleid, containerid) in approved {
+            let exact = CloudKitContainer {
+                database_type: Database::PrivateDb,
+                bundleid,
+                containerid,
+                env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+            };
+            assert!(allowed.matches(&exact));
+
+            let wrong_bundle = CloudKitContainer {
+                bundleid: "com.example.unapproved",
+                ..exact
+            };
+            assert!(!allowed.matches(&wrong_bundle));
+
+            let wrong_container = CloudKitContainer {
+                containerid: "com.example.unapproved",
+                ..exact
+            };
+            assert!(!allowed.matches(&wrong_container));
+
+            let wrong_database = CloudKitContainer {
+                database_type: Database::SharedDb,
+                ..exact
+            };
+            assert!(!allowed.matches(&wrong_database));
+
+            let wrong_environment = CloudKitContainer {
+                env: cloudkit_proto::request_operation::header::ContainerEnvironment::Sandbox,
+                ..exact
+            };
+            assert!(!allowed.matches(&wrong_environment));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_read_authentication_rejects_wrong_container_client_and_account() {
+        let messages_container = CloudKitContainer {
+            database_type: Database::PrivateDb,
+            bundleid: "com.apple.imagent",
+            containerid: "com.apple.messages.cloud",
+            env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        };
+        let open = one_shot_test_open_container(&messages_container);
+        open.validate_read_authentication_identity(
+            &open.client,
+            CloudKitReadAuthenticationContainer::Messages,
+        )
+        .await
+        .unwrap();
+
+        let wrong_container = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        assert!(matches!(
+            wrong_container
+                .validate_read_authentication_identity(
+                    &wrong_container.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+
+        let other_client = one_shot_test_open_container(&messages_container).client;
+        assert!(matches!(
+            open.validate_read_authentication_identity(
+                &other_client,
+                CloudKitReadAuthenticationContainer::Messages,
+            )
+            .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+
+        let shared = open.shared();
+        assert!(matches!(
+            shared
+                .validate_read_authentication_identity(
+                    &shared.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+
+        open.client.state.write().await.dsid = "different-dsid".to_owned();
+        assert!(matches!(
+            open.validate_read_authentication_identity(
+                &open.client,
+                CloudKitReadAuthenticationContainer::Messages,
+            )
+            .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
     }
 
     static SEMANTIC_FAKE_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {

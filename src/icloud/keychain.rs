@@ -75,10 +75,11 @@ use crate::{
     aps::APSInterestToken,
     auth::MobileMeDelegateResponse,
     cloudkit::{
-        CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession,
-        FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS,
+        CloudKitClient, CloudKitContainer, CloudKitOpenContainer,
+        CloudKitReadAuthenticationContainer, CloudKitSession, FetchRecordChangesOperation,
+        FunctionInvokeOperation, ALL_ASSETS,
     },
-    cloudkit_operation_gate::with_cloudkit_writer_operation,
+    cloudkit_operation_gate::{with_cloudkit_writer_operation, CloudKitReadAuthenticationPermit},
     util::{
         base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize,
         bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch,
@@ -1633,6 +1634,46 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(container)
     }
 
+    pub async fn get_container_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        permit.validate()?;
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Cuttlefish,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let _initialization = self.container_initialization.lock().await;
+        permit.validate()?;
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Cuttlefish,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let container = Arc::new(
+            CUTTLEFISH_CONTAINER
+                .init_for_read_authentication(
+                    self.client.clone(),
+                    permit,
+                    CloudKitReadAuthenticationContainer::Cuttlefish,
+                )
+                .await?,
+        );
+        *self.container.lock().await = Some(container.clone());
+        Ok(container)
+    }
+
     /// Returns only an already-open Cuttlefish container. Semantic decode must
     /// not trigger `ckAppInit` or authentication bootstrap.
     async fn get_container_lookup_only(
@@ -1657,6 +1698,46 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Ok(container);
         }
         let container = Arc::new(SECURITYD_CONTAINER.init(self.client.clone()).await?);
+        *self.security_container.lock().await = Some(container.clone());
+        Ok(container)
+    }
+
+    pub async fn get_security_container_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        permit.validate()?;
+        let cached = self.security_container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Securityd,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let _initialization = self.security_container_initialization.lock().await;
+        permit.validate()?;
+        let cached = self.security_container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            container
+                .validate_read_authentication_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Securityd,
+                )
+                .await?;
+            return Ok(container);
+        }
+        let container = Arc::new(
+            SECURITYD_CONTAINER
+                .init_for_read_authentication(
+                    self.client.clone(),
+                    permit,
+                    CloudKitReadAuthenticationContainer::Securityd,
+                )
+                .await?,
+        );
         *self.security_container.lock().await = Some(container.clone());
         Ok(container)
     }
