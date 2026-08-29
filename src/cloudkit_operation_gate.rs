@@ -288,23 +288,33 @@ pub(crate) fn cloudkit_writer_operation_is_held() -> bool {
 /// The task-local marker lets the shared transport recognize a caller-held
 /// permit without trying to acquire a second read lock behind a pending pause.
 /// Nested workflows in the same task reuse the outer permit.
-pub async fn with_cloudkit_writer_operation<F, T, E>(operation: F) -> Result<T, E>
+pub fn with_cloudkit_writer_operation<F, T, E>(operation: F) -> impl Future<Output = Result<T, E>>
 where
     F: Future<Output = Result<T, E>>,
     E: From<PushError>,
 {
-    if cloudkit_writer_operation_is_held() {
-        return operation.await;
-    }
+    // Some CloudKit workflows contain very large debug-mode async state
+    // machines. Keeping `F` inline in another generic async function made each
+    // nested writer scope add that state to the polling stack. ARM64 Android's
+    // smaller worker stacks then overflowed during the initial Passwords sync.
+    // Pin the operation before returning so both the reentrant and permit-
+    // acquiring paths have a pointer-sized outer future.
+    let operation = Box::pin(operation);
 
-    let permit = acquire_cloudkit_writer_operation().await.map_err(E::from)?;
-    CLOUDKIT_WRITER_OPERATION_SCOPE
-        .scope((), async move {
-            let result = operation.await;
-            drop(permit);
-            result
-        })
-        .await
+    Box::pin(async move {
+        if cloudkit_writer_operation_is_held() {
+            return operation.await;
+        }
+
+        let permit = acquire_cloudkit_writer_operation().await.map_err(E::from)?;
+        CLOUDKIT_WRITER_OPERATION_SCOPE
+            .scope((), async move {
+                let result = operation.await;
+                drop(permit);
+                result
+            })
+            .await
+    })
 }
 
 /// Fails immediately when a native CloudKit writer pause is pending or active.
@@ -669,5 +679,37 @@ mod tests {
 
         assert_eq!(value, 17);
         assert!(!cloudkit_writer_operation_is_held());
+    }
+
+    #[tokio::test]
+    async fn writer_scope_state_is_checked_when_future_is_polled() {
+        let scoped = CLOUDKIT_WRITER_OPERATION_SCOPE
+            .scope((), async {
+                assert!(cloudkit_writer_operation_is_held());
+                with_cloudkit_writer_operation(async {
+                    assert!(cloudkit_writer_operation_is_held());
+                    Ok::<(), PushError>(())
+                })
+            })
+            .await;
+
+        assert!(!cloudkit_writer_operation_is_held());
+        scoped.await.unwrap();
+        assert!(!cloudkit_writer_operation_is_held());
+    }
+
+    #[test]
+    fn writer_scope_keeps_large_operation_off_the_outer_future() {
+        let large_capture = [0u8; 256 * 1024];
+        let scoped = with_cloudkit_writer_operation(async move {
+            std::hint::black_box(large_capture);
+            Ok::<(), PushError>(())
+        });
+
+        assert!(
+            std::mem::size_of_val(&scoped) <= 64,
+            "writer scope future unexpectedly grew to {} bytes",
+            std::mem::size_of_val(&scoped)
+        );
     }
 }
