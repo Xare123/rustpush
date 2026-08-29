@@ -21,6 +21,7 @@ use rasn::{types::Integer, AsnType, Decode, Encode};
 use serde::{de::DeserializeOwned, Deserialize};
 
 pub mod identity_manager;
+pub mod link;
 pub mod user;
 
 #[derive(Deserialize, Debug)]

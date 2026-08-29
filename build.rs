@@ -8,7 +8,9 @@ fn main() -> Result<()> {
         &[
             "src/icloud/mmcs.proto",
             "src/ids/ids.proto",
+            "src/ids/qr.proto",
             "src/facetime.proto",
+            "src/avconference.proto",
             "src/statuskit.proto",
             "src/imessage/cloud_messages.proto",
             "src/passwords.proto",

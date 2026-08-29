@@ -9,6 +9,7 @@ use std::{
 
 use crate::{
     aps::new_aps_id,
+    ids::link::QuickRelayAllocationsResponse,
     util::{DebugMutex, DebugRwLock},
 };
 use async_recursion::async_recursion;
@@ -488,7 +489,7 @@ pub struct IdentityResource {
     pub users: DebugRwLock<Vec<IDSUser>>,
     pub identity: IDSNGMIdentity,
     config: Arc<dyn OSConfig>,
-    aps: APSConnection,
+    pub aps: APSConnection,
     query_lock: DebugMutex<()>,
     manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
     services: &'static [&'static IDSService],
@@ -887,6 +888,79 @@ impl IdentityResource {
             .upgrade()
             .unwrap()
             .clone()
+    }
+
+    pub async fn request_relay_allocations(
+        &self,
+        handle: &str,
+        participants: &[String],
+        group_id: &str,
+    ) -> Result<QuickRelayAllocationsResponse, PushError> {
+        const TOPIC: &str = "com.apple.private.alloy.facetime.multi";
+        self.cache_keys(
+            TOPIC,
+            participants,
+            handle,
+            false,
+            &QueryOptions {
+                required_for_message: true,
+                result_expected: true,
+            },
+        )
+        .await?;
+
+        let targets = self
+            .cache
+            .lock()
+            .await
+            .get_participants_targets(TOPIC, handle, participants);
+        let receiver = self.aps.subscribe().await;
+        let request_id = Uuid::new_v4();
+        self.send_message(
+            TOPIC,
+            IDSSendMessage::quickrelay(
+                handle.to_owned(),
+                request_id,
+                IDSQuickRelaySettings {
+                    reason: 0,
+                    group_id: group_id.to_owned(),
+                    request_type: 3,
+                    member_count: participants.len() as u32,
+                },
+            ),
+            targets,
+        )
+        .await?;
+
+        let response = self
+            .aps
+            .wait_for_timeout(
+                receiver,
+                get_message(
+                    |payload| {
+                        let parsed = match plist::from_value::<QuickRelayAllocationsResponse>(
+                            &payload,
+                        ) {
+                            Ok(parsed) => parsed,
+                            Err(_) => {
+                                warn!("FaceTime relay allocation response parse failed");
+                                return None;
+                            }
+                        };
+                        (parsed.for_id.as_ref() == request_id.as_bytes()).then_some(parsed)
+                    },
+                    &["com.apple.private.alloy.quickrelay"],
+                ),
+            )
+            .await?;
+
+        let expected_session = Uuid::from_str(group_id).map_err(|_| PushError::BadMsg)?;
+        if response.session_id.as_ref() != expected_session.as_bytes() {
+            warn!("FaceTime relay allocation response had the wrong session");
+            return Err(PushError::BadMsg);
+        }
+
+        Ok(response)
     }
 
     pub async fn ensure_private_self(

@@ -474,7 +474,7 @@ pub struct IDSNGMIdentity {
         serialize_with = "ec_serialize_priv",
         deserialize_with = "ec_deserialize_priv_compact"
     )]
-    device_key: CompactECKey<Private>,
+    pub device_key: CompactECKey<Private>,
     #[serde(
         serialize_with = "ec_serialize_priv",
         deserialize_with = "ec_deserialize_priv_compact"
