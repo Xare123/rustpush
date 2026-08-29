@@ -3117,16 +3117,16 @@ impl AVSession {
         let mut data = self.state.lock().await;
         data.video_enabled = video;
         drop(data);
-        self.send_stream_groups_state().await
+        self.send_stream_groups_state(None).await
     }
 
-    async fn send_stream_groups_state(&self) -> Result<(), PushError> {
+    async fn send_stream_groups_state(&self, recipient: Option<u64>) -> Result<(), PushError> {
         let data = self.state.lock().await;
         let video = data.video_enabled;
-        let mine = *data.participant_session_ids.keys().next().unwrap();
+        let participants = data.active_participants.clone();
         drop(data);
         info!("Sending stream group state!");
-        self.send_control_message(mine, VCControlData::StreamGroupState(HashMap::from_iter([
+        let stream_groups = VCControlData::StreamGroupState(HashMap::from_iter([
             (136, 0),
             (128, if video { 1 } else { 2 }),
             (10, 0),
@@ -3147,7 +3147,15 @@ impl AVSession {
             (8, 0),
             (131, 0),
             (9, 0),
-        ]))).await?;
+        ]));
+
+        if let Some(recipient) = recipient {
+            self.send_control_message(recipient, stream_groups).await?;
+        } else {
+            for participant in participants {
+                self.send_control_message(participant, stream_groups.clone()).await?;
+            }
+        }
         Ok(())
     }
 
@@ -3623,7 +3631,7 @@ impl AVSession {
                             info!("Got control message {item:?}");
                             match item {
                                 VCControlData::FetchStreamGroupState => {
-                                    self.send_stream_groups_state().await?;
+                                    self.send_stream_groups_state(Some(id as u64)).await?;
                                 },
                                 VCControlData::OneToOneEnabledState(enabled) => {
                                     let state = self.state.lock().await;

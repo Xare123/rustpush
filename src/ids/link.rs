@@ -2638,8 +2638,9 @@ impl GlobalLink {
                 None
             } else {
                 if link_id.is_none() {
-                    warn!("No send state 2!");
-                    return Ok(())
+                    // This exchange establishes the one-to-one relay link.
+                    // Dropping it until a link ID exists deadlocks negotiation.
+                    warn!("Sending control before the one-to-one link is confirmed");
                 }
                 link_id
             },
