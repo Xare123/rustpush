@@ -13,6 +13,7 @@ use std::{
 
 use crate::{
     aps::APSInterestToken,
+    cloudkit_operation_gate::{cloudkit_writer_operation_is_held, try_acquire_cloudkit_operation},
     util::{
         bin_deserialize, bin_serialize, proto_deserialize, proto_deserialize_opt, proto_serialize,
         proto_serialize_opt, DebugMutex, DebugRwLock,
@@ -514,6 +515,12 @@ fn record_semantic_read_operations<Op: CloudKitOp>(
         .collect()
 }
 
+fn cloudkit_writer_permit_required<Op: CloudKitOp>(operations: &[Op]) -> bool {
+    operations
+        .iter()
+        .any(|operation| operation.semantic_read_operation().is_none())
+}
+
 fn validate_semantic_read_request_operation(
     semantic_operation: SemanticReadOperation,
     link: &str,
@@ -609,6 +616,38 @@ fn validate_semantic_read_request_operation(
                 ) =>
         {
             Ok("Cuttlefish/fetchRecoverableTLKShares")
+        }
+        _ => Err(PushError::CloudKitSemanticOperationDenied),
+    }
+}
+
+fn validate_semantic_read_request_headers(
+    semantic_operation: SemanticReadOperation,
+    headers: &HeaderMap,
+) -> Result<(), PushError> {
+    const ROUTING_HINT: &str = "x-cloudkit-functionroutinghint";
+
+    let expected_routing_hint = match semantic_operation {
+        SemanticReadOperation::FetchRecordChanges | SemanticReadOperation::FetchZone => None,
+        SemanticReadOperation::CuttlefishFetchChanges => Some("Cuttlefish/fetchChanges"),
+        SemanticReadOperation::CuttlefishFetchRecoverableTlkShares => {
+            Some("Cuttlefish/fetchRecoverableTLKShares")
+        }
+        SemanticReadOperation::CkAppInit => {
+            return Err(PushError::CloudKitSemanticOperationDenied);
+        }
+    };
+
+    match expected_routing_hint {
+        None if headers.is_empty() => Ok(()),
+        Some(expected)
+            if headers.len() == 1
+                && headers
+                    .get(ROUTING_HINT)
+                    .and_then(|value| value.to_str().ok())
+                    == Some(expected) =>
+        {
+            Ok(())
         }
         _ => Err(PushError::CloudKitSemanticOperationDenied),
     }
@@ -2990,6 +3029,16 @@ impl<'t> CloudKitContainer<'t> {
         &'t self,
         client: Arc<CloudKitClient<T>>,
     ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
+        // A warm semantic read uses an already-open container. Any cold
+        // initialization performs token/anisette work and ckAppInit, so admit
+        // it as writer-side work before the first authentication or network
+        // side effect. Known writer workflows already hold the task-local
+        // permit; unknown callers get the same fail-closed backstop here.
+        let _writer_operation_permit = if cloudkit_writer_operation_is_held() {
+            None
+        } else {
+            Some(try_acquire_cloudkit_operation()?)
+        };
         let session = CloudKitSession::new();
         let dsid = client.state.read().await.dsid.clone();
 
@@ -4527,6 +4576,26 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .into());
         }
 
+        // The semantic pull owns the exclusive pause permit. Every other CloudKit
+        // request must fail closed before request construction, authentication, or
+        // transport so startup trust repair, Find My, and future writer call sites
+        // cannot bypass the higher-level Passwords gate.
+        let _writer_operation_permit = if cloudkit_writer_permit_required(ops)
+            && !cloudkit_writer_operation_is_held()
+        {
+            Some(try_acquire_cloudkit_operation()?)
+        } else {
+            None
+        };
+
+        let custom_headers = ops[0].custom_headers();
+        validate_cloudkit_operation_headers(&custom_headers)?;
+        for operation in ops {
+            if let Some(semantic_operation) = operation.semantic_read_operation() {
+                validate_semantic_read_request_headers(semantic_operation, &custom_headers)?;
+            }
+        }
+
         let request = ops
             .iter()
             .enumerate()
@@ -4552,8 +4621,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .collect::<Result<Vec<_>, PushError>>()?
             .concat();
         let compressed_request = gzip_normal(&request).map_err(PushError::from)?;
-        let custom_headers = ops[0].custom_headers();
-        validate_cloudkit_operation_headers(&custom_headers)?;
         let automatic_retry_safe = allow_automatic_replay
             && ops
                 .iter()
@@ -5448,6 +5515,75 @@ mod cloud_sync_transport_tests {
         }
     }
 
+    struct SpoofedSemanticRoutingOperation;
+
+    impl CloudKitOp for SpoofedSemanticRoutingOperation {
+        type Response = Vec<u8>;
+
+        fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
+            output.function_invoke_request = Some(cloudkit_proto::FunctionInvokeRequest {
+                service: Some("Cuttlefish".to_owned()),
+                name: Some("fetchChanges".to_owned()),
+                parameters: Some(Vec::new()),
+            });
+        }
+
+        fn retrieve_response(
+            response: &cloudkit_proto::ResponseOperation,
+        ) -> Result<Self::Response, PushError> {
+            response
+                .function_invoke_response
+                .as_ref()
+                .and_then(|response| response.serialized_result.clone())
+                .ok_or(PushError::CloudKitSemanticOperationDenied)
+        }
+
+        fn flow_control_key() -> &'static str {
+            panic!("not flow")
+        }
+
+        fn operation() -> cloudkit_proto::operation::Type {
+            cloudkit_proto::operation::Type::FunctionInvokeType
+        }
+
+        fn is_fetch() -> bool {
+            true
+        }
+
+        fn is_flow() -> bool {
+            false
+        }
+
+        fn is_grouped() -> bool {
+            false
+        }
+
+        fn tags() -> bool {
+            false
+        }
+
+        fn link() -> &'static str {
+            "https://gateway.icloud.com/ckcoderouter/api/client/code/invoke"
+        }
+
+        fn custom_headers(&self) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cloudkit-functionroutinghint",
+                HeaderValue::from_static("Cuttlefish/updateTrust"),
+            );
+            headers
+        }
+
+        fn retry_safety(&self) -> CloudKitRetrySafety {
+            CloudKitRetrySafety::ReadOnly
+        }
+
+        fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+            Some(SemanticReadOperation::CuttlefishFetchChanges)
+        }
+    }
+
     fn semantic_wire_request<Op: CloudKitOp>(operation: &Op) -> cloudkit_proto::RequestOperation {
         let mut request = cloudkit_proto::RequestOperation {
             request: Some(cloudkit_proto::Operation {
@@ -5514,6 +5650,75 @@ mod cloud_sync_transport_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn production_semantic_header_validator_pins_exact_function_route() {
+        let fetch_changes = FunctionInvokeOperation::new(
+            "Cuttlefish".to_owned(),
+            "fetchChanges".to_owned(),
+            Vec::new(),
+        );
+        assert!(validate_semantic_read_request_headers(
+            SemanticReadOperation::CuttlefishFetchChanges,
+            &fetch_changes.custom_headers(),
+        )
+        .is_ok());
+
+        assert!(matches!(
+            validate_semantic_read_request_headers(
+                SemanticReadOperation::CuttlefishFetchChanges,
+                &SpoofedSemanticRoutingOperation.custom_headers(),
+            ),
+            Err(PushError::CloudKitSemanticOperationDenied)
+        ));
+
+        let mut extra_header = fetch_changes.custom_headers();
+        extra_header.insert("x-test-extra", HeaderValue::from_static("denied"));
+        assert!(matches!(
+            validate_semantic_read_request_headers(
+                SemanticReadOperation::CuttlefishFetchChanges,
+                &extra_header,
+            ),
+            Err(PushError::CloudKitSemanticOperationDenied)
+        ));
+    }
+
+    #[test]
+    fn shared_transport_requires_writer_permit_for_every_nonsemantic_operation() {
+        assert!(!cloudkit_writer_permit_required(&[
+            FetchRecordChangesOperation::new(public_zone(), None, &NO_ASSETS),
+        ]));
+        assert!(!cloudkit_writer_permit_required(&[
+            FetchZoneOperation::new(public_zone()),
+        ]));
+        assert!(!cloudkit_writer_permit_required(&[
+            FunctionInvokeOperation::new(
+                "Cuttlefish".to_owned(),
+                "fetchChanges".to_owned(),
+                Vec::new(),
+            ),
+        ]));
+
+        assert!(cloudkit_writer_permit_required(&[SaveRecordOperation(
+            Default::default()
+        ),]));
+        assert!(cloudkit_writer_permit_required(&[DeleteRecordOperation(
+            Default::default()
+        ),]));
+        assert!(cloudkit_writer_permit_required(&[
+            FunctionInvokeOperation::new(
+                "Cuttlefish".to_owned(),
+                "updateTrust".to_owned(),
+                Vec::new(),
+            ),
+        ]));
+
+        // A malicious operation can lie about its semantic classification, but
+        // the exact serialized-wire validator below still rejects it before HTTP.
+        assert!(!cloudkit_writer_permit_required(&[
+            SpoofedSemanticWriteOperation,
+        ]));
     }
 
     #[test]
@@ -5784,6 +5989,27 @@ mod cloud_sync_transport_tests {
         let result = with_cloudkit_test_transport(transport.transport(), async {
             open.perform_semantic_read_only(&CloudKitSession::new(), SpoofedSemanticWriteOperation)
                 .await
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PushError::CloudKitSemanticOperationDenied)
+        ));
+        assert!(transport.recorded().is_empty());
+        assert_eq!(transport.invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn faithful_fake_transport_rejects_spoofed_function_route_before_http() {
+        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let transport = FaithfulSemanticTransport::default();
+        let result = with_cloudkit_test_transport(transport.transport(), async {
+            open.perform_semantic_read_only(
+                &CloudKitSession::new(),
+                SpoofedSemanticRoutingOperation,
+            )
+            .await
         })
         .await;
 

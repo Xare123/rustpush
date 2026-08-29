@@ -18,6 +18,7 @@ use crate::{
         DeleteRecordOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation,
         SaveRecordOperation, ALL_ASSETS,
     },
+    cloudkit_operation_gate::with_cloudkit_writer_operation,
     mmcsp::container,
     util::{base64_decode, bin_deserialize, bin_serialize, encode_hex},
     IMClient, Message,
@@ -451,109 +452,112 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
         record: IMessageNicknameRecord,
         existing: &mut Option<ShareProfileMessage>,
     ) -> Result<(), PushError> {
-        let container = self.get_container().await?;
-        if let Some(record) = &existing {
-            let _ = self.delete_my_record(&record.cloud_kit_record_key).await; // if this fails, we'll catch it later
-            *existing = None;
-        }
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
+            if let Some(record) = &existing {
+                let _ = self.delete_my_record(&record.cloud_kit_record_key).await; // if this fails, we'll catch it later
+                *existing = None;
+            }
 
-        let key: [u8; 16] = rand::random();
-        let (record, record_id) =
-            IMessageEncNicknameRecord::new(&record, &IMessageNicknameEncryption::new(&key))?;
+            let key: [u8; 16] = rand::random();
+            let (record, record_id) =
+                IMessageEncNicknameRecord::new(&record, &IMessageNicknameEncryption::new(&key))?;
 
-        let mut upload_requests = vec![];
-        if let Some(ad) = &record.ad {
-            let mut cursor = Cursor::new(ad);
-            let prepared = prepare_cloudkit_put(&mut cursor).await?;
-            cursor.rewind()?;
-            upload_requests.push(CloudKitUploadRequest {
-                file: Some(cursor),
-                record_id: record_id.clone(),
-                record_type: IMessageRawNicknameRecord::record_type(),
-                field: "ad",
-                prepared,
-            });
-        }
-
-        let poster_id = format!("{}-wp", record_id);
-        if let Some(poster) = &record.poster {
-            let mut cursor_wd = Cursor::new(&poster.wd);
-            let prepared_wd = prepare_cloudkit_put(&mut cursor_wd).await?;
-            cursor_wd.rewind()?;
-            let mut cursor_lrwd = Cursor::new(&poster.lrwd);
-            let prepared_lrwd = prepare_cloudkit_put(&mut cursor_lrwd).await?;
-            cursor_lrwd.rewind()?;
-            upload_requests.extend([
-                CloudKitUploadRequest {
-                    file: Some(cursor_wd),
-                    record_id: poster_id.clone(),
+            let mut upload_requests = vec![];
+            if let Some(ad) = &record.ad {
+                let mut cursor = Cursor::new(ad);
+                let prepared = prepare_cloudkit_put(&mut cursor).await?;
+                cursor.rewind()?;
+                upload_requests.push(CloudKitUploadRequest {
+                    file: Some(cursor),
+                    record_id: record_id.clone(),
                     record_type: IMessageRawNicknameRecord::record_type(),
-                    field: "wd",
-                    prepared: prepared_wd,
-                },
-                CloudKitUploadRequest {
-                    file: Some(cursor_lrwd),
-                    record_id: poster_id.clone(),
-                    record_type: IMessageRawNicknameRecord::record_type(),
-                    field: "lrwd",
-                    prepared: prepared_lrwd,
-                },
-            ]);
-        }
+                    field: "ad",
+                    prepared,
+                });
+            }
 
-        let session = CloudKitSession::new();
-        let mut asset = container
-            .upload_asset(&session, &public_zone(), upload_requests)
-            .await?;
-
-        let mut raw_ops = vec![SaveRecordOperation::try_new(
-            record_identifier_public(&record_id),
-            &IMessageRawNicknameRecord {
-                n: record.n,
-                am: record.am,
-                ad: asset.remove("ad").map(|mut i| i.remove(0)),
-            },
-            None,
-            false,
-        )?];
-
-        if let Some(poster) = &record.poster {
-            raw_ops.push(SaveRecordOperation::try_new(
-                record_identifier_public(&poster_id),
-                &IMessageRawPosterRecord {
-                    pr: cloudkit_proto::record::Reference {
-                        r#type: Some(cloudkit_proto::record::reference::Type::Owning as i32),
-                        record_identifier: Some(record_identifier_public(&container.user_id)),
+            let poster_id = format!("{}-wp", record_id);
+            if let Some(poster) = &record.poster {
+                let mut cursor_wd = Cursor::new(&poster.wd);
+                let prepared_wd = prepare_cloudkit_put(&mut cursor_wd).await?;
+                cursor_wd.rewind()?;
+                let mut cursor_lrwd = Cursor::new(&poster.lrwd);
+                let prepared_lrwd = prepare_cloudkit_put(&mut cursor_lrwd).await?;
+                cursor_lrwd.rewind()?;
+                upload_requests.extend([
+                    CloudKitUploadRequest {
+                        file: Some(cursor_wd),
+                        record_id: poster_id.clone(),
+                        record_type: IMessageRawNicknameRecord::record_type(),
+                        field: "wd",
+                        prepared: prepared_wd,
                     },
-                    wm: poster.wm.clone(),
-                    lrwd: asset.remove("lrwd").unwrap().remove(0),
-                    wd: asset.remove("wd").unwrap().remove(0),
+                    CloudKitUploadRequest {
+                        file: Some(cursor_lrwd),
+                        record_id: poster_id.clone(),
+                        record_type: IMessageRawNicknameRecord::record_type(),
+                        field: "lrwd",
+                        prepared: prepared_lrwd,
+                    },
+                ]);
+            }
+
+            let session = CloudKitSession::new();
+            let mut asset = container
+                .upload_asset(&session, &public_zone(), upload_requests)
+                .await?;
+
+            let mut raw_ops = vec![SaveRecordOperation::try_new(
+                record_identifier_public(&record_id),
+                &IMessageRawNicknameRecord {
+                    n: record.n,
+                    am: record.am,
+                    ad: asset.remove("ad").map(|mut i| i.remove(0)),
                 },
                 None,
                 false,
-            )?);
-        }
+            )?];
 
-        if let Err(e) = container
-            .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
-            .await
-        {
-            if let Some((record, _)) = self.get_my_record().await? {
-                self.delete_my_record(&record.record_id).await?;
-                container
-                    .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
-                    .await?;
-            } else {
-                return Err(e);
+            if let Some(poster) = &record.poster {
+                raw_ops.push(SaveRecordOperation::try_new(
+                    record_identifier_public(&poster_id),
+                    &IMessageRawPosterRecord {
+                        pr: cloudkit_proto::record::Reference {
+                            r#type: Some(cloudkit_proto::record::reference::Type::Owning as i32),
+                            record_identifier: Some(record_identifier_public(&container.user_id)),
+                        },
+                        wm: poster.wm.clone(),
+                        lrwd: asset.remove("lrwd").unwrap().remove(0),
+                        wd: asset.remove("wd").unwrap().remove(0),
+                    },
+                    None,
+                    false,
+                )?);
             }
-        }
 
-        *existing = Some(ShareProfileMessage {
-            cloud_kit_record_key: record_id,
-            cloud_kit_decryption_record_key: key.to_vec(),
-            poster: record.poster.map(|p| p.share_meta),
-        });
-        Ok(())
+            if let Err(e) = container
+                .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
+                .await
+            {
+                if let Some((record, _)) = self.get_my_record().await? {
+                    self.delete_my_record(&record.record_id).await?;
+                    container
+                        .perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone)
+                        .await?;
+                } else {
+                    return Err(e);
+                }
+            }
+
+            *existing = Some(ShareProfileMessage {
+                cloud_kit_record_key: record_id,
+                cloud_kit_decryption_record_key: key.to_vec(),
+                poster: record.poster.map(|p| p.share_meta),
+            });
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_my_record(&self, record_id: &str) -> Result<(), PushError> {

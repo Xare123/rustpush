@@ -14,6 +14,7 @@ use crate::{
         CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation,
         ALL_ASSETS, NO_ASSETS,
     },
+    cloudkit_operation_gate::with_cloudkit_writer_operation,
     ids::{
         identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw},
         user::IDSService,
@@ -1478,6 +1479,10 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     }
 
     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
+        with_cloudkit_writer_operation(self.sync_item_positions_with_writer_permit()).await
+    }
+
+    async fn sync_item_positions_with_writer_permit(&self) -> Result<(), PushError> {
         self.sync_items(true).await?;
 
         let mut state = self.state.state.lock().await;
@@ -1729,6 +1734,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             .await?;
 
         let mut update_records = vec![];
+        let mut pending_accessory_updates = vec![];
         for (device, reports) in reports {
             let newest_report = reports
                 .into_iter()
@@ -1737,30 +1743,39 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             info!("newest report for {device} {newest_report:?}");
             let accessory = state
                 .accessories
-                .get_mut(&device)
+                .get(&device)
                 .expect("Accessory not found!");
-            accessory.local_alignment.last_index_observed = newest_report.key_index as i64;
-            accessory.local_alignment.last_index_observation_date = Some(newest_report.timestamp);
+            let mut local_alignment = accessory.local_alignment.clone();
+            local_alignment.last_index_observed = newest_report.key_index as i64;
+            local_alignment.last_index_observation_date = Some(newest_report.timestamp);
 
-            if newest_report
+            let alignment_update = if newest_report
                 .key_index
                 .saturating_sub(accessory.alignment.last_index_observed as usize)
                 > 96
             {
-                accessory.alignment = accessory.local_alignment.clone();
                 info!("We are behind with our stored alignment, let's update it!");
+                let alignment = local_alignment.clone();
                 let (op, id) = SaveRecordOperation::new_protected(
                     record_identifier(beacon_zone.clone(), &accessory.alignment_id),
-                    &accessory.local_alignment,
+                    &alignment,
                     &key,
-                    accessory.aligment_prot_tag.take(),
+                    accessory.aligment_prot_tag.clone(),
                 );
-                accessory.aligment_prot_tag = Some(id);
                 update_records.push(op);
-            }
-            accessory.last_report = Some(newest_report);
+                Some((alignment, id))
+            } else {
+                None
+            };
+            pending_accessory_updates.push((
+                device,
+                local_alignment,
+                alignment_update,
+                newest_report,
+            ));
         }
 
+        let mut pending_shared_reports = vec![];
         for (share, reports) in shared_reports {
             let newest_report = reports
                 .into_iter()
@@ -1772,25 +1787,46 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 .circles_member
                 .get(&share)
                 .expect("Shared Accessory not found circle!");
-
-            let accessory = state
+            let beacon_identifier = share_circle.beacon_identifier.clone();
+            state
                 .share_state
                 .shared_beacons_client
-                .get_mut(&share_circle.beacon_identifier)
+                .get(&beacon_identifier)
                 .expect("Shared Accessory not found!");
             info!("newest report for {share} {newest_report:?}");
-
-            accessory.last_report = Some(newest_report);
+            pending_shared_reports.push((beacon_identifier, newest_report));
         }
 
         if !update_records.is_empty() {
-            container
-                .perform_operations_checked(
-                    &CloudKitSession::new(),
-                    &update_records,
-                    IsolationLevel::Operation,
-                )
-                .await?;
+            with_cloudkit_writer_operation(container.perform_operations_checked(
+                &CloudKitSession::new(),
+                &update_records,
+                IsolationLevel::Operation,
+            ))
+            .await?;
+        }
+
+        for (device, local_alignment, alignment_update, newest_report) in pending_accessory_updates
+        {
+            let accessory = state
+                .accessories
+                .get_mut(&device)
+                .expect("Accessory not found!");
+            accessory.local_alignment = local_alignment;
+            if let Some((alignment, protection_tag)) = alignment_update {
+                accessory.alignment = alignment;
+                accessory.aligment_prot_tag = Some(protection_tag);
+            }
+            accessory.last_report = Some(newest_report);
+        }
+
+        for (beacon_identifier, newest_report) in pending_shared_reports {
+            let accessory = state
+                .share_state
+                .shared_beacons_client
+                .get_mut(&beacon_identifier)
+                .expect("Shared Accessory not found!");
+            accessory.last_report = Some(newest_report);
         }
 
         self.state.save(&state)?;
@@ -2261,51 +2297,63 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
                 match parsed.r#type {
                     2 => {
-                        let Some(correlation_id) = self
-                            .identity
-                            .cache
-                            .lock()
-                            .await
-                            .get_correlation_id(&topic, &target, &sender)
-                        else {
-                            warn!("Failed to get correlation id for sender!");
-                            return Ok(vec![]);
-                        };
-
-                        let payload_data: Vec<IDSSharedItem> =
-                            plist::from_bytes(parsed.payload.as_ref())?;
-                        let mut results = vec![];
-                        for shared_item in payload_data {
-                            let Some(item) = self
-                                .add_shared_item(
-                                    shared_item,
-                                    sender.clone(),
-                                    correlation_id.clone(),
-                                    ns_since_epoch,
-                                )
-                                .await?
+                        // Hold one permit over the complete automatic share-acceptance
+                        // workflow. add_shared_item may delete an older share while
+                        // replacing it, so acquiring inside either helper would deadlock.
+                        return with_cloudkit_writer_operation(async {
+                            let Some(correlation_id) = self
+                                .identity
+                                .cache
+                                .lock()
+                                .await
+                                .get_correlation_id(&topic, &target, &sender)
                             else {
-                                continue;
+                                warn!("Failed to get correlation id for sender!");
+                                return Ok(vec![]);
                             };
-                            results.push((sender.clone(), item.0, item.1));
-                        }
-                        do_app_ack().await?;
-                        return Ok(results);
+
+                            let payload_data: Vec<IDSSharedItem> =
+                                plist::from_bytes(parsed.payload.as_ref())?;
+                            let mut results = vec![];
+                            for shared_item in payload_data {
+                                let Some(item) = self
+                                    .add_shared_item(
+                                        shared_item,
+                                        sender.clone(),
+                                        correlation_id.clone(),
+                                        ns_since_epoch,
+                                    )
+                                    .await?
+                                else {
+                                    continue;
+                                };
+                                results.push((sender.clone(), item.0, item.1));
+                            }
+                            do_app_ack().await?;
+                            Ok(results)
+                        })
+                        .await;
                     }
                     7 => {
-                        #[derive(Deserialize)]
-                        #[serde(rename_all = "camelCase")]
-                        struct DeleteItems {
-                            circle_identifiers: Vec<String>,
-                        }
-
-                        let payload_data: Vec<DeleteItems> =
-                            plist::from_bytes(parsed.payload.as_ref())?;
-                        for payload in payload_data {
-                            for circle in payload.circle_identifiers {
-                                self.delete_shared_item(&circle, true).await?;
+                        // This branch can send the acknowledgement and delete remote
+                        // records. Wait for any semantic-pull pause before doing either.
+                        with_cloudkit_writer_operation(async {
+                            #[derive(Deserialize)]
+                            #[serde(rename_all = "camelCase")]
+                            struct DeleteItems {
+                                circle_identifiers: Vec<String>,
                             }
-                        }
+
+                            let payload_data: Vec<DeleteItems> =
+                                plist::from_bytes(parsed.payload.as_ref())?;
+                            for payload in payload_data {
+                                for circle in payload.circle_identifiers {
+                                    self.delete_shared_item(&circle, true).await?;
+                                }
+                            }
+                            Ok::<(), PushError>(())
+                        })
+                        .await?;
                     }
                     _ => {}
                 }

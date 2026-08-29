@@ -1,6 +1,7 @@
 mod activation;
 mod aps;
 mod auth;
+pub mod cloudkit_operation_gate;
 mod error;
 pub mod facetime;
 pub mod findmy;

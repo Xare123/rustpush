@@ -67,6 +67,7 @@ use xml::{
 
 use crate::{
     aps::{get_message, APSInterestToken},
+    cloudkit_operation_gate::with_cloudkit_writer_operation,
     ids::user::{IDSUser, IDSUserIdentity, IDSUserType},
     keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity},
     util::{
@@ -1604,19 +1605,22 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                     info: message.step5.as_ref().unwrap().voucher.clone(),
                     signature: message.step5.as_ref().unwrap().voucher_sig.clone(),
                 };
-                self.trusted_peers
-                    .as_ref()
-                    .unwrap()
-                    .join_clique(
-                        self.saved_device_password.as_ref().unwrap(),
-                        self.private_identity
-                            .as_ref()
-                            .expect("no private identity??"),
-                        Some(info),
-                        &[],
-                        vec![],
-                    )
-                    .await?;
+                with_cloudkit_writer_operation(async {
+                    self.trusted_peers
+                        .as_ref()
+                        .unwrap()
+                        .join_clique(
+                            self.saved_device_password.as_ref().unwrap(),
+                            self.private_identity
+                                .as_ref()
+                                .expect("no private identity??"),
+                            Some(info),
+                            &[],
+                            vec![],
+                        )
+                        .await
+                })
+                .await?;
                 return Ok(Some(LoginState::LoggedIn));
             }
             _circlestep => {
@@ -1633,7 +1637,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
     ) -> Result<(), PushError> {
         self.private_identity = Some(peers.new_user_identity(false).await?);
 
-        peers.sync_trust().await?;
+        with_cloudkit_writer_operation(peers.sync_trust()).await?;
 
         let Some(request) = &self.saved_step else {
             return Ok(());
@@ -1779,7 +1783,10 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                 use prost::Message;
 
                 let is_in_clique = if let Some(tp) = &self.trusted_peers {
-                    tp.is_in_clique().await
+                    with_cloudkit_writer_operation(async {
+                        Ok::<bool, PushError>(tp.is_in_clique().await)
+                    })
+                    .await?
                 } else {
                     false
                 };
@@ -1922,7 +1929,10 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                 let channel = self.channel.as_ref().unwrap();
 
                 let is_in_clique = if let Some(tp) = &self.trusted_peers {
-                    tp.is_in_clique().await
+                    with_cloudkit_writer_operation(async {
+                        Ok::<bool, PushError>(tp.is_in_clique().await)
+                    })
+                    .await?
                 } else {
                     false
                 };
@@ -1977,7 +1987,8 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 
                 let peers = self.trusted_peers.as_ref().unwrap();
                 let tlks = peers.get_share_tlks().await?;
-                peers.share_tlks_to_peer(&cuttlefish_peer, &tlks).await?;
+                with_cloudkit_writer_operation(peers.share_tlks_to_peer(&cuttlefish_peer, &tlks))
+                    .await?;
 
                 let voucher = peers
                     .state

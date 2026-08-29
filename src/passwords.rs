@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
-    io::{Cursor, ErrorKind},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, LazyLock,
-    },
+    io::Cursor,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -59,13 +56,29 @@ use openssl::{
 use plist::{Data, Date, Dictionary, Value};
 use prost::Message;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
-use crate::{keychain::KeychainClient, PushError};
+use crate::{
+    cloudkit_operation_gate::{
+        pause_cloudkit_writer_operations, resume_cloudkit_writer_operations,
+        with_cloudkit_writer_operation,
+    },
+    keychain::KeychainClient,
+    PushError,
+};
 
 pub mod passwordsp {
     include!(concat!(env!("OUT_DIR"), "/passwordsp.rs"));
+}
+
+/// Backward-compatible bridge entry point for pausing native CloudKit writers.
+pub async fn pause_password_cloudkit_operations(token: u64) -> Result<u64, PushError> {
+    pause_cloudkit_writer_operations(token).await
+}
+
+/// Backward-compatible bridge entry point for resuming native CloudKit writers.
+pub async fn resume_password_cloudkit_operations(token: u64) -> Result<(), PushError> {
+    resume_cloudkit_writer_operations(token).await
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -106,234 +119,6 @@ pub struct PasswordState {
 
 fn zone_identifier_key(id: &RecordZoneIdentifier) -> String {
     base64_encode(&id.encode_to_vec())
-}
-
-const PASSWORD_CLOUDKIT_PAUSE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
-const PASSWORD_CLOUDKIT_OPERATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-struct PasswordCloudKitPause {
-    token: u64,
-    _permit: OwnedRwLockWriteGuard<()>,
-}
-
-struct PasswordCloudKitOperationGate {
-    operations: Arc<RwLock<()>>,
-    pause: Mutex<Option<PasswordCloudKitPause>>,
-    next_token: AtomicU64,
-    pause_acquire_timeout: Duration,
-    operation_acquire_timeout: Duration,
-}
-
-impl PasswordCloudKitOperationGate {
-    fn new(pause_acquire_timeout: Duration, operation_acquire_timeout: Duration) -> Self {
-        Self {
-            operations: Arc::new(RwLock::new(())),
-            pause: Mutex::new(None),
-            next_token: AtomicU64::new(rand::random::<u64>().max(1)),
-            pause_acquire_timeout,
-            operation_acquire_timeout,
-        }
-    }
-
-    fn next_token(&self) -> u64 {
-        loop {
-            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-            if token != 0 {
-                return token;
-            }
-        }
-    }
-
-    async fn acquire_operation(&self) -> Result<OwnedRwLockReadGuard<()>, PushError> {
-        tokio::time::timeout(
-            self.operation_acquire_timeout,
-            self.operations.clone().read_owned(),
-        )
-        .await
-        .map_err(|_| {
-            PushError::IoError(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "password CloudKit operations are paused",
-            ))
-        })
-    }
-
-    async fn pause(&self) -> Result<u64, PushError> {
-        let deadline = tokio::time::Instant::now() + self.pause_acquire_timeout;
-        let mut pause = tokio::time::timeout_at(deadline, self.pause.lock())
-            .await
-            .map_err(|_| {
-                PushError::IoError(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "timed out waiting to pause password CloudKit operations",
-                ))
-            })?;
-        if pause.is_some() {
-            return Err(PushError::IoError(std::io::Error::new(
-                ErrorKind::WouldBlock,
-                "password CloudKit operations are already paused",
-            )));
-        }
-
-        let permit = tokio::time::timeout_at(deadline, self.operations.clone().write_owned())
-            .await
-            .map_err(|_| {
-                PushError::IoError(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "timed out waiting to pause password CloudKit operations",
-                ))
-            })?;
-
-        let token = self.next_token();
-        *pause = Some(PasswordCloudKitPause {
-            token,
-            _permit: permit,
-        });
-        Ok(token)
-    }
-
-    async fn resume(&self, token: u64) -> Result<(), PushError> {
-        let mut pause = self.pause.lock().await;
-        if token == 0 || pause.as_ref().map(|active| active.token) != Some(token) {
-            return Err(PushError::IoError(std::io::Error::new(
-                ErrorKind::PermissionDenied,
-                "invalid password CloudKit pause token",
-            )));
-        }
-
-        pause.take();
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
-    const TEST_WAIT: Duration = Duration::from_millis(20);
-
-    fn test_gate() -> Arc<PasswordCloudKitOperationGate> {
-        Arc::new(PasswordCloudKitOperationGate::new(
-            TEST_TIMEOUT,
-            TEST_TIMEOUT,
-        ))
-    }
-
-    #[tokio::test]
-    async fn pause_waits_for_active_operation() {
-        let gate = test_gate();
-        let operation = gate.acquire_operation().await.unwrap();
-        let pause_gate = gate.clone();
-        let mut pause_task = tokio::spawn(async move { pause_gate.pause().await });
-
-        assert!(tokio::time::timeout(TEST_WAIT, &mut pause_task)
-            .await
-            .is_err());
-
-        drop(operation);
-        let token = tokio::time::timeout(TEST_TIMEOUT, pause_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        gate.resume(token).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn paused_gate_blocks_new_operations() {
-        let gate = test_gate();
-        let token = gate.pause().await.unwrap();
-        let operation_gate = gate.clone();
-        let mut operation_task =
-            tokio::spawn(async move { operation_gate.acquire_operation().await });
-
-        assert!(tokio::time::timeout(TEST_WAIT, &mut operation_task)
-            .await
-            .is_err());
-
-        gate.resume(token).await.unwrap();
-        let operation = tokio::time::timeout(TEST_TIMEOUT, operation_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        drop(operation);
-    }
-
-    #[tokio::test]
-    async fn resume_releases_exactly_one_pause_token() {
-        let gate = test_gate();
-        let first_token = gate.pause().await.unwrap();
-        gate.resume(first_token).await.unwrap();
-
-        let second_token = gate.pause().await.unwrap();
-        assert_ne!(first_token, second_token);
-        assert!(matches!(
-            gate.resume(first_token).await,
-            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
-        ));
-        gate.resume(second_token).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_and_double_resume_fail() {
-        let gate = test_gate();
-        assert!(matches!(
-            gate.resume(0).await,
-            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
-        ));
-
-        let token = gate.pause().await.unwrap();
-        assert!(matches!(
-            gate.resume(token.wrapping_add(1)).await,
-            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
-        ));
-        gate.resume(token).await.unwrap();
-        assert!(matches!(
-            gate.resume(token).await,
-            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
-        ));
-    }
-
-    #[tokio::test]
-    async fn pause_timeout_leaves_no_orphan_pause() {
-        let gate = Arc::new(PasswordCloudKitOperationGate::new(TEST_WAIT, TEST_TIMEOUT));
-        let operation = gate.acquire_operation().await.unwrap();
-
-        assert!(matches!(
-            gate.pause().await,
-            Err(PushError::IoError(error)) if error.kind() == ErrorKind::TimedOut
-        ));
-
-        drop(operation);
-        let operation = tokio::time::timeout(TEST_TIMEOUT, gate.acquire_operation())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(operation);
-
-        let token = gate.pause().await.unwrap();
-        gate.resume(token).await.unwrap();
-    }
-}
-
-static PASSWORD_CLOUDKIT_OPERATION_GATE: LazyLock<PasswordCloudKitOperationGate> =
-    LazyLock::new(|| {
-        PasswordCloudKitOperationGate::new(
-            PASSWORD_CLOUDKIT_PAUSE_ACQUIRE_TIMEOUT,
-            PASSWORD_CLOUDKIT_OPERATION_ACQUIRE_TIMEOUT,
-        )
-    });
-
-/// Pauses Passwords and Keychain CloudKit work after in-flight operations finish.
-pub async fn pause_password_cloudkit_operations() -> Result<u64, PushError> {
-    PASSWORD_CLOUDKIT_OPERATION_GATE.pause().await
-}
-
-/// Resumes Passwords and Keychain CloudKit work paused by the matching token.
-pub async fn resume_password_cloudkit_operations(token: u64) -> Result<(), PushError> {
-    PASSWORD_CLOUDKIT_OPERATION_GATE.resume(token).await
 }
 
 pub struct PasswordManager<P: AnisetteProvider> {
@@ -1559,21 +1344,20 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                 let msg_copy = msg.clone();
                 let self_copy = self.clone();
                 tokio::task::spawn(async move {
-                    let _operation = match PASSWORD_CLOUDKIT_OPERATION_GATE
-                        .acquire_operation()
-                        .await
-                    {
-                        Ok(operation) => operation,
-                        Err(e) => {
-                            warn!("Skipped password/keychain sync while CloudKit operations are paused {e}");
-                            return;
+                    if let Err(e) = with_cloudkit_writer_operation(async {
+                        if let Err(e) = self_copy.handle_notif(&msg_copy).await {
+                            warn!("Failed to sync in response to update {e}");
                         }
-                    };
-                    if let Err(e) = self_copy.handle_notif(&msg_copy).await {
-                        warn!("Failed to sync in response to update {e}");
-                    }
-                    if let Err(e) = self_copy.handle_keychain_notif(&msg_copy).await {
-                        warn!("Failed to sync in response to update {e}");
+                        if let Err(e) = self_copy.handle_keychain_notif(&msg_copy).await {
+                            warn!("Failed to sync in response to update {e}");
+                        }
+                        Ok::<(), PushError>(())
+                    })
+                    .await
+                    {
+                        warn!(
+                            "Skipped password/keychain sync while CloudKit operations are paused {e}"
+                        );
                     }
                 });
             }
@@ -1611,36 +1395,40 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn accept_invite(&self, invite_id: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let container = self.get_shared_container().await?;
-        let mut groups = self.state.write().await;
-        let group = groups
-            .invite_groups
-            .get(invite_id)
-            .expect("invite not found!!");
-        container
-            .accept_participant(
-                &self.keychain,
-                &SHARED_PASSWORDS_SERVICE,
-                group.invitation_token.as_ref(),
-                &group.share_url,
-            )
-            .await?;
-        groups.invite_groups.remove(invite_id);
-        Ok(())
+        with_cloudkit_writer_operation(async {
+            let container = self.get_shared_container().await?;
+            let mut groups = self.state.write().await;
+            let group = groups
+                .invite_groups
+                .get(invite_id)
+                .expect("invite not found!!");
+            container
+                .accept_participant(
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    group.invitation_token.as_ref(),
+                    &group.share_url,
+                )
+                .await?;
+            groups.invite_groups.remove(invite_id);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn decline_invite(&self, invite_id: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let container = self.get_shared_container().await?;
-        let mut groups = self.state.write().await;
-        let group = groups
-            .invite_groups
-            .get(invite_id)
-            .expect("invite not found!!");
-        container.decline_participant(&group.share_url).await?;
-        groups.invite_groups.remove(invite_id);
-        Ok(())
+        with_cloudkit_writer_operation(async {
+            let container = self.get_shared_container().await?;
+            let mut groups = self.state.write().await;
+            let group = groups
+                .invite_groups
+                .get(invite_id)
+                .expect("invite not found!!");
+            container.decline_participant(&group.share_url).await?;
+            groups.invite_groups.remove(invite_id);
+            Ok(())
+        })
+        .await
     }
 
     async fn sync_groups(&self) -> Result<(), PushError> {
@@ -1902,91 +1690,97 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn remove_group(&self, id: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let mut groups = self.state.write().await;
-        let group = groups.groups.get(id).expect("Zone not found!");
+        with_cloudkit_writer_operation(async {
+            let mut groups = self.state.write().await;
+            let group = groups.groups.get(id).expect("Zone not found!");
 
-        if group.is_owner {
-            let container = self.get_container().await?;
-            let delete = ZoneDeleteOperation::new(group.id.clone());
-            container.perform(&CloudKitSession::new(), delete).await?;
-        } else {
-            let container = self.get_shared_container().await?;
-            let delete = DeleteRecordOperation::new(record_identifier(
-                group.id.clone(),
-                "cloudkit.zoneshare",
-            ));
-            container.perform(&CloudKitSession::new(), delete).await?;
-        }
-        groups.groups.remove(id);
-        (self.update_state)(&groups);
-        Ok(())
+            if group.is_owner {
+                let container = self.get_container().await?;
+                let delete = ZoneDeleteOperation::new(group.id.clone());
+                container.perform(&CloudKitSession::new(), delete).await?;
+            } else {
+                let container = self.get_shared_container().await?;
+                let delete = DeleteRecordOperation::new(record_identifier(
+                    group.id.clone(),
+                    "cloudkit.zoneshare",
+                ));
+                container.perform(&CloudKitSession::new(), delete).await?;
+            }
+            groups.groups.remove(id);
+            (self.update_state)(&groups);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn create_group(&self, name: &str) -> Result<String, PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let container = self.get_container().await?;
-        let group = Uuid::new_v4().to_string().to_uppercase();
-        let zone = container.private_zone(format!("group-{group}"));
+        with_cloudkit_writer_operation(async {
+            let container = self.get_container().await?;
+            let group = Uuid::new_v4().to_string().to_uppercase();
+            let zone = container.private_zone(format!("group-{group}"));
 
-        let service = PCSPrivateKey::get_service_key(
-            &self.keychain,
-            &SHARED_PASSWORDS_SERVICE,
-            self.client.config.as_ref(),
-        )
-        .await?;
-
-        // this will create the zone for us
-        let mut keys = container
-            .get_zone_encryption_config(&zone, &self.keychain, &SHARED_PASSWORDS_SERVICE)
-            .await?;
-        let mut share = CloudKitShare {
-            display_name: name.to_string(),
-            share_info: create_share(&zone, "cloudkit.zoneshare", &service)?,
-            url: None,
-            public_sharing_key: vec![],
-        };
-        container
-            .update_zone_share(
-                &mut keys,
+            let service = PCSPrivateKey::get_service_key(
                 &self.keychain,
                 &SHARED_PASSWORDS_SERVICE,
-                &mut share,
+                self.client.config.as_ref(),
             )
             .await?;
 
-        let mut groups = self.state.write().await;
-        groups.groups.insert(
-            zone_identifier_key(&zone),
-            SavedPasswordGroup {
-                id: zone.clone(),
-                share: Some(share),
-                sync_continuation_token: None,
-                invitations: HashMap::new(),
-                items: HashMap::new(),
-                is_owner: true,
-            },
-        );
-        (self.update_state)(&groups);
+            // this will create the zone for us
+            let mut keys = container
+                .get_zone_encryption_config(&zone, &self.keychain, &SHARED_PASSWORDS_SERVICE)
+                .await?;
+            let mut share = CloudKitShare {
+                display_name: name.to_string(),
+                share_info: create_share(&zone, "cloudkit.zoneshare", &service)?,
+                url: None,
+                public_sharing_key: vec![],
+            };
+            container
+                .update_zone_share(
+                    &mut keys,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    &mut share,
+                )
+                .await?;
 
-        Ok(zone_identifier_key(&zone))
+            let mut groups = self.state.write().await;
+            groups.groups.insert(
+                zone_identifier_key(&zone),
+                SavedPasswordGroup {
+                    id: zone.clone(),
+                    share: Some(share),
+                    sync_continuation_token: None,
+                    invitations: HashMap::new(),
+                    items: HashMap::new(),
+                    is_owner: true,
+                },
+            );
+            (self.update_state)(&groups);
+
+            Ok(zone_identifier_key(&zone))
+        })
+        .await
     }
 
     pub async fn rename_group(&self, id: &str, new_name: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let mut groups = self.state.write().await;
-        let group = groups.groups.get_mut(id).expect("Zone not found!");
-        let share = group.share.as_mut().expect("no share");
-        share.display_name = new_name.to_string();
+        with_cloudkit_writer_operation(async {
+            let mut groups = self.state.write().await;
+            let group = groups.groups.get_mut(id).expect("Zone not found!");
+            let share = group.share.as_mut().expect("no share");
+            share.display_name = new_name.to_string();
 
-        let container = self.get_container().await?;
-        let mut keys = container
-            .get_zone_encryption_config(&group.id, &self.keychain, &SHARED_PASSWORDS_SERVICE)
-            .await?;
-        container
-            .update_zone_share(&mut keys, &self.keychain, &SHARED_PASSWORDS_SERVICE, share)
-            .await?;
-        Ok(())
+            let container = self.get_container().await?;
+            let mut keys = container
+                .get_zone_encryption_config(&group.id, &self.keychain, &SHARED_PASSWORDS_SERVICE)
+                .await?;
+            container
+                .update_zone_share(&mut keys, &self.keychain, &SHARED_PASSWORDS_SERVICE, share)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn send_invite_message(
@@ -2063,140 +1857,145 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     pub async fn remove_user(&self, group: &str, send_handle: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let container = self.get_container().await?;
+        with_cloudkit_writer_operation(async {
+            let container = self.get_container().await?;
 
-        let mut groups = self.state.write().await;
+            let mut groups = self.state.write().await;
 
-        let group = groups.groups.get_mut(group).expect("Zone not found!");
-        let zone_identifier = group.id.clone();
-        let zone = group.share.as_mut().expect("no share");
-        let participant = zone
-            .find_participant_by_handle(&send_handle)
-            .expect("Particiupant remove nto found!")
-            .clone();
+            let group = groups.groups.get_mut(group).expect("Zone not found!");
+            let zone_identifier = group.id.clone();
+            let zone = group.share.as_mut().expect("no share");
+            let participant = zone
+                .find_participant_by_handle(&send_handle)
+                .expect("Particiupant remove nto found!")
+                .clone();
 
-        let mut pcs_config = container
-            .get_zone_encryption_config_share(
-                &zone_identifier,
-                &self.keychain,
-                &SHARED_PASSWORDS_SERVICE,
-                Some(zone.share_info.clone()),
-            )
-            .await?;
+            let mut pcs_config = container
+                .get_zone_encryption_config_share(
+                    &zone_identifier,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    Some(zone.share_info.clone()),
+                )
+                .await?;
 
-        let participant_id = get_participant_id(&participant).to_string();
+            let participant_id = get_participant_id(&participant).to_string();
 
-        container
-            .remove_participant(
-                &mut pcs_config,
-                &self.keychain,
-                &SHARED_PASSWORDS_SERVICE,
-                zone,
-                &participant_id,
-            )
-            .await?;
+            container
+                .remove_participant(
+                    &mut pcs_config,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    zone,
+                    &participant_id,
+                )
+                .await?;
 
-        let zone_copy = zone.clone();
-        (self.update_state)(&groups);
+            let zone_copy = zone.clone();
+            (self.update_state)(&groups);
 
-        let group = groups
-            .groups
-            .get_mut(&zone_identifier_key(&zone_identifier))
-            .expect("Zone not found!");
-        let invite = participant
-            .contact_information
-            .as_ref()
-            .and_then(|c| {
-                group
-                    .invitations
-                    .remove(&format!("tel:+{}", c.phone_number()))
-            })
-            .or(participant.contact_information.as_ref().and_then(|c| {
-                group
-                    .invitations
-                    .remove(&format!("mailto:{}", c.email_address()))
-            }));
-        if let Some(invite) = invite {
-            self.send_invite_message(&invite, 3, &zone_copy).await?;
-        }
+            let group = groups
+                .groups
+                .get_mut(&zone_identifier_key(&zone_identifier))
+                .expect("Zone not found!");
+            let invite = participant
+                .contact_information
+                .as_ref()
+                .and_then(|c| {
+                    group
+                        .invitations
+                        .remove(&format!("tel:+{}", c.phone_number()))
+                })
+                .or(participant.contact_information.as_ref().and_then(|c| {
+                    group
+                        .invitations
+                        .remove(&format!("mailto:{}", c.email_address()))
+                }));
+            if let Some(invite) = invite {
+                self.send_invite_message(&invite, 3, &zone_copy).await?;
+            }
 
-        (self.update_state)(&groups);
-        Ok(())
+            (self.update_state)(&groups);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn invite_user(&self, group_id: &str, send_handle: &str) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let container = self.get_container().await?;
+        with_cloudkit_writer_operation(async {
+            let container = self.get_container().await?;
 
-        let mut groups = self.state.write().await;
+            let mut groups = self.state.write().await;
 
-        let group = groups.groups.get_mut(group_id).expect("Zone not found!");
-        let zone_id = group.id.clone();
-        let zone = group.share.as_mut().expect("no share");
+            let group = groups.groups.get_mut(group_id).expect("Zone not found!");
+            let zone_id = group.id.clone();
+            let zone = group.share.as_mut().expect("no share");
 
-        let mut pcs_config = container
-            .get_zone_encryption_config_share(
-                &zone_id,
-                &self.keychain,
-                &SHARED_PASSWORDS_SERVICE,
-                Some(zone.share_info.clone()),
-            )
-            .await?;
+            let mut pcs_config = container
+                .get_zone_encryption_config_share(
+                    &zone_id,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    Some(zone.share_info.clone()),
+                )
+                .await?;
 
-        let invite = container
-            .add_participant(
-                &mut pcs_config,
-                &self.keychain,
-                &SHARED_PASSWORDS_SERVICE,
-                zone,
-                send_handle,
-            )
-            .await?;
+            let invite = container
+                .add_participant(
+                    &mut pcs_config,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    zone,
+                    send_handle,
+                )
+                .await?;
 
-        let invite_id = Uuid::new_v4().to_string().to_uppercase();
+            let invite_id = Uuid::new_v4().to_string().to_uppercase();
 
-        let zone_identifier = zone_id
-            .value
-            .as_ref()
-            .expect("no zid")
-            .name()
-            .replacen("group-", "", 1);
-        let password_invite = PasswordInvite {
-            send_handle: send_handle.to_string(),
-            group: zone_identifier,
-            invite,
-            invite_id,
-            time: SystemTime::now(),
-        };
+            let zone_identifier = zone_id
+                .value
+                .as_ref()
+                .expect("no zid")
+                .name()
+                .replacen("group-", "", 1);
+            let password_invite = PasswordInvite {
+                send_handle: send_handle.to_string(),
+                group: zone_identifier,
+                invite,
+                invite_id,
+                time: SystemTime::now(),
+            };
 
-        let zone_copy = zone.clone();
+            let zone_copy = zone.clone();
 
-        (self.update_state)(&groups);
-        self.send_invite_message(&password_invite, 1, &zone_copy)
-            .await?;
+            (self.update_state)(&groups);
+            self.send_invite_message(&password_invite, 1, &zone_copy)
+                .await?;
 
-        let group = groups
-            .groups
-            .get_mut(&zone_identifier_key(&zone_id))
-            .expect("Zone not found!");
-        group
-            .invitations
-            .insert(send_handle.to_string(), password_invite);
-        (self.update_state)(&groups);
+            let group = groups
+                .groups
+                .get_mut(&zone_identifier_key(&zone_id))
+                .expect("Zone not found!");
+            group
+                .invitations
+                .insert(send_handle.to_string(), password_invite);
+            (self.update_state)(&groups);
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     pub async fn sync_passwords(&self, connection: &APSConnection) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        self.prepare_watch(connection).await?;
-        self.keychain
-            .sync_keychain(&["WiFi", "Passwords", "CreditCards"])
-            .await?;
-
-        self.sync_groups().await?;
-        Ok(())
+        with_cloudkit_writer_operation(async {
+            self.prepare_watch(connection).await?;
+            self.keychain
+                .sync_keychain(&["WiFi", "Passwords", "CreditCards"])
+                .await?;
+            self.sync_groups().await?;
+            Ok(())
+        })
+        .await
     }
 
     pub fn iter_password_entries<'a, T: PasswordEntry>(
@@ -2307,26 +2106,28 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         apply: impl FnOnce(&mut T),
         default_group: Option<String>,
     ) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        let pwstate = self.state.read().await;
-        let state = self.keychain.state.read().await;
-        let mut existing = self
-            .iter_password_entries::<T>(&state, &pwstate)
-            .find(|i| i.1 .1.match_criteria(criteria))
-            .unwrap_or_else(|| {
-                (
-                    Uuid::new_v4().to_string().to_uppercase(),
-                    (default_group, T::new_with_criteria(criteria)),
-                )
-            });
+        with_cloudkit_writer_operation(async {
+            let pwstate = self.state.read().await;
+            let state = self.keychain.state.read().await;
+            let mut existing = self
+                .iter_password_entries::<T>(&state, &pwstate)
+                .find(|i| i.1 .1.match_criteria(criteria))
+                .unwrap_or_else(|| {
+                    (
+                        Uuid::new_v4().to_string().to_uppercase(),
+                        (default_group, T::new_with_criteria(criteria)),
+                    )
+                });
 
-        drop(state);
-        drop(pwstate);
+            drop(state);
+            drop(pwstate);
 
-        apply(&mut existing.1 .1);
+            apply(&mut existing.1 .1);
 
-        self.insert_password_entry_inner(&existing.0, &existing.1 .1, existing.1 .0)
-            .await
+            self.insert_password_entry_inner(&existing.0, &existing.1 .1, existing.1 .0)
+                .await
+        })
+        .await
     }
 
     pub async fn insert_password_entry<T: PasswordEntry>(
@@ -2335,8 +2136,10 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         entry: &T,
         group: Option<String>,
     ) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        self.insert_password_entry_inner(id, entry, group).await
+        with_cloudkit_writer_operation(async {
+            self.insert_password_entry_inner(id, entry, group).await
+        })
+        .await
     }
 
     async fn insert_password_entry_inner<T: PasswordEntry>(
@@ -2414,30 +2217,32 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         id: &str,
         group: Option<String>,
     ) -> Result<(), PushError> {
-        let _operation = PASSWORD_CLOUDKIT_OPERATION_GATE.acquire_operation().await?;
-        if let Some(group) = group {
-            let mut groups = self.state.write().await;
+        with_cloudkit_writer_operation(async {
+            if let Some(group) = group {
+                let mut groups = self.state.write().await;
 
-            let group = groups.groups.get_mut(&group).expect("Zone not found!");
-            let container = if group.is_owner {
-                self.get_container().await?
+                let group = groups.groups.get_mut(&group).expect("Zone not found!");
+                let container = if group.is_owner {
+                    self.get_container().await?
+                } else {
+                    self.get_shared_container().await?
+                };
+
+                let operation = DeleteRecordOperation::new(record_identifier(
+                    group.id.clone(),
+                    &format!("item-{id}"),
+                ));
+                container
+                    .perform(&CloudKitSession::new(), operation)
+                    .await?;
+
+                group.items.remove(id);
+                (self.update_state)(&groups);
             } else {
-                self.get_shared_container().await?
-            };
-
-            let operation = DeleteRecordOperation::new(record_identifier(
-                group.id.clone(),
-                &format!("item-{id}"),
-            ));
-            container
-                .perform(&CloudKitSession::new(), operation)
-                .await?;
-
-            group.items.remove(id);
-            (self.update_state)(&groups);
-        } else {
-            self.keychain.delete_keychain(id, T::view()).await?;
-        }
-        Ok(())
+                self.keychain.delete_keychain(id, T::view()).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 }

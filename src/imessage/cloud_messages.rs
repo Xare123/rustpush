@@ -55,6 +55,7 @@ use crate::util::{
 };
 use crate::{
     cloudkit::{CloudKitClient, CloudKitContainer},
+    cloudkit_operation_gate::with_cloudkit_writer_operation,
     PushError,
 };
 use crate::{Attachment, AttachmentType, FileContainer};
@@ -2073,46 +2074,49 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         request_identity: CloudKitRequestIdentity,
         request_timeout: Duration,
     ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
-        if request_timeout.is_zero() || request_timeout > Duration::from_secs(5 * 60) {
-            return Err(PushError::BadMsg);
-        }
-        let ordered_pairs = ordered_message_save_pairs(&messages, &request_identity)?;
-        let container = self.get_container_lookup_only().await?;
-        let zone = container.private_zone("messageManateeZone".to_string());
-        let key = container
-            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
-            .await?;
+        with_cloudkit_writer_operation(async move {
+            if request_timeout.is_zero() || request_timeout > Duration::from_secs(5 * 60) {
+                return Err(PushError::BadMsg);
+            }
+            let ordered_pairs = ordered_message_save_pairs(&messages, &request_identity)?;
+            let container = self.get_container_lookup_only().await?;
+            let zone = container.private_zone("messageManateeZone".to_string());
+            let key = container
+                .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+                .await?;
 
-        let mut operations = Vec::with_capacity(messages.len());
-        let mut local_operation_ids = Vec::with_capacity(messages.len());
-        for (input, (paired_local_operation_id, _)) in
-            messages.into_iter().zip(ordered_pairs.iter())
-        {
-            debug_assert_eq!(&input.local_operation_id, paired_local_operation_id);
-            operations.push(SaveRecordOperation::try_new(
-                record_identifier(zone.clone(), &input.server_record_name),
-                input.message,
-                Some(&key),
-                CloudMessagesSaveMode::CreateOnly.update_flag(),
-            )?);
-            local_operation_ids.push(input.local_operation_id);
-        }
+            let mut operations = Vec::with_capacity(messages.len());
+            let mut local_operation_ids = Vec::with_capacity(messages.len());
+            for (input, (paired_local_operation_id, _)) in
+                messages.into_iter().zip(ordered_pairs.iter())
+            {
+                debug_assert_eq!(&input.local_operation_id, paired_local_operation_id);
+                operations.push(SaveRecordOperation::try_new(
+                    record_identifier(zone.clone(), &input.server_record_name),
+                    input.message,
+                    Some(&key),
+                    CloudMessagesSaveMode::CreateOnly.update_flag(),
+                )?);
+                local_operation_ids.push(input.local_operation_id);
+            }
 
-        let prepared_authentication = container.prepare_operations_authentication().await?;
+            let prepared_authentication = container.prepare_operations_authentication().await?;
 
-        Ok(CloudMessagesPreparedSaveSubmission {
-            container,
-            session: CloudKitSession::new(),
-            request_identity,
-            prepared_authentication,
-            operations,
-            local_operation_ids,
-            retry_policy: CloudKitRetryPolicy {
-                max_attempts: 1,
-                request_timeout,
-                ..CloudKitRetryPolicy::default()
-            },
+            Ok(CloudMessagesPreparedSaveSubmission {
+                container,
+                session: CloudKitSession::new(),
+                request_identity,
+                prepared_authentication,
+                operations,
+                local_operation_ids,
+                retry_policy: CloudKitRetryPolicy {
+                    max_attempts: 1,
+                    request_timeout,
+                    ..CloudKitRetryPolicy::default()
+                },
+            })
         })
+        .await
     }
 
     async fn sync_records_page(
@@ -2232,93 +2236,99 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         zone: &str,
         records: HashMap<String, T>,
     ) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
-        let container = self.get_container().await?;
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
 
-        let zone = container.private_zone(zone.to_string());
-        let key = container
-            .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
-            .await?;
+            let zone = container.private_zone(zone.to_string());
+            let key = container
+                .get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE)
+                .await?;
 
-        let mut results = HashMap::new();
-        let records = records.into_iter().collect::<Vec<_>>();
+            let mut results = HashMap::new();
+            let records = records.into_iter().collect::<Vec<_>>();
 
-        for batch in records.chunks(256) {
-            let mut operations = vec![];
-            let mut ids = vec![];
-            for (record_id, chat) in batch {
-                operations.push(SaveRecordOperation::try_new(
-                    record_identifier(zone.clone(), &record_id),
-                    chat,
-                    Some(&key),
-                    true,
-                )?);
-                ids.push(record_id.clone());
-            }
-
-            let mut result: HashMap<usize, Result<(), PushError>> = match container
-                .perform_operations(
-                    &CloudKitSession::new(),
-                    &operations,
-                    IsolationLevel::Operation,
-                )
-                .await
-            {
-                Ok(item) => item
-                    .into_iter()
-                    .map(|i| i.map(|_| ()))
-                    .enumerate()
-                    .collect(),
-                Err(e) => {
-                    let joined = Arc::new(e);
-                    results.extend(
-                        ids.into_iter()
-                            .map(|r| (r, Err(PushError::BatchError(joined.clone())))),
-                    );
-                    continue;
+            for batch in records.chunks(256) {
+                let mut operations = vec![];
+                let mut ids = vec![];
+                for (record_id, chat) in batch {
+                    operations.push(SaveRecordOperation::try_new(
+                        record_identifier(zone.clone(), &record_id),
+                        chat,
+                        Some(&key),
+                        true,
+                    )?);
+                    ids.push(record_id.clone());
                 }
-            };
 
-            results.extend(
-                ids.into_iter()
-                    .enumerate()
-                    .map(|(idx, r)| (r, result.remove(&idx).unwrap())),
-            );
-        }
-
-        Ok(results)
-    }
-
-    async fn delete_records(&self, zone: &str, records: &[String]) -> Result<(), PushError> {
-        let container = self.get_container().await?;
-
-        let zone = container.private_zone(zone.to_string());
-
-        for batch in records.chunks(256) {
-            let mut operations = vec![];
-            for record_id in batch {
-                operations.push(DeleteRecordOperation::new(record_identifier(
-                    zone.clone(),
-                    record_id,
-                )));
-            }
-            (|| async {
-                container
-                    .perform_operations_checked(
+                let mut result: HashMap<usize, Result<(), PushError>> = match container
+                    .perform_operations(
                         &CloudKitSession::new(),
                         &operations,
                         IsolationLevel::Operation,
                     )
                     .await
-            })
-            .retry(
-                &ConstantBuilder::default()
-                    .with_delay(Duration::from_secs(5))
-                    .with_max_times(3),
-            )
-            .await?;
-        }
+                {
+                    Ok(item) => item
+                        .into_iter()
+                        .map(|i| i.map(|_| ()))
+                        .enumerate()
+                        .collect(),
+                    Err(e) => {
+                        let joined = Arc::new(e);
+                        results.extend(
+                            ids.into_iter()
+                                .map(|r| (r, Err(PushError::BatchError(joined.clone())))),
+                        );
+                        continue;
+                    }
+                };
 
-        Ok(())
+                results.extend(
+                    ids.into_iter()
+                        .enumerate()
+                        .map(|(idx, r)| (r, result.remove(&idx).unwrap())),
+                );
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn delete_records(&self, zone: &str, records: &[String]) -> Result<(), PushError> {
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
+
+            let zone = container.private_zone(zone.to_string());
+
+            for batch in records.chunks(256) {
+                let mut operations = vec![];
+                for record_id in batch {
+                    operations.push(DeleteRecordOperation::new(record_identifier(
+                        zone.clone(),
+                        record_id,
+                    )));
+                }
+                (|| async {
+                    container
+                        .perform_operations_checked(
+                            &CloudKitSession::new(),
+                            &operations,
+                            IsolationLevel::Operation,
+                        )
+                        .await
+                })
+                .retry(
+                    &ConstantBuilder::default()
+                        .with_delay(Duration::from_secs(5))
+                        .with_max_times(3),
+                )
+                .await?;
+            }
+
+            Ok(())
+        })
+        .await
     }
 
     async fn count_zone_records(&self, zone: &str) -> Result<CloudMessageSummary, PushError> {
@@ -2366,47 +2376,53 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn reset(&self) -> Result<(), PushError> {
-        let container = self.get_container().await?;
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
 
-        container.keys.lock().await.clear();
+            container.keys.lock().await.clear();
 
-        container
-            .perform_operations_checked(
-                &CloudKitSession::new(),
-                &[
-                    ZoneDeleteOperation::new(container.private_zone("chatManateeZone".to_string())),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("messageManateeZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("attachmentManateeZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("chat1ManateeZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("messageUpdateZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("recoverableMessageDeleteZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("scheduledMessageZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("chatBotMessageZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("chatBotAttachmentZone".to_string()),
-                    ),
-                    ZoneDeleteOperation::new(
-                        container.private_zone("chatBotRecoverableMessageDeleteZone".to_string()),
-                    ),
-                ],
-                IsolationLevel::Operation,
-            )
-            .await?;
-        Ok(())
+            container
+                .perform_operations_checked(
+                    &CloudKitSession::new(),
+                    &[
+                        ZoneDeleteOperation::new(
+                            container.private_zone("chatManateeZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("messageManateeZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("attachmentManateeZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("chat1ManateeZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("messageUpdateZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("recoverableMessageDeleteZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("scheduledMessageZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("chatBotMessageZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container.private_zone("chatBotAttachmentZone".to_string()),
+                        ),
+                        ZoneDeleteOperation::new(
+                            container
+                                .private_zone("chatBotRecoverableMessageDeleteZone".to_string()),
+                        ),
+                    ],
+                    IsolationLevel::Operation,
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn sync_chats(
@@ -2666,49 +2682,55 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         &self,
         files: Vec<(PreparedPut, T, String)>,
     ) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
-        let container = self.get_container().await?;
-        Ok(container
-            .upload_asset(
-                &CloudKitSession::new(),
-                &container.private_zone("attachmentManateeZone".to_string()),
-                files
-                    .into_iter()
-                    .map(|f| CloudKitUploadRequest {
-                        file: Some(f.1),
-                        record_id: f.2,
-                        field: "lqa",
-                        record_type: CloudAttachment::record_type(),
-                        prepared: f.0,
-                    })
-                    .collect(),
-            )
-            .await?
-            .remove("lqa")
-            .unwrap_or_default())
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
+            Ok(container
+                .upload_asset(
+                    &CloudKitSession::new(),
+                    &container.private_zone("attachmentManateeZone".to_string()),
+                    files
+                        .into_iter()
+                        .map(|f| CloudKitUploadRequest {
+                            file: Some(f.1),
+                            record_id: f.2,
+                            field: "lqa",
+                            record_type: CloudAttachment::record_type(),
+                            prepared: f.0,
+                        })
+                        .collect(),
+                )
+                .await?
+                .remove("lqa")
+                .unwrap_or_default())
+        })
+        .await
     }
 
     pub async fn upload_group_photo<T: Read + Send + Sync>(
         &self,
         files: Vec<(PreparedPut, T, String)>,
     ) -> Result<Vec<cloudkit_proto::Asset>, PushError> {
-        let container = self.get_container().await?;
-        Ok(container
-            .upload_asset(
-                &CloudKitSession::new(),
-                &container.private_zone("chatManateeZone".to_string()),
-                files
-                    .into_iter()
-                    .map(|f| CloudKitUploadRequest {
-                        file: Some(f.1),
-                        record_id: f.2,
-                        field: "gp",
-                        record_type: CloudChat::record_type(),
-                        prepared: f.0,
-                    })
-                    .collect(),
-            )
-            .await?
-            .remove("gp")
-            .unwrap_or_default())
+        with_cloudkit_writer_operation(async move {
+            let container = self.get_container().await?;
+            Ok(container
+                .upload_asset(
+                    &CloudKitSession::new(),
+                    &container.private_zone("chatManateeZone".to_string()),
+                    files
+                        .into_iter()
+                        .map(|f| CloudKitUploadRequest {
+                            file: Some(f.1),
+                            record_id: f.2,
+                            field: "gp",
+                            record_type: CloudChat::record_type(),
+                            prepared: f.0,
+                        })
+                        .collect(),
+                )
+                .await?
+                .remove("gp")
+                .unwrap_or_default())
+        })
+        .await
     }
 }

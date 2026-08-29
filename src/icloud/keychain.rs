@@ -78,6 +78,7 @@ use crate::{
         CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession,
         FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS,
     },
+    cloudkit_operation_gate::with_cloudkit_writer_operation,
     util::{
         base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize,
         bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch,
@@ -1793,23 +1794,26 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn delete_keychain(&self, uuid: &str, zone: &str) -> Result<(), PushError> {
-        let security_container = self.get_security_container().await?;
-        let record_zone = security_container.private_zone(zone.to_string());
+        with_cloudkit_writer_operation(async move {
+            let security_container = self.get_security_container().await?;
+            let record_zone = security_container.private_zone(zone.to_string());
 
-        security_container
-            .perform(
-                &CloudKitSession::new(),
-                DeleteRecordOperation::new(record_identifier(record_zone, uuid)),
-            )
-            .await?;
+            security_container
+                .perform(
+                    &CloudKitSession::new(),
+                    DeleteRecordOperation::new(record_identifier(record_zone, uuid)),
+                )
+                .await?;
 
-        let mut state = self.state.write().await;
-        let zone = state.items.entry(zone.to_string()).or_default();
-        zone.keys.remove(uuid);
+            let mut state = self.state.write().await;
+            let zone = state.items.entry(zone.to_string()).or_default();
+            zone.keys.remove(uuid);
 
-        (self.update_state)(&state);
+            (self.update_state)(&state);
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     pub async fn insert_keychain(
@@ -1821,80 +1825,83 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         pcs: Option<&PCSMeta>,
         associated_tag: Option<&str>,
     ) -> Result<(), PushError> {
-        let security_container = self.get_security_container().await?;
+        with_cloudkit_writer_operation(async move {
+            let security_container = self.get_security_container().await?;
 
-        let mut state = self.state.write().await;
-        let key = state.keystore.require_key(zone, class)?;
+            let mut state = self.state.write().await;
+            let key = state.keystore.require_key(zone, class)?;
 
-        let record_zone = security_container.private_zone(zone.to_string());
+            let record_zone = security_container.private_zone(zone.to_string());
 
-        let data = self.config.get_register_meta().os_version;
-        let mut item = data.split(",");
-        let meta = format!(
-            "{} {} ({})",
-            item.next().unwrap(),
-            item.next().unwrap(),
-            item.next().unwrap()
-        );
+            let data = self.config.get_register_meta().os_version;
+            let mut item = data.split(",");
+            let meta = format!(
+                "{} {} ({})",
+                item.next().unwrap(),
+                item.next().unwrap(),
+                item.next().unwrap()
+            );
 
-        debug!("Insert key uuid {uuid}");
-        let mut item = CuttlefishEncItem {
-            gen: 0,
-            pcspublickey: pcs.map(|p| p.pcspublickey.clone()),
-            pcspublicidentity: pcs.map(|p| p.pcspublicidentity.clone()),
-            pcsservice: pcs.map(|p| p.pcsservice),
-            uploadver: meta,
-            encver: 2,
-            parentkeyref: Reference {
-                r#type: Some(reference::Type::Validating as i32),
-                record_identifier: Some(record_identifier(record_zone.clone(), &key.uuid)),
-            },
-            ..Default::default()
-        };
-
-        item.encrypt(
-            &uuid,
-            &key.decode(&state.get_cloudkey_access_key()?),
-            dict.clone(),
-        )?;
-
-        let mut ops = vec![SaveRecordOperation::try_new(
-            record_identifier(record_zone.clone(), &uuid),
-            item,
-            None,
-            true,
-        )?];
-
-        if let Some(tag) = associated_tag {
-            ops.push(SaveRecordOperation::try_new(
-                record_identifier(record_zone.clone(), tag),
-                CuttlefishCurrentItem {
-                    item: Reference {
-                        r#type: Some(reference::Type::Weak as i32),
-                        record_identifier: Some(record_identifier(record_zone.clone(), &uuid)),
-                    },
+            debug!("Insert key uuid {uuid}");
+            let mut item = CuttlefishEncItem {
+                gen: 0,
+                pcspublickey: pcs.map(|p| p.pcspublickey.clone()),
+                pcspublicidentity: pcs.map(|p| p.pcspublicidentity.clone()),
+                pcsservice: pcs.map(|p| p.pcsservice),
+                uploadver: meta,
+                encver: 2,
+                parentkeyref: Reference {
+                    r#type: Some(reference::Type::Validating as i32),
+                    record_identifier: Some(record_identifier(record_zone.clone(), &key.uuid)),
                 },
+                ..Default::default()
+            };
+
+            item.encrypt(
+                &uuid,
+                &key.decode(&state.get_cloudkey_access_key()?),
+                dict.clone(),
+            )?;
+
+            let mut ops = vec![SaveRecordOperation::try_new(
+                record_identifier(record_zone.clone(), &uuid),
+                item,
                 None,
                 true,
-            )?);
-        }
+            )?];
 
-        security_container
-            .perform_operations_checked(&CloudKitSession::new(), &ops, IsolationLevel::Zone)
-            .await?;
+            if let Some(tag) = associated_tag {
+                ops.push(SaveRecordOperation::try_new(
+                    record_identifier(record_zone.clone(), tag),
+                    CuttlefishCurrentItem {
+                        item: Reference {
+                            r#type: Some(reference::Type::Weak as i32),
+                            record_identifier: Some(record_identifier(record_zone.clone(), &uuid)),
+                        },
+                    },
+                    None,
+                    true,
+                )?);
+            }
 
-        encrypt_entry(&mut dict, &state.get_keychain_access_key()?);
+            security_container
+                .perform_operations_checked(&CloudKitSession::new(), &ops, IsolationLevel::Zone)
+                .await?;
 
-        let zone = state.items.entry(zone.to_string()).or_default();
-        if let Some(tag) = associated_tag {
-            zone.current_keys.insert(tag.to_string(), uuid.to_string());
-        }
+            encrypt_entry(&mut dict, &state.get_keychain_access_key()?);
 
-        zone.keys.insert(uuid.to_string(), dict);
+            let zone = state.items.entry(zone.to_string()).or_default();
+            if let Some(tag) = associated_tag {
+                zone.current_keys.insert(tag.to_string(), uuid.to_string());
+            }
 
-        (self.update_state)(&state);
+            zone.keys.insert(uuid.to_string(), dict);
 
-        Ok(())
+            (self.update_state)(&state);
+
+            Ok(())
+        })
+        .await
     }
 
     pub async fn sync_keychain(&self, zones: &[&str]) -> Result<(), PushError> {
@@ -2083,177 +2090,183 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn create_subscriptions(&self) -> Result<(), PushError> {
-        let security = self.get_security_container().await?;
-        let mut subscriptions = vec![];
-        for zone in KEYCHAIN_ZONES {
-            let mut zone_identifier = security.private_zone(zone.to_string());
-            zone_identifier.environment = Some(ContainerEnvironment::Production as i32);
-            subscriptions.push(CreateSubscriptionOperation(CreateSubscriptionRequest {
-                subscription: Some(Subscription {
-                    identifier: Some(Identifier {
-                        name: Some(format!("zone:{}", zone)),
-                        r#type: Some(cloudkit_proto::identifier::Type::Subscription.into()),
+        with_cloudkit_writer_operation(async move {
+            let security = self.get_security_container().await?;
+            let mut subscriptions = vec![];
+            for zone in KEYCHAIN_ZONES {
+                let mut zone_identifier = security.private_zone(zone.to_string());
+                zone_identifier.environment = Some(ContainerEnvironment::Production as i32);
+                subscriptions.push(CreateSubscriptionOperation(CreateSubscriptionRequest {
+                    subscription: Some(Subscription {
+                        identifier: Some(Identifier {
+                            name: Some(format!("zone:{}", zone)),
+                            r#type: Some(cloudkit_proto::identifier::Type::Subscription.into()),
+                        }),
+                        evaulation_type: Some(2),
+                        zone_identifier: Some(zone_identifier),
+                        ..Default::default()
                     }),
-                    evaulation_type: Some(2),
-                    zone_identifier: Some(zone_identifier),
-                    ..Default::default()
-                }),
-            }))
-        }
-        // ignore inner results, assume that it was created or maybe zone didn't exist but who cares
-        security
-            .perform_operations(
-                &CloudKitSession::new(),
-                &subscriptions,
-                IsolationLevel::Zone,
-            )
-            .await?;
-        Ok(())
+                }))
+            }
+            // ignore inner results, assume that it was created or maybe zone didn't exist but who cares
+            security
+                .perform_operations(
+                    &CloudKitSession::new(),
+                    &subscriptions,
+                    IsolationLevel::Zone,
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn reset_clique(&self, device_password: &[u8]) -> Result<(), PushError> {
-        let response: CuttlefishFetchViableBottleResponse = self
-            .invoke_cuttlefish(
-                "fetchViableBottles",
-                CuttlefishFetchViableBottleRequest {
-                    filter: Some(1),
-                    metrics: Some(vec![]),
-                },
-            )
-            .await?;
+        with_cloudkit_writer_operation(async move {
+            let response: CuttlefishFetchViableBottleResponse = self
+                .invoke_cuttlefish(
+                    "fetchViableBottles",
+                    CuttlefishFetchViableBottleRequest {
+                        filter: Some(1),
+                        metrics: Some(vec![]),
+                    },
+                )
+                .await?;
 
-        for bottle in response.valid {
-            // not valid anymore lmao
-            self.delete(bottle.id()).await?;
-        }
+            for bottle in response.valid {
+                // not valid anymore lmao
+                self.delete(bottle.id()).await?;
+            }
 
-        let private = self.new_user_identity(true).await?;
+            let private = self.new_user_identity(true).await?;
 
-        let data = self.config.get_register_meta().os_version;
-        let mut item = data.split(",");
-        let meta = format!(
-            "{} {} ({})",
-            item.next().unwrap(),
-            item.next().unwrap(),
-            item.next().unwrap()
-        );
+            let data = self.config.get_register_meta().os_version;
+            let mut item = data.split(",");
+            let meta = format!(
+                "{} {} ({})",
+                item.next().unwrap(),
+                item.next().unwrap(),
+                item.next().unwrap()
+            );
 
-        let mut shares: Vec<CuttlefishSerializedKey> = vec![];
-        let mut viewkeys: Vec<ViewKeys> = vec![];
-        let mut delete_ops = vec![];
+            let mut shares: Vec<CuttlefishSerializedKey> = vec![];
+            let mut viewkeys: Vec<ViewKeys> = vec![];
+            let mut delete_ops = vec![];
 
-        let security = self.get_security_container().await?;
-        let mut state = self.state.write().await;
+            let security = self.get_security_container().await?;
+            let mut state = self.state.write().await;
 
-        let access_key = state.get_cloudkey_access_key()?;
+            let access_key = state.get_cloudkey_access_key()?;
 
-        for zone in KEYCHAIN_ZONES {
-            let tlk_id = Uuid::new_v4().to_string().to_uppercase();
-            let class_a_id = Uuid::new_v4().to_string().to_uppercase();
-            let class_c_id = Uuid::new_v4().to_string().to_uppercase();
-            let tlk: [u8; 64] = rand::random();
-            let class_a: [u8; 64] = rand::random();
-            let class_c: [u8; 64] = rand::random();
-            let tlk_key = SivKey(tlk.to_vec());
+            for zone in KEYCHAIN_ZONES {
+                let tlk_id = Uuid::new_v4().to_string().to_uppercase();
+                let class_a_id = Uuid::new_v4().to_string().to_uppercase();
+                let class_c_id = Uuid::new_v4().to_string().to_uppercase();
+                let tlk: [u8; 64] = rand::random();
+                let class_a: [u8; 64] = rand::random();
+                let class_c: [u8; 64] = rand::random();
+                let tlk_key = SivKey(tlk.to_vec());
 
-            viewkeys.push(ViewKeys {
-                service: Some(zone.to_string()),
-                top_level_key: Some(ViewKey {
-                    key_id: Some(tlk_id.clone()),
-                    top_level_key_id: Some(tlk_id.clone()),
-                    key: Some(base64_encode(&tlk_key.encrypt(&tlk))),
-                    key_number: None,
-                    harware: Some(meta.clone()),
-                }),
-                class_a: Some(ViewKey {
-                    key_id: Some(class_a_id.clone()),
-                    top_level_key_id: Some(tlk_id.clone()),
-                    key: Some(base64_encode(&tlk_key.encrypt(&class_a))),
-                    key_number: Some(1),
-                    harware: Some(meta.clone()),
-                }),
-                class_c: Some(ViewKey {
-                    key_id: Some(class_c_id.clone()),
-                    top_level_key_id: Some(tlk_id.clone()),
-                    key: Some(base64_encode(&tlk_key.encrypt(&class_c))),
-                    key_number: Some(2),
-                    harware: Some(meta.clone()),
-                }),
-                old_top_level_key: None,
-            });
+                viewkeys.push(ViewKeys {
+                    service: Some(zone.to_string()),
+                    top_level_key: Some(ViewKey {
+                        key_id: Some(tlk_id.clone()),
+                        top_level_key_id: Some(tlk_id.clone()),
+                        key: Some(base64_encode(&tlk_key.encrypt(&tlk))),
+                        key_number: None,
+                        harware: Some(meta.clone()),
+                    }),
+                    class_a: Some(ViewKey {
+                        key_id: Some(class_a_id.clone()),
+                        top_level_key_id: Some(tlk_id.clone()),
+                        key: Some(base64_encode(&tlk_key.encrypt(&class_a))),
+                        key_number: Some(1),
+                        harware: Some(meta.clone()),
+                    }),
+                    class_c: Some(ViewKey {
+                        key_id: Some(class_c_id.clone()),
+                        top_level_key_id: Some(tlk_id.clone()),
+                        key: Some(base64_encode(&tlk_key.encrypt(&class_c))),
+                        key_number: Some(2),
+                        harware: Some(meta.clone()),
+                    }),
+                    old_top_level_key: None,
+                });
 
-            state.keystore.0.push(CloudKey {
-                uuid: tlk_id.clone(),
-                zone_name: zone.to_string(),
-                keyclass: "tlk".to_string(),
-                key: EncryptedCloudKey::new(&tlk_key, &access_key),
-            });
-            state.keystore.0.push(CloudKey {
-                uuid: class_a_id.clone(),
-                zone_name: zone.to_string(),
-                keyclass: "classA".to_string(),
-                key: EncryptedCloudKey::new(&SivKey(class_a.to_vec()), &access_key),
-            });
-            state.keystore.0.push(CloudKey {
-                uuid: class_c_id.clone(),
-                zone_name: zone.to_string(),
-                keyclass: "classC".to_string(),
-                key: EncryptedCloudKey::new(&SivKey(class_c.to_vec()), &access_key),
-            });
+                state.keystore.0.push(CloudKey {
+                    uuid: tlk_id.clone(),
+                    zone_name: zone.to_string(),
+                    keyclass: "tlk".to_string(),
+                    key: EncryptedCloudKey::new(&tlk_key, &access_key),
+                });
+                state.keystore.0.push(CloudKey {
+                    uuid: class_a_id.clone(),
+                    zone_name: zone.to_string(),
+                    keyclass: "classA".to_string(),
+                    key: EncryptedCloudKey::new(&SivKey(class_a.to_vec()), &access_key),
+                });
+                state.keystore.0.push(CloudKey {
+                    uuid: class_c_id.clone(),
+                    zone_name: zone.to_string(),
+                    keyclass: "classC".to_string(),
+                    key: EncryptedCloudKey::new(&SivKey(class_c.to_vec()), &access_key),
+                });
 
-            shares.push(CuttlefishSerializedKey {
-                uuid: Some(tlk_id.clone()),
-                zone_name: Some(zone.to_string()),
-                keyclass: Some("tlk".to_string()),
-                key: Some(tlk_key.0),
-            });
-            delete_ops.push(ZoneDeleteOperation::new(
-                security.private_zone(zone.to_string()),
-            ));
-        }
+                shares.push(CuttlefishSerializedKey {
+                    uuid: Some(tlk_id.clone()),
+                    zone_name: Some(zone.to_string()),
+                    keyclass: Some("tlk".to_string()),
+                    key: Some(tlk_key.0),
+                });
+                delete_ops.push(ZoneDeleteOperation::new(
+                    security.private_zone(zone.to_string()),
+                ));
+            }
 
-        drop(state);
+            drop(state);
 
-        (|| async {
             (|| async {
-                security
-                    .perform_operations_checked(
-                        &CloudKitSession::new(),
-                        &delete_ops,
-                        IsolationLevel::Zone,
-                    )
-                    .await
+                (|| async {
+                    security
+                        .perform_operations_checked(
+                            &CloudKitSession::new(),
+                            &delete_ops,
+                            IsolationLevel::Zone,
+                        )
+                        .await
+                })
+                .retry(
+                    &ConstantBuilder::default()
+                        .with_delay(Duration::ZERO)
+                        .with_max_times(3),
+                )
+                .notify(|err: &PushError, _dur: Duration| {
+                    println!("erasing keys {:?}", err);
+                })
+                .await?;
+
+                let _: CuttlefishResetResponse = self
+                    .invoke_cuttlefish("reset", CuttlefishResetRequest { reason: Some(3) })
+                    .await?;
+
+                self.join_clique(device_password, &private, None, &shares, viewkeys.clone())
+                    .await?;
+                let _ = self.create_subscriptions().await;
+                Ok(())
             })
             .retry(
                 &ConstantBuilder::default()
                     .with_delay(Duration::ZERO)
-                    .with_max_times(3),
+                    .with_max_times(2),
             )
             .notify(|err: &PushError, _dur: Duration| {
-                println!("erasing keys {:?}", err);
+                println!("resetting clique {:?}", err);
             })
             .await?;
 
-            let _: CuttlefishResetResponse = self
-                .invoke_cuttlefish("reset", CuttlefishResetRequest { reason: Some(3) })
-                .await?;
-
-            self.join_clique(device_password, &private, None, &shares, viewkeys.clone())
-                .await?;
-            let _ = self.create_subscriptions().await;
             Ok(())
         })
-        .retry(
-            &ConstantBuilder::default()
-                .with_delay(Duration::ZERO)
-                .with_max_times(2),
-        )
-        .notify(|err: &PushError, _dur: Duration| {
-            println!("resetting clique {:?}", err);
-        })
-        .await?;
-
-        Ok(())
+        .await
     }
 
     pub async fn sync_trust(&self) -> Result<(), PushError> {
