@@ -2438,7 +2438,7 @@ impl FTClient {
                             connection.clone(),
                             participant.into(),
                             sender.clone(),
-                            avc_data.to_vec(),
+                            avc_data.as_ref().to_vec(),
                         )
                     });
                     // Persist the received participant event before network I/O,
@@ -2560,16 +2560,29 @@ impl FTClient {
                 (210, _, _, _) => {
                     // we don't have any realtime connection so we use the peridic rekeys as heartbeats
                     session.last_rekey = Some(ns_since_epoch / 1000000);
-                    if let Some(session) = &session.connection {
-                        if let Some(participant) = session.link.token_to_participant(&token).await {
-                            session.handle_prekey(participant, QuickRelayPreKey {
-                                public_prekey: prekey.clone(),
-                                wrap_mode: *wrap_mode,
-                                creation_date: ns_since_epoch as f64 / 1000000000.0,
-                            }).await?;
-                        } else {
-                            warn!("Ignoring prekey for unknwon participant!");
+                    if let (Some(prekey), Some(wrap_mode)) =
+                        (received.prekey.clone(), received.prekey_wrap_mode)
+                    {
+                        if let Some(session) = &session.connection {
+                            if let Some(participant) =
+                                session.link.token_to_participant(&token).await
+                            {
+                                session
+                                    .handle_prekey(
+                                        participant,
+                                        QuickRelayPreKey {
+                                            public_prekey: prekey,
+                                            wrap_mode,
+                                            creation_date: ns_since_epoch as f64 / 1000000000.0,
+                                        },
+                                    )
+                                    .await?;
+                            } else {
+                                warn!("Ignoring prekey for unknwon participant!");
+                            }
                         }
+                    } else {
+                        warn!("Ignoring FaceTime rekey heartbeat without complete prekey material");
                     }
 
                     (self.update_state)(&state);

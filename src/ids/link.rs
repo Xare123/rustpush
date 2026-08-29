@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fmt::Debug, net::
 use aes_gcm::{AeadInPlace, Aes256Gcm, Nonce, Tag, aead::Payload};
 use deku::{bitvec::BitStore, prelude::*};
 use h3::{client::{self, SendRequest}, quic::StreamId};
-use h3_quinn::Connection;
+use h3_quinn::{quinn, Connection};
 use hkdf::{Hkdf, hmac::Hmac};
 use hkdf::hmac::Mac;
 use http::Request;
