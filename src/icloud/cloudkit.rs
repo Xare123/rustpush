@@ -90,6 +90,8 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 const CLOUDKIT_MAX_RESPONSE_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const CLOUDKIT_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
@@ -510,6 +512,106 @@ fn record_semantic_read_operations<Op: CloudKitOp>(
                 .ok_or(PushError::CloudKitSemanticOperationDenied)
         })
         .collect()
+}
+
+fn validate_semantic_read_request_operation(
+    semantic_operation: SemanticReadOperation,
+    link: &str,
+    retry_safety: CloudKitRetrySafety,
+    operation: &cloudkit_proto::RequestOperation,
+) -> Result<&'static str, PushError> {
+    if !semantic_operation.is_warm_semantic_transport()
+        || retry_safety != CloudKitRetrySafety::ReadOnly
+    {
+        return Err(PushError::CloudKitSemanticOperationDenied);
+    }
+
+    let url = Url::parse(link).map_err(|_| PushError::CloudKitSemanticOperationDenied)?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("gateway.icloud.com")
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PushError::CloudKitSemanticOperationDenied);
+    }
+
+    let populated_payloads = [
+        operation.zone_save_request.is_some(),
+        operation.zone_retrieve_request.is_some(),
+        operation.zone_delete_request.is_some(),
+        operation.retrieve_zone_changes_request.is_some(),
+        operation.record_save_request.is_some(),
+        operation.record_retrieve_request.is_some(),
+        operation.retrieve_changes_request.is_some(),
+        operation.record_delete_request.is_some(),
+        operation.resolve_token_request.is_some(),
+        operation.query_retrieve_request.is_some(),
+        operation.asset_upload_token_retrieve_request.is_some(),
+        operation.create_subscription_request.is_some(),
+        operation.user_query_request.is_some(),
+        operation.share_accept_request.is_some(),
+        operation.share_decline_request.is_some(),
+        operation.token_registration_request.is_some(),
+        operation.token_unregistration_request.is_some(),
+        operation.function_invoke_request.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if populated_payloads != 1 {
+        return Err(PushError::CloudKitSemanticOperationDenied);
+    }
+
+    let operation_type = operation
+        .request
+        .as_ref()
+        .and_then(|request| request.r#type)
+        .and_then(|value| cloudkit_proto::operation::Type::try_from(value).ok());
+    match semantic_operation {
+        SemanticReadOperation::FetchRecordChanges
+            if url.path() == "/ckdatabase/api/client/record/sync"
+                && operation.retrieve_changes_request.is_some()
+                && operation_type
+                    == Some(cloudkit_proto::operation::Type::RecordRetrieveChangesType) =>
+        {
+            Ok("record/sync")
+        }
+        SemanticReadOperation::FetchZone
+            if url.path() == "/ckdatabase/api/client/zone/retrieve"
+                && operation.zone_retrieve_request.is_some()
+                && operation_type == Some(cloudkit_proto::operation::Type::ZoneRetrieveType) =>
+        {
+            Ok("zone/retrieve")
+        }
+        SemanticReadOperation::CuttlefishFetchChanges
+            if url.path() == "/ckcoderouter/api/client/code/invoke"
+                && operation_type == Some(cloudkit_proto::operation::Type::FunctionInvokeType)
+                && matches!(
+                    operation.function_invoke_request.as_ref(),
+                    Some(function)
+                        if function.service.as_deref() == Some("Cuttlefish")
+                            && function.name.as_deref() == Some("fetchChanges")
+                ) =>
+        {
+            Ok("Cuttlefish/fetchChanges")
+        }
+        SemanticReadOperation::CuttlefishFetchRecoverableTlkShares
+            if url.path() == "/ckcoderouter/api/client/code/invoke"
+                && operation_type == Some(cloudkit_proto::operation::Type::FunctionInvokeType)
+                && matches!(
+                    operation.function_invoke_request.as_ref(),
+                    Some(function)
+                        if function.service.as_deref() == Some("Cuttlefish")
+                            && function.name.as_deref() == Some("fetchRecoverableTLKShares")
+                ) =>
+        {
+            Ok("Cuttlefish/fetchRecoverableTLKShares")
+        }
+        _ => Err(PushError::CloudKitSemanticOperationDenied),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2169,6 +2271,13 @@ impl CloudKitOp for FunctionInvokeOperation {
             .unwrap(),
         );
         map
+    }
+    fn retry_safety(&self) -> CloudKitRetrySafety {
+        if self.semantic_read_operation().is_some() {
+            CloudKitRetrySafety::ReadOnly
+        } else {
+            CloudKitRetrySafety::Never
+        }
     }
     fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
         match (self.0.service.as_deref(), self.0.name.as_deref()) {
@@ -3928,6 +4037,26 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         uuid: String,
         isolation_level: IsolationLevel,
     ) -> Vec<u8> {
+        let operation = self.build_request_operation(
+            operation,
+            config,
+            is_first,
+            is_last,
+            uuid,
+            isolation_level,
+        );
+        Self::frame_request_operation(&operation)
+    }
+
+    fn build_request_operation<Op: CloudKitOp>(
+        &self,
+        operation: &Op,
+        config: &dyn OSConfig,
+        is_first: bool,
+        is_last: bool,
+        uuid: String,
+        isolation_level: IsolationLevel,
+    ) -> cloudkit_proto::RequestOperation {
         let debugmeta = config.get_debug_meta();
         let mut op = cloudkit_proto::RequestOperation {
             header: if is_first {
@@ -4032,7 +4161,11 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             ..Default::default()
         };
         operation.set_request(&mut op);
-        let encoded = op.encode_to_vec();
+        op
+    }
+
+    fn frame_request_operation(operation: &cloudkit_proto::RequestOperation) -> Vec<u8> {
+        let encoded = operation.encode_to_vec();
         let mut buf: Vec<u8> = encode_uleb128(encoded.len() as u64);
         buf.extend(encoded);
         buf
@@ -4398,16 +4531,25 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .iter()
             .enumerate()
             .map(|(idx, op)| {
-                self.build_request(
+                let request_operation = self.build_request_operation(
                     op,
                     self.client.config.as_ref(),
                     idx == 0,
                     idx == ops.len() - 1,
                     request_identity.operation_uuids()[idx].clone(),
                     isolation_level,
-                )
+                );
+                if let Some(semantic_operation) = op.semantic_read_operation() {
+                    validate_semantic_read_request_operation(
+                        semantic_operation,
+                        Op::link(),
+                        op.retry_safety(),
+                        &request_operation,
+                    )?;
+                }
+                Ok(Self::frame_request_operation(&request_operation))
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, PushError>>()?
             .concat();
         let compressed_request = gzip_normal(&request).map_err(PushError::from)?;
         let custom_headers = ops[0].custom_headers();
@@ -5105,6 +5247,7 @@ mod cloud_sync_transport_tests {
     #[derive(Clone, Default)]
     struct FaithfulSemanticTransport {
         recorded: Arc<StdMutex<Vec<String>>>,
+        invocations: Arc<AtomicUsize>,
     }
 
     fn validate_semantic_request_target(request: &reqwest::Request) -> Result<(), PushError> {
@@ -5124,12 +5267,19 @@ mod cloud_sync_transport_tests {
             let transport = self.clone();
             Arc::new(move |request| {
                 let transport = transport.clone();
-                Box::pin(async move { transport.handle(request) }) as CloudKitTestTransportFuture
+                Box::pin(async move {
+                    transport.invocations.fetch_add(1, Ordering::SeqCst);
+                    transport.handle(request)
+                }) as CloudKitTestTransportFuture
             })
         }
 
         fn recorded(&self) -> Vec<String> {
             self.recorded.lock().expect("recorder lock").clone()
+        }
+
+        fn invocations(&self) -> usize {
+            self.invocations.load(Ordering::SeqCst)
         }
 
         fn handle(&self, request: RequestBuilder) -> Result<CloudKitBufferedResponse, PushError> {
@@ -5182,72 +5332,20 @@ mod cloud_sync_transport_tests {
             url: &Url,
             operation: &'a cloudkit_proto::RequestOperation,
         ) -> Result<&'static str, PushError> {
-            let populated_fields = [
-                operation.zone_save_request.is_some(),
-                operation.zone_retrieve_request.is_some(),
-                operation.zone_delete_request.is_some(),
-                operation.retrieve_zone_changes_request.is_some(),
-                operation.record_save_request.is_some(),
-                operation.record_retrieve_request.is_some(),
-                operation.retrieve_changes_request.is_some(),
-                operation.record_delete_request.is_some(),
-                operation.resolve_token_request.is_some(),
-                operation.query_retrieve_request.is_some(),
-                operation.asset_upload_token_retrieve_request.is_some(),
-                operation.create_subscription_request.is_some(),
-                operation.user_query_request.is_some(),
-                operation.share_accept_request.is_some(),
-                operation.share_decline_request.is_some(),
-                operation.token_registration_request.is_some(),
-                operation.token_unregistration_request.is_some(),
-                operation.function_invoke_request.is_some(),
-            ]
-            .into_iter()
-            .filter(|present| *present)
-            .count();
-            if populated_fields != 1 {
-                return Err(PushError::CloudKitSemanticOperationDenied);
+            for semantic_operation in SemanticReadOperation::ALL
+                .into_iter()
+                .filter(|operation| operation.is_warm_semantic_transport())
+            {
+                if let Ok(logical_operation) = validate_semantic_read_request_operation(
+                    semantic_operation,
+                    url.as_str(),
+                    CloudKitRetrySafety::ReadOnly,
+                    operation,
+                ) {
+                    return Ok(logical_operation);
+                }
             }
-
-            let operation_type = operation
-                .request
-                .as_ref()
-                .and_then(|request| request.r#type)
-                .and_then(|value| cloudkit_proto::operation::Type::try_from(value).ok());
-            match url.path() {
-                "/ckdatabase/api/client/record/sync"
-                    if operation.retrieve_changes_request.is_some()
-                        && operation_type
-                            == Some(cloudkit_proto::operation::Type::RecordRetrieveChangesType) =>
-                {
-                    Ok("record/sync")
-                }
-                "/ckdatabase/api/client/zone/retrieve"
-                    if operation.zone_retrieve_request.is_some()
-                        && operation_type
-                            == Some(cloudkit_proto::operation::Type::ZoneRetrieveType) =>
-                {
-                    Ok("zone/retrieve")
-                }
-                "/ckcoderouter/api/client/code/invoke"
-                    if operation.function_invoke_request.is_some()
-                        && operation_type
-                            == Some(cloudkit_proto::operation::Type::FunctionInvokeType) =>
-                {
-                    let function = operation
-                        .function_invoke_request
-                        .as_ref()
-                        .ok_or(PushError::CloudKitSemanticOperationDenied)?;
-                    match (function.service.as_deref(), function.name.as_deref()) {
-                        (Some("Cuttlefish"), Some("fetchChanges")) => Ok("Cuttlefish/fetchChanges"),
-                        (Some("Cuttlefish"), Some("fetchRecoverableTLKShares")) => {
-                            Ok("Cuttlefish/fetchRecoverableTLKShares")
-                        }
-                        _ => Err(PushError::CloudKitSemanticOperationDenied),
-                    }
-                }
-                _ => Err(PushError::CloudKitSemanticOperationDenied),
-            }
+            Err(PushError::CloudKitSemanticOperationDenied)
         }
 
         fn response_for(
@@ -5347,6 +5445,197 @@ mod cloud_sync_transport_tests {
 
         fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
             Some(SemanticReadOperation::FetchRecordChanges)
+        }
+    }
+
+    fn semantic_wire_request<Op: CloudKitOp>(operation: &Op) -> cloudkit_proto::RequestOperation {
+        let mut request = cloudkit_proto::RequestOperation {
+            request: Some(cloudkit_proto::Operation {
+                operation_uuid: Some("AAAAAAAA-BBBB-4CCC-8DDD-000000000001".to_owned()),
+                r#type: Some(Op::operation().into()),
+                synchronous_mode: None,
+                last: Some(true),
+            }),
+            ..Default::default()
+        };
+        operation.set_request(&mut request);
+        request
+    }
+
+    #[test]
+    fn production_semantic_wire_validator_accepts_only_the_four_exact_reads() {
+        let record_changes = FetchRecordChangesOperation::new(public_zone(), None, &NO_ASSETS);
+        assert_eq!(
+            validate_semantic_read_request_operation(
+                record_changes.semantic_read_operation().unwrap(),
+                FetchRecordChangesOperation::link(),
+                record_changes.retry_safety(),
+                &semantic_wire_request(&record_changes),
+            )
+            .unwrap(),
+            "record/sync"
+        );
+
+        let zone = FetchZoneOperation::new(public_zone());
+        assert_eq!(
+            validate_semantic_read_request_operation(
+                zone.semantic_read_operation().unwrap(),
+                FetchZoneOperation::link(),
+                zone.retry_safety(),
+                &semantic_wire_request(&zone),
+            )
+            .unwrap(),
+            "zone/retrieve"
+        );
+
+        for (name, semantic_operation, expected) in [
+            (
+                "fetchChanges",
+                SemanticReadOperation::CuttlefishFetchChanges,
+                "Cuttlefish/fetchChanges",
+            ),
+            (
+                "fetchRecoverableTLKShares",
+                SemanticReadOperation::CuttlefishFetchRecoverableTlkShares,
+                "Cuttlefish/fetchRecoverableTLKShares",
+            ),
+        ] {
+            let function =
+                FunctionInvokeOperation::new("Cuttlefish".to_owned(), name.to_owned(), Vec::new());
+            assert_eq!(function.retry_safety(), CloudKitRetrySafety::ReadOnly);
+            assert_eq!(
+                validate_semantic_read_request_operation(
+                    semantic_operation,
+                    FunctionInvokeOperation::link(),
+                    function.retry_safety(),
+                    &semantic_wire_request(&function),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn production_semantic_wire_validator_rejects_every_non_allowlisted_payload() {
+        let operation = FetchRecordChangesOperation::new(public_zone(), None, &NO_ASSETS);
+        let assert_denied = |request: cloudkit_proto::RequestOperation| {
+            assert!(matches!(
+                validate_semantic_read_request_operation(
+                    SemanticReadOperation::FetchRecordChanges,
+                    FetchRecordChangesOperation::link(),
+                    CloudKitRetrySafety::ReadOnly,
+                    &request,
+                ),
+                Err(PushError::CloudKitSemanticOperationDenied)
+            ));
+        };
+
+        macro_rules! assert_payload_denied {
+            ($field:ident) => {{
+                let mut request = semantic_wire_request(&operation);
+                request.retrieve_changes_request = None;
+                request.$field = Some(Default::default());
+                assert_denied(request);
+            }};
+        }
+
+        assert_payload_denied!(zone_save_request);
+        assert_payload_denied!(zone_retrieve_request);
+        assert_payload_denied!(zone_delete_request);
+        assert_payload_denied!(retrieve_zone_changes_request);
+        assert_payload_denied!(record_save_request);
+        assert_payload_denied!(record_retrieve_request);
+        assert_payload_denied!(record_delete_request);
+        assert_payload_denied!(resolve_token_request);
+        assert_payload_denied!(query_retrieve_request);
+        assert_payload_denied!(asset_upload_token_retrieve_request);
+        assert_payload_denied!(create_subscription_request);
+        assert_payload_denied!(user_query_request);
+        assert_payload_denied!(share_accept_request);
+        assert_payload_denied!(share_decline_request);
+        assert_payload_denied!(token_registration_request);
+        assert_payload_denied!(token_unregistration_request);
+        assert_payload_denied!(function_invoke_request);
+
+        let mut no_payload = semantic_wire_request(&operation);
+        no_payload.retrieve_changes_request = None;
+        assert_denied(no_payload);
+
+        let mut multiple_payloads = semantic_wire_request(&operation);
+        multiple_payloads.record_save_request = Some(Default::default());
+        assert_denied(multiple_payloads);
+    }
+
+    #[test]
+    fn production_semantic_wire_validator_rejects_wrong_route_type_and_retry_class() {
+        let operation = FetchRecordChangesOperation::new(public_zone(), None, &NO_ASSETS);
+        let mut request = semantic_wire_request(&operation);
+        let assert_denied =
+            |link: &str,
+             retry_safety: CloudKitRetrySafety,
+             request: &cloudkit_proto::RequestOperation| {
+                assert!(matches!(
+                    validate_semantic_read_request_operation(
+                        SemanticReadOperation::FetchRecordChanges,
+                        link,
+                        retry_safety,
+                        request,
+                    ),
+                    Err(PushError::CloudKitSemanticOperationDenied)
+                ));
+            };
+
+        for link in [
+            "http://gateway.icloud.com/ckdatabase/api/client/record/sync",
+            "https://example.invalid/ckdatabase/api/client/record/sync",
+            "https://gateway.icloud.com:444/ckdatabase/api/client/record/sync",
+            "https://gateway.icloud.com/ckdatabase/api/client/zone/retrieve",
+            "https://gateway.icloud.com/ckdatabase/api/client/record/sync?write=true",
+        ] {
+            assert_denied(link, CloudKitRetrySafety::ReadOnly, &request);
+        }
+        assert_denied(
+            FetchRecordChangesOperation::link(),
+            CloudKitRetrySafety::Never,
+            &request,
+        );
+        assert_denied(
+            FetchRecordChangesOperation::link(),
+            CloudKitRetrySafety::Idempotent,
+            &request,
+        );
+
+        request.request.as_mut().unwrap().r#type =
+            Some(cloudkit_proto::operation::Type::RecordSaveType.into());
+        assert_denied(
+            FetchRecordChangesOperation::link(),
+            CloudKitRetrySafety::ReadOnly,
+            &request,
+        );
+    }
+
+    #[test]
+    fn production_semantic_wire_validator_rejects_other_cuttlefish_names_and_services() {
+        for (service, name) in [
+            ("Cuttlefish", "updateTrust"),
+            ("Cuttlefish", "fetchRecoverableTlkShares"),
+            ("Cuttlefish", "fetchChangesAndSave"),
+            ("NotCuttlefish", "fetchChanges"),
+        ] {
+            let function =
+                FunctionInvokeOperation::new(service.to_owned(), name.to_owned(), Vec::new());
+            let request = semantic_wire_request(&function);
+            assert!(matches!(
+                validate_semantic_read_request_operation(
+                    SemanticReadOperation::CuttlefishFetchChanges,
+                    FunctionInvokeOperation::link(),
+                    CloudKitRetrySafety::ReadOnly,
+                    &request,
+                ),
+                Err(PushError::CloudKitSemanticOperationDenied)
+            ));
+            assert_eq!(function.retry_safety(), CloudKitRetrySafety::Never);
         }
     }
 
@@ -5481,6 +5770,7 @@ mod cloud_sync_transport_tests {
                 "Cuttlefish/fetchRecoverableTLKShares".to_owned(),
             ]
         );
+        assert_eq!(transport.invocations(), 4);
         assert!(!transport
             .recorded()
             .iter()
@@ -5502,6 +5792,7 @@ mod cloud_sync_transport_tests {
             Err(PushError::CloudKitSemanticOperationDenied)
         ));
         assert!(transport.recorded().is_empty());
+        assert_eq!(transport.invocations(), 0);
     }
 
     #[test]
