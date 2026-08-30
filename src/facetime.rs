@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::Cursor,
@@ -27,24 +26,9 @@ use openssl::{
 };
 use plist::{Data, Dictionary, Value};
 use prost::Message;
-=======
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
-
-use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, Payload}};
-use base64::engine::general_purpose;
-use deku::{ctx::Endian, prelude::*};
-use facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
-use hkdf::Hkdf;
-use log::{debug, info, warn};
-use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
-use plist::{Data, Dictionary, Value};
-use base64::Engine;
-use prost::{Message, bytes::{Buf, BytesMut}};
->>>>>>> origin/master
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use uuid::Uuid;
-<<<<<<< HEAD
 
 use crate::{
     aps::{get_message, APSInterestToken},
@@ -60,13 +44,6 @@ use crate::{
     },
     APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError,
 };
-=======
-use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
-
-// static HAS_JOINED: AtomicBool = AtomicBool::new(false);
->>>>>>> origin/master
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -217,16 +194,12 @@ fn send_for_message(
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum FTMode {
     Outgoing,
     Incoming,
     Missed,
     MissedOutgoing,
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -244,26 +217,15 @@ pub struct FTSession {
     pub report_id: String, // this is different from group_id because we are thinking different
     pub start_time: Option<u64>, // ms since epoch
     pub last_rekey: Option<u64>, // ms since epoch
+    #[serde(skip)]
+    pub is_propped: bool,
     // WARNING: this value may not accurately represent state. It's just used as a temporary store to see if we need to prop it up
     // also represents ringing from other (our) devices
     #[serde(skip)]
     pub is_ringing_inaccurate: bool,
     pub mode: Option<FTMode>,
-    #[serde(default = "default_enabled")]
-    pub is_video: bool,
     #[serde(skip)]
     pub recent_member_adds: HashMap<String, u64>,
-    #[serde(skip)]
-    pub connection: Option<Arc<AVSession>>,
-    #[serde(skip)]
-    pub av_config: Option<AVConfig>,
-    // this is not fully right/correct, when the initiator leaves
-    // it is not reassigned to me even if it probably should be.
-    // I don't think that affects any of our existing flows, but could be
-    // relevant in the future. The main issue is a false positive rather
-    // than a false negative, which we avoid at this time.
-    #[serde(skip)]
-    pub is_initiator: bool,
 }
 
 // time to track recently added members
@@ -360,111 +322,6 @@ impl FTSession {
             }
         }
     }
-
-    fn import_allocations(&mut self, allocations: &QuickRelayAllocationsResponse) {
-        for allocation in &allocations.allocations {
-            let id = allocation.id as u64;
-            let participant = self.participants.entry(id.to_string()).or_default();
-            participant.handle = allocation.participant.clone();
-            participant.participant_id = id;
-            participant.token = Some(base64_encode(allocation.token.as_ref()));
-        }
-    }
-}
-
-fn session_matches_operation(current: &FTSession, baseline: &FTSession) -> bool {
-    current.group_id == baseline.group_id && current.report_id == baseline.report_id
-}
-
-fn allocation_fields_match(left: &FTParticipant, right: &FTParticipant) -> bool {
-    left.token == right.token
-        && left.handle == right.handle
-        && left.participant_id == right.participant_id
-}
-
-fn merge_session_operation(
-    current: &mut FTSession,
-    baseline: &FTSession,
-    prepared: &FTSession,
-    merge_members: bool,
-) {
-    for (participant_id, prepared_participant) in &prepared.participants {
-        let Some(current_participant) = current.participants.get_mut(participant_id) else {
-            if baseline.participants.contains_key(participant_id) {
-                // The concurrent state removed an operation-existing participant. Do not
-                // resurrect it from the stale async snapshot.
-                continue;
-            }
-            current
-                .participants
-                .insert(participant_id.clone(), prepared_participant.clone());
-            continue;
-        };
-
-        let Some(baseline_participant) = baseline.participants.get(participant_id) else {
-            // A concurrent event created this participant. Fill only allocation fields that
-            // are still unset, and never replace its live/last-join state.
-            if current_participant.token.is_none() {
-                current_participant.token = prepared_participant.token.clone();
-            }
-            if current_participant.handle.is_empty() {
-                current_participant.handle = prepared_participant.handle.clone();
-            }
-            if current_participant.participant_id == 0 {
-                current_participant.participant_id = prepared_participant.participant_id;
-            }
-            continue;
-        };
-
-        if allocation_fields_match(current_participant, baseline_participant) {
-            current_participant.token = prepared_participant.token.clone();
-            current_participant.handle = prepared_participant.handle.clone();
-            current_participant.participant_id = prepared_participant.participant_id;
-        }
-    }
-
-    if current.is_propped == baseline.is_propped && prepared.is_propped != baseline.is_propped {
-        current.is_propped = prepared.is_propped;
-    }
-
-    if merge_members {
-        for member in prepared.members.difference(&baseline.members) {
-            current.members.insert(member.clone());
-        }
-        for (member, added_at) in &prepared.recent_member_adds {
-            if baseline.recent_member_adds.get(member) != Some(added_at)
-                && current.recent_member_adds.get(member) == baseline.recent_member_adds.get(member)
-            {
-                current.recent_member_adds.insert(member.clone(), *added_at);
-            }
-        }
-    }
-}
-
-fn commit_session_operation(
-    state: &mut FTState,
-    group: &str,
-    baseline: &FTSession,
-    prepared: &FTSession,
-    merge_members: bool,
-) -> bool {
-    let Some(current) = state.sessions.get_mut(group) else {
-        return false;
-    };
-    if !session_matches_operation(current, baseline) {
-        return false;
-    }
-    merge_session_operation(current, baseline, prepared, merge_members);
-    true
-}
-
-fn conversation_link_url(link: &ConversationLink) -> String {
-    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
-    format!(
-        "https://facetime.apple.com/join#v=1&p={}&k={}",
-        &link.pseudonym[6..],
-        encoded
-    )
 }
 
 const UNIX_TO_2001: Duration = Duration::from_millis(978307200000);
@@ -493,42 +350,6 @@ impl ToString for ParticipantID {
     fn to_string(&self) -> String {
         let num: u64 = (*self).into();
         num.to_string()
-    }
-}
-
-
-pub fn my_conv_participant(config: &AVConfig, video_mode: bool) -> ConversationParticipant {
-    let avc_data = config.avc_data();
-
-    ConversationParticipant {
-        version: 0,
-        identifier: 0,
-        handle: None,
-        avc_data: plist_to_bin(&avc_data).expect("failed to serialize AVC data"),
-        is_moments_available: Some(true),
-        is_screen_sharing_available: Some(true),
-        is_gondola_calling_available: Some(true),
-        is_mirage_available: Some(false),
-        is_lightweight: Some(false),
-        share_play_protocol_version: 4,
-        options: 1,
-        is_gft_downgrade_to_one_to_one_available: Some(true),
-        guest_mode_enabled: None,
-        association: None,
-        is_u_plus_n_downgrade_available: Some(true),
-        av_mode: Some(if video_mode { 2 } else { 1 }),
-        supports_leave_context: Some(true),
-        is_u_plus_one_screen_sharing_available: Some(true),
-        persona_handshake_data: None,
-        is_spatial_persona_enabled: Some(false),
-        is_u_plus_one_av_less_available: Some(true),
-        vision_feature_version: Some(0),
-        vision_call_establishment_version: Some(0),
-        is_u_plus_one_vision_to_vision_available: Some(false),
-        supports_request_to_screen_share: Some(true),
-        spatial_persona_generation_counter: None,
-        is_photos_share_play_available: Some(false),
-        ..Default::default()
     }
 }
 
@@ -567,12 +388,6 @@ pub enum FTMessage {
     RespondedElsewhere {
         guid: String,
     },
-    Connected {
-        guid: String,
-    },
-    Disconnected {
-        guid: String,
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -586,189 +401,32 @@ pub struct LetMeInRequest {
     pub usage: Option<String>,
 }
 
-<<<<<<< HEAD
-#[derive(Clone, Copy)]
-struct DirectAdmissionRecord {
-    expires_at: SystemTime,
-    completed: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum DirectAdmissionClaim {
-    Start,
-    InFlight,
-    Completed,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum DelegatedAdmissionClaim {
-    Start,
-    InFlight,
-    Completed,
-}
-
-fn claim_delegated_admission(
-    requests: &HashMap<String, LetMeInRequest>,
-    in_flight: &mut HashSet<String>,
-    delegation: &str,
-) -> DelegatedAdmissionClaim {
-    if !requests.contains_key(delegation) {
-        return DelegatedAdmissionClaim::Completed;
-    }
-    if !in_flight.insert(delegation.to_owned()) {
-        return DelegatedAdmissionClaim::InFlight;
-    }
-    DelegatedAdmissionClaim::Start
-}
-
-fn finish_delegated_admission(
-    requests: &mut HashMap<String, LetMeInRequest>,
-    in_flight: &mut HashSet<String>,
-    delegation: &str,
-    succeeded: bool,
-) {
-    in_flight.remove(delegation);
-    if succeeded {
-        requests.remove(delegation);
-    }
-}
-
-fn encrypted_letmein_parts(
-    encrypted: &EncryptedConversationMessage,
-) -> Result<([u8; 32], &[u8], &[u8]), PushError> {
-    let public_key = encrypted
-        .public_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| PushError::BadMsg)?;
-    if encrypted.conversation_message_bytes.len() <= NONCE_COUNT {
-        return Err(PushError::BadMsg);
-    }
-    let (nonce, body) = encrypted.conversation_message_bytes.split_at(NONCE_COUNT);
-    Ok((public_key, nonce, body))
-}
-
-fn direct_admission_key(letmein: &LetMeInRequest, approved_group: Option<&str>) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for value in [
-        letmein.pseud.as_bytes(),
-        letmein.requestor.as_bytes(),
-        letmein.token.as_slice(),
-        letmein.shared_secret.as_slice(),
-        approved_group.unwrap_or_default().as_bytes(),
-    ] {
-        hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value);
-    }
-    hasher.finalize().into()
-}
-
-fn claim_direct_admission(
-    admissions: &mut HashMap<[u8; 32], DirectAdmissionRecord>,
-    key: [u8; 32],
-    now: SystemTime,
-) -> DirectAdmissionClaim {
-    admissions.retain(|_, record| record.expires_at > now);
-    if let Some(record) = admissions.get(&key) {
-        return if record.completed {
-            DirectAdmissionClaim::Completed
-        } else {
-            DirectAdmissionClaim::InFlight
-        };
-    }
-    admissions.insert(
-        key,
-        DirectAdmissionRecord {
-            expires_at: now + Duration::from_secs(120),
-            completed: false,
-        },
-    );
-    DirectAdmissionClaim::Start
-}
-
-fn finish_direct_admission(
-    admissions: &mut HashMap<[u8; 32], DirectAdmissionRecord>,
-    key: [u8; 32],
-    now: SystemTime,
-    succeeded: bool,
-) {
-    if succeeded {
-        admissions.insert(
-            key,
-            DirectAdmissionRecord {
-                expires_at: now + Duration::from_secs(120),
-                completed: true,
-            },
-        );
-    } else {
-        admissions.remove(&key);
-=======
-fn participant_from_meta(id: ParticipantID, ids_sender: &str, avc_data: Vec<u8>, message: &ConversationMessage, context: &ConversationParticipantDidJoinContext) -> ConversationParticipant {
-    ConversationParticipant {
-        version: context.version,
-        identifier: id.into(),
-        handle: Some(handle_from_ids(ids_sender)),
-        avc_data: avc_data.into(),
-        is_moments_available: Some(context.is_moments_available),
-        is_screen_sharing_available: Some(context.is_screen_sharing_available),
-        is_gondola_calling_available: Some(context.is_gondola_calling_available),
-        is_mirage_available: Some(context.is_mirage_available),
-        is_lightweight: Some(context.is_lightweight),
-        share_play_protocol_version: context.share_play_protocol_version,
-        // options: 1,
-        options: 0, // default (missing)
-        is_gft_downgrade_to_one_to_one_available: context.is_gft_downgrade_to_one_to_one_available,
-        guest_mode_enabled: Some(message.guest_mode_enabled),
-        association: context.participant_association.clone(),
-        is_u_plus_n_downgrade_available: context.is_u_plus_n_downgrade_available,
-        av_mode: message.av_mode,
-        supports_leave_context: context.supports_leave_context,
-        is_u_plus_one_screen_sharing_available: context.is_u_plus_one_screen_sharing_available,
-        persona_handshake_data: None,
-        is_spatial_persona_enabled: context.is_spatial_persona_enabled,
-        is_u_plus_one_av_less_available: context.is_u_plus_one_av_less_available,
-        vision_feature_version: context.vision_feature_version,
-        vision_call_establishment_version: context.vision_call_establishment_version,
-        is_u_plus_one_vision_to_vision_available: context.is_u_plus_one_vision_to_vision_available,
-        supports_request_to_screen_share: context.supports_request_to_screen_share,
-        spatial_persona_generation_counter: Some(0),
-        is_photos_share_play_available: context.is_photos_share_play_available,                            
->>>>>>> origin/master
-    }
-}
-
 #[derive(Serialize, Deserialize, Default)]
 pub struct FTState {
     pub links: HashMap<String, FTLink>,
     pub sessions: HashMap<String, FTSession>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct FTWireMessage {
     #[serde(rename = "s")]
-    pub session: String,
+    session: String,
     #[serde(rename = "rtmpk")]
-    pub prekey: Option<Data>,
+    prekey: Option<Data>,
     #[serde(rename = "rtmpwm")]
-    pub prekey_wrap_mode: Option<u32>,
-    #[serde(rename = "rtskm")]
-    pub session_key_material: Option<QuickRelaySkmMaterial>,
-    #[serde(rename = "rtmkm")]
-    pub media_key_material: Option<QuickRelayMkmMaterial>,
-    #[serde(rename = "rtallmkmuri")]
-    pub all_mkm_uri: Option<Vec<String>>,
+    prekey_wrap_mode: Option<u32>,
     #[serde(rename = "fanout-groupID-key")]
-    pub fanout_groupid: String,
-    pub client_context_data_key: Option<Data>,
-    pub participant_data_key: Option<Data>,
-    pub is_initiator_key: Option<bool>,
+    fanout_groupid: String,
+    client_context_data_key: Option<Data>,
+    participant_data_key: Option<Data>,
+    is_initiator_key: Option<bool>,
     #[serde(rename = "fanout-groupMembers-key")]
-    pub fanout_groupmembers: Option<Vec<String>>,
-    pub is_u_plus_one_key: Option<bool>,
-    pub join_notification_key: Option<u32>,
-    pub participant_id_key: Option<ParticipantID>, // also i64 sometimes?
-    pub uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
+    fanout_groupmembers: Option<Vec<String>>,
+    is_u_plus_one_key: Option<bool>,
+    join_notification_key: Option<u32>,
+    participant_id_key: Option<ParticipantID>, // also i64 sometimes?
+    uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
 }
 
 pub struct FTClient {
@@ -777,11 +435,8 @@ pub struct FTClient {
     os_config: Arc<dyn OSConfig>,
     _interest_token: APSInterestToken,
     pub state: DebugRwLock<FTState>,
-    pub interfaces: DebugRwLock<Option<Vec<IpAddr>>>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
-    delegated_admissions: DebugMutex<HashSet<String>>,
-    direct_admissions: DebugMutex<HashMap<[u8; 32], DirectAdmissionRecord>>,
 }
 
 impl FTClient {
@@ -806,15 +461,11 @@ impl FTClient {
             identity,
             os_config: config,
             state: DebugRwLock::new(state),
-            interfaces: DebugRwLock::new(None),
             update_state,
             delegated_requests: DebugMutex::new(HashMap::new()),
-            delegated_admissions: DebugMutex::new(HashSet::new()),
-            direct_admissions: DebugMutex::new(HashMap::new()),
         }
     }
 
-<<<<<<< HEAD
     pub async fn ensure_allocations(
         &self,
         session: &mut FTSession,
@@ -831,15 +482,6 @@ impl FTClient {
             return Ok(());
         }
 
-=======
-    pub async fn connect_to_relay(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
-        if session.connection.is_some() {
-            return Ok(())
-        }
-
-        info!("making new for session id {}", session.group_id);
-
->>>>>>> origin/master
         // we need to do quickrelay allocations
         let people_in_chatroom: Vec<String> = session
             .members
@@ -848,7 +490,6 @@ impl FTClient {
             .map(|m| m.handle.clone())
             .collect();
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
-<<<<<<< HEAD
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity
             .cache_keys(
@@ -886,57 +527,37 @@ impl FTClient {
                 targets,
             )
             .await?;
-=======
 
-        let (incoming_handler, ctrl_channel) = IncomingFrameHandler::new();
->>>>>>> origin/master
-
-        let incoming_copy = incoming_handler.clone();
-        let relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id, 
-            Arc::new(move |packet| incoming_copy.handle_packet(packet)), true, true).await?;
-
-        session.import_allocations(&relay_session.state.lock().await.configuration);
-
-        if !session.av_config.is_some() {
-            session.av_config = Some(AVConfig::new());
+        #[derive(Deserialize)]
+        pub struct QuickRelayAllocation {
+            #[serde(rename = "qri")]
+            id: i64,
+            #[serde(rename = "tP")]
+            participant: String,
+            #[serde(rename = "t")]
+            token: Data,
         }
 
-        let interfaces = self.interfaces.read().await;
-        let ifs = interfaces.as_ref().unwrap();
-        relay_session.update_local_interfaces(ifs).await;
-
-        session.connection = Some(AVSession::new(
-            relay_session.clone(), 
-            session.av_config.clone().unwrap(), 
-            session.group_id.clone(), 
-            ctrl_channel, 
-            incoming_handler,
-            &my_conv_participant(session.av_config.as_ref().unwrap(), session.is_video).encode_to_vec(),
-            session.is_video,
-        ).await?);
-
-        for participant in session.participants.values() {
-            let Some(active) = &participant.active else { continue };
-            if active.avc_data.is_empty() {
-                continue
-            }
-            info!("Importing cached avc data");
-            session.connection.as_ref().unwrap().import_avc(active.identifier, &active.avc_data).await?;
+        #[derive(Deserialize)]
+        pub struct QuickRelayAllocationsResponse {
+            #[serde(rename = "U")]
+            for_id: Data,
+            #[serde(rename = "qal")]
+            allocations: Vec<QuickRelayAllocation>,
         }
 
-<<<<<<< HEAD
         let response = self
             .conn
             .wait_for_timeout(
                 receiver,
                 get_message(
                     |payload| {
-                        info!("FaceTime relay response received");
+                        info!("Got relay {:?}", payload);
                         let parsed =
                             match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
                                 Ok(parsed) => parsed,
-                                Err(_e) => {
-                                    warn!("FaceTime relay response parse failed");
+                                Err(e) => {
+                                    info!("Failed to parse {e}");
                                     return None;
                                 }
                             };
@@ -962,14 +583,6 @@ impl FTClient {
             participant.token = Some(base64_encode(allocation.token.as_ref()));
         }
 
-=======
-        if relay_session.state.lock().await.active_participants.is_empty() {
-            session.is_initiator = true;
-        }
-
-        info!("Connected!");
-        
->>>>>>> origin/master
         Ok(())
     }
 
@@ -996,7 +609,7 @@ impl FTClient {
             )
             .await?;
 
-        info!("FaceTime link created");
+        info!("Creating new link using pseud {new_alias} for handle {handle} with usage {usage:?}");
 
         let key = CompactECKey::new()?;
 
@@ -1024,7 +637,10 @@ impl FTClient {
         if state.links[&pseud].usage == Some(usage.to_string()) {
             return Ok(());
         }
-        info!("FaceTime link reassigned");
+        info!(
+            "Using link {} for {usage} from {old_usage}",
+            existing.handle
+        );
         if let Some(link) = state
             .links
             .values()
@@ -1045,38 +661,36 @@ impl FTClient {
     }
 
     pub async fn get_link_for_usage(&self, handle: &str, usage: &str) -> Result<String, PushError> {
-        let existing = {
-            let mut state = self.state.write().await;
-            state.links.retain(|_, l| !l.is_expired()); // remove expired links
-            state
-                .links
-                .values()
-                .find(|a| a.usage == Some(usage.to_string()))
-                .map(|link| link.get_link().map(|url| (link.pseud.clone(), url)))
-                .transpose()?
-        };
-
-        if let Some((pseud, link)) = existing {
+        let mut state = self.state.write().await;
+        state.links.retain(|_, l| !l.is_expired()); // remove expiredg links
+        if let Some(link) = state
+            .links
+            .values()
+            .find(|a| a.usage == Some(usage.to_string()))
+        {
             if self
                 .identity
-                .validate_pseudonym("com.apple.private.alloy.facetime.multi", handle, &pseud)
+                .validate_pseudonym(
+                    "com.apple.private.alloy.facetime.multi",
+                    handle,
+                    &link.pseud,
+                )
                 .await?
             {
-                return Ok(link);
+                return Ok(link.get_link()?);
+            } else {
+                warn!("Failed to validate pseudonym! {}", link.pseud);
             }
-            warn!("FaceTime link validation failed");
         }
 
         // disassociate any bad links, so we don't pull from them and we only have one link with this usage
         // we don't delete because that is too error prone, we can just let them expire instead.
         // after all, the point of this function is to get a link that works, not do pruning. (there may be many (hundreds) due past bug)
-        {
-            let mut state = self.state.write().await;
-            for link in state.links.values_mut() {
-                if link.usage == Some(usage.to_string()) {
-                    link.usage = None;
-                }
+        for (_, link) in &mut state.links {
+            if link.usage != Some(usage.to_string()) {
+                continue;
             }
+            link.usage = None;
         }
 
         let link_obj = self
@@ -1088,9 +702,8 @@ impl FTClient {
             .await?;
         let link = link_obj.get_link()?;
 
-        let mut state = self.state.write().await;
         state.links.insert(link_obj.pseud.clone(), link_obj);
-        (self.update_state)(&state);
+        (self.update_state)(&*state);
 
         Ok(link)
     }
@@ -1129,19 +742,18 @@ impl FTClient {
     }
 
     pub async fn get_session_link(&self, guid: &str) -> Result<String, PushError> {
-        let mut session = {
-            let state = self.state.read().await;
-            state
-                .sessions
-                .get(guid)
-                .cloned()
-                .expect("No session found!")
-        };
+        let mut state = self.state.write().await;
+        let state = &mut *state;
+        let session = state.sessions.get_mut(guid).expect("No session found!");
         let my_handle = session.my_handles.first().expect("No handle").clone();
         if let Some(link) = &session.link {
-            return Ok(conversation_link_url(link));
+            let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
+            return Ok(format!(
+                "https://facetime.apple.com/join#v=1&p={}&k={}",
+                &link.pseudonym[6..],
+                encoded
+            ));
         }
-        let baseline = session.clone();
 
         let mut link_obj = self
             .new_link(
@@ -1179,80 +791,24 @@ impl FTClient {
 
         let link = link_obj.get_link()?;
         session.link = Some(conversation_link);
-        {
-            let mut state = self.state.write().await;
-            let Some(current) = state.sessions.get(guid) else {
-                warn!("FaceTime session link commit rejected: missing");
-                return Err(PushError::BadMsg);
-            };
-            if let Some(existing) = current.link.as_ref() {
-                return Ok(conversation_link_url(existing));
-            }
-            if !session_matches_operation(current, &baseline) {
-                warn!("FaceTime session link commit rejected: correlation_changed");
-                return Err(PushError::BadMsg);
-            }
-            state.links.insert(link_obj.pseud.clone(), link_obj);
-            state.sessions.get_mut(guid).expect("session checked").link = session.link.clone();
-            (self.update_state)(&state);
-        }
+        state.links.insert(link_obj.pseud.clone(), link_obj);
 
-        self.message_session(my_handle, message, &session, None)
+        self.message_session(my_handle, message, session, None)
             .await?;
 
         Ok(link)
     }
 
-    pub async fn upgrade_to_video(&self, guid: &str, request: bool) -> Result<(), PushError> {
-        let mut state = self.state.write().await;
-        let state = &mut *state;
-        let session = state.sessions.get_mut(guid).expect("No session found!");
-
-        let my_handle = session.my_handles.first().expect("No handle").clone();
-        if session.is_video { return Ok(()); }
-
-        if request {
-            let mut message = ConversationMessage::default();
-            message.set_type(ConversationMessageType::RequestVideoUpgrade);
-            message.conversation_group_uuid_string = session.group_id.clone();
-            
-            self.message_session(my_handle, message, session, None).await?;
-        }
-
-        session.is_video = true;
-
-        self.update_participant(session).await?;
-        
-        Ok(())
-    }
-
-    pub async fn update_participant(&self, session: &mut FTSession) -> Result<(), PushError> {
-        let my_handle = session.my_handles.first().expect("No handle").clone();
-
-        let mut message = ConversationMessage::default();
-        message.set_type(ConversationMessageType::ParticipantUpdated);
-        message.conversation_group_uuid_string = session.group_id.clone();
-        message.active_participants.push(my_conv_participant(session.av_config.as_ref().expect("no avc!"), session.is_video));
-
-        self.message_session(my_handle, message, session, None).await?;
-        Ok(())
-    }
-
     // group is random uuid
-<<<<<<< HEAD
     pub async fn create_session(
         &self,
         for_group: String,
         handle: String,
         participants: &[String],
     ) -> Result<(), PushError> {
-=======
-    pub async fn create_session(&self, for_group: String, handle: String, participants: &[String], is_video: bool) -> Result<(), PushError> {
->>>>>>> origin/master
         let since_the_epoch = duration_since_epoch();
-        info!("Createing session for {for_group}");
 
-        let mut session = FTSession {
+        let session = FTSession {
             group_id: for_group,
             members: participants
                 .iter()
@@ -1268,47 +824,21 @@ impl FTClient {
             report_id: Uuid::new_v4().to_string().to_uppercase(),
             start_time: Some(since_the_epoch.as_millis() as u64),
             last_rekey: None,
+            is_propped: false,
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
-            connection: None,
-            av_config: Some(AVConfig::new()),
-            is_initiator: true,
-
-            is_video,
         };
 
-<<<<<<< HEAD
-=======
-        
         let mut my_session = self.state.write().await;
->>>>>>> origin/master
         let group = session.group_id.clone();
-        let baseline = session.clone();
-        {
-            let mut state = self.state.write().await;
-            if state.sessions.contains_key(&group) {
-                warn!("FaceTime session creation rejected: already_exists");
-                return Err(PushError::BadMsg);
-            }
-            state.sessions.insert(group.clone(), session.clone());
-        }
+        my_session.sessions.insert(group.clone(), session);
 
-<<<<<<< HEAD
-        self.ensure_allocations(&mut session, &[]).await?;
-        self.prop_up_conv(&mut session, true).await?;
-
-        let mut state = self.state.write().await;
-        if !commit_session_operation(&mut state, &group, &baseline, &session, false) {
-            warn!("FaceTime session creation commit rejected: correlation_changed");
-            return Err(PushError::BadMsg);
-        }
-        (self.update_state)(&state);
-=======
         let session = my_session.sessions.get_mut(&group).unwrap();
 
-        self.join(session, true).await?;
->>>>>>> origin/master
+        self.ensure_allocations(session, &[]).await?;
+
+        self.prop_up_conv(session, true).await?;
 
         Ok(())
     }
@@ -1373,10 +903,12 @@ impl FTClient {
             .get_participant(self.conn.get_token().await)
             .ok_or(PushError::NoParticipantTokenIndex)?;
 
-        let is_initiator = session.is_initiator; // todo, what does this mean
+        let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
+            prekey: None,
+            prekey_wrap_mode: None,
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(update_context.encode_to_vec().into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
@@ -1385,7 +917,6 @@ impl FTClient {
             is_u_plus_one_key: Some(is_u_plus_one),
             join_notification_key: Some(join_type),
             participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
-<<<<<<< HEAD
             uri_to_participant_id_key: Some(session.participants.values().fold(
                 HashMap::new(),
                 |mut a, i| {
@@ -1395,13 +926,6 @@ impl FTClient {
                     a
                 },
             )),
-=======
-            uri_to_participant_id_key: Some(session.participants.values().fold(HashMap::new(), |mut a, i| {
-                a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
-                a
-            })),
-            ..Default::default()
->>>>>>> origin/master
         };
 
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
@@ -1450,15 +974,7 @@ impl FTClient {
         Ok(())
     }
 
-<<<<<<< HEAD
     pub async fn prop_up_conv(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
-=======
-
-    pub async fn join(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
-        info!("joining conversation");
-
-        self.connect_to_relay(session, &[]).await?;
->>>>>>> origin/master
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         // we are picking up a call (the prop isn't to ring, and we are ringing)
         if !ring && session.is_ringing_inaccurate {
@@ -1502,11 +1018,7 @@ impl FTClient {
 
         let base64_encoded = Some(base64_encode(&self_token));
 
-        let link_prekey: Option<Data> = if let Some(link) = &session.connection {
-            Some(link.get_public_key().await?.into())
-        } else { None };
-
-        let is_initiator = session.is_initiator; // todo, what does this mean
+        let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
 
         let relevant_people: Vec<String> = session
@@ -1554,7 +1066,6 @@ impl FTClient {
                             .map(|a| a.to_conversation())
                             .collect::<Vec<_>>();
 
-<<<<<<< HEAD
                         let mut message = ConversationMessage::default();
                         // ring not sending to ourselves
                         if ring && target.participant != my_participant.handle {
@@ -1596,55 +1107,6 @@ impl FTClient {
                         update_context.is_screen_sharing_available = true;
                         update_context.is_gondola_calling_available = true;
                         update_context.share_play_protocol_version = 4;
-=======
-                let participant = my_conv_participant(builder_session.av_config.as_ref().expect("no avc!"), builder_session.is_video);
-
-                let mut message = ConversationMessage::default();
-                // ring not sending to ourselves
-                if ring && target.participant != my_participant.handle {
-                    message.set_type(ConversationMessageType::Invitation);
-                }
-                message.link = builder_session.link.clone();
-                message.report_data = Some(builder_session.get_report());
-                message.invitation_preferences = vec![
-                    ConversationInvitationPreference { version: 0, handle_type: HandleType::PhoneNumber as i32, notification_styles: 1 },
-                    ConversationInvitationPreference { version: 0, handle_type: HandleType::Generic as i32, notification_styles: 1 },
-                    ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
-                ];
-                if let Some(guest_mode_enabled) = participant.guest_mode_enabled {
-                    message.guest_mode_enabled = guest_mode_enabled;
-                }
-                message.av_mode = participant.av_mode;
-
-                update_context.message = Some(message);
-                update_context.version = participant.version;
-                update_context.is_moments_available = participant.is_moments_available.unwrap_or_default();
-                update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
-                // maybe make these optional/forced
-                update_context.video = Some(builder_session.is_video);
-                update_context.video_enabled = Some(builder_session.is_video);
-
-                update_context.is_screen_sharing_available = participant.is_screen_sharing_available.unwrap_or_default();
-                update_context.is_mirage_available = participant.is_mirage_available.unwrap_or_default();
-                update_context.is_lightweight = participant.is_lightweight.unwrap_or_default();
-                update_context.is_gondola_calling_available = participant.is_gondola_calling_available.unwrap_or_default();
-                update_context.share_play_protocol_version = participant.share_play_protocol_version;
-                // was false
-                update_context.is_gft_downgrade_to_one_to_one_available = participant.is_gft_downgrade_to_one_to_one_available;
-                update_context.participant_association = participant.association.clone();
-                // was false
-                update_context.is_u_plus_n_downgrade_available = participant.is_u_plus_n_downgrade_available;
-                update_context.supports_leave_context = participant.supports_leave_context;
-                update_context.is_u_plus_one_screen_sharing_available = participant.is_u_plus_one_screen_sharing_available;
-                update_context.is_spatial_persona_enabled = participant.is_spatial_persona_enabled;
-                // was false
-                update_context.is_u_plus_one_av_less_available = participant.is_u_plus_one_av_less_available;
-                update_context.vision_feature_version = participant.vision_feature_version;
-                update_context.vision_call_establishment_version = participant.vision_call_establishment_version;
-                update_context.is_u_plus_one_vision_to_vision_available = participant.is_u_plus_one_vision_to_vision_available;
-                update_context.supports_request_to_screen_share = participant.supports_request_to_screen_share;
-                update_context.is_photos_share_play_available = participant.is_photos_share_play_available;
->>>>>>> origin/master
 
                         let participant_map: HashMap<String, Vec<ParticipantID>> = builder_session
                             .participants
@@ -1656,7 +1118,6 @@ impl FTClient {
                                 a
                             });
 
-<<<<<<< HEAD
                         let wire_message = FTWireMessage {
                             session: builder_session.group_id.clone(),
                             prekey: None,
@@ -1701,39 +1162,6 @@ impl FTClient {
 
         session.is_propped = true;
 
-=======
-                let wire_message = FTWireMessage {
-                    session: builder_session.group_id.clone(),
-                    prekey: link_prekey.clone(),
-                    prekey_wrap_mode: link_prekey.as_ref().map(|_| 1),
-                    fanout_groupid: builder_session.group_id.clone(),
-                    client_context_data_key: Some(update_context.encode_to_vec().into()),
-                    participant_data_key: Some(participant.avc_data.clone().into()), // should be AV mode, hopefully this doens't give us trouble?
-                    is_initiator_key: Some(is_initiator),
-                    fanout_groupmembers: Some(builder_session.members.iter().map(|a| a.handle.clone()).collect()),
-                    is_u_plus_one_key: Some(is_u_plus_one),
-                    join_notification_key: Some(1),
-                    participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
-                    uri_to_participant_id_key: Some(participant_map),
-                    ..Default::default()
-                };
-                Some(plist_to_bin(&wire_message).expect("Failed to serialize plist"))
-            })),
-            send_delivered: false,
-            command: 207,
-            no_response: false,
-            id: Uuid::new_v4().to_string().to_uppercase(),
-            scheduled_ms: None,
-            queue_id: None,
-            relay: None,
-            extras: Dictionary::from_iter([
-                ("is-initiator-key", Value::Boolean(is_initiator)),
-                ("up1", Value::Boolean(is_u_plus_one))
-            ]),
-        }, targets).await?;
-
-        
->>>>>>> origin/master
         Ok(())
     }
 
@@ -1744,7 +1172,6 @@ impl FTClient {
 
         let my_handle = session.my_handles.first().expect("No Handle??").clone();
 
-<<<<<<< HEAD
         let alive_tokens: Vec<MessageTarget> = session
             .participants
             .values()
@@ -1757,9 +1184,6 @@ impl FTClient {
             .collect();
         let relevant_people: Vec<String> =
             session.members.iter().map(|m| m.handle.clone()).collect();
-=======
-        let relevant_people: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
->>>>>>> origin/master
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity
             .cache_keys(
@@ -1774,7 +1198,6 @@ impl FTClient {
             )
             .await?;
 
-<<<<<<< HEAD
         let targets = self.identity.cache.lock().await.get_targets(
             &topic,
             &my_handle,
@@ -1792,28 +1215,11 @@ impl FTClient {
             .get_participant(self.conn.get_token().await)
             .ok_or(PushError::NoParticipantTokenIndex)?;
         let is_initiator = true; // todo, what does this mean
-=======
-        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &my_handle, &relevant_people);
-        self.identity.send_message(topic, send_for_message(my_handle, message, None), targets).await?;
-        Ok(())
-    }
-
-    pub async fn leave(&self, session: &mut FTSession) -> Result<(), PushError> {
-        info!("Leaving now!");
-
-        if let Some(session) = session.connection.take() {
-            if let Err(e) = session.link.unalloc_bind().await {
-                warn!("Failed to unbind! {e}");
-            }
-            info!("Dropping Session!");
-        }
-        
-        let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
-        let is_initiator = session.is_initiator;
->>>>>>> origin/master
         let is_u_plus_one = true; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
+            prekey: None,
+            prekey_wrap_mode: None,
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(vec![16, 0].into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
@@ -1822,7 +1228,6 @@ impl FTClient {
             is_u_plus_one_key: Some(is_u_plus_one),
             join_notification_key: Some(2),
             participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
-<<<<<<< HEAD
             uri_to_participant_id_key: Some(session.participants.values().fold(
                 HashMap::new(),
                 |mut a, i| {
@@ -1839,19 +1244,6 @@ impl FTClient {
             .union(&session.members)
             .map(|m| m.handle.clone())
             .collect();
-=======
-            uri_to_participant_id_key: Some(session.participants.values().fold(HashMap::new(), |mut a, i| {
-                a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
-                a
-            })),
-            ..Default::default()
-        };
-
-        session.is_initiator = false; // can't be initiator after leaving
-
-
-        let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
->>>>>>> origin/master
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity
@@ -1906,10 +1298,10 @@ impl FTClient {
             .ok_or(PushError::NoParticipantTokenIndex)?;
         my_participant.active = None; // we left, remember?
 
+        session.is_propped = false;
         Ok(())
     }
 
-<<<<<<< HEAD
     pub async fn add_members(
         &self,
         session: &mut FTSession,
@@ -1917,33 +1309,23 @@ impl FTClient {
         letmein: bool,
         to_members: Option<Vec<String>>,
     ) -> Result<(), PushError> {
-=======
-    pub async fn set_local_interfaces(&self, interfaces: &[IpAddr]) {
-        let mut state = self.interfaces.write().await;
-        *state = Some(interfaces.to_vec());
-        drop(state); // can trigger a race.
-        for session in self.state.read().await.sessions.values() {
-            let Some(link) = &session.connection else { continue };
-            link.link.update_local_interfaces(interfaces).await;
-        }
-    } 
-
-    pub async fn add_members(&self, session: &mut FTSession, mut new_members: Vec<FTMember>, letmein: bool, to_members: Option<Vec<String>>) -> Result<(), PushError> {
->>>>>>> origin/master
         // if to_members is some this is a re-broadcast and they will already be in the call
         if to_members.is_none() {
             new_members
                 .retain(|member| !session.members.iter().any(|m| &m.handle == &member.handle));
             if new_members.is_empty() {
-                warn!("FaceTime member add ignored: no_new_members");
+                warn!("(add_members) all new members already in call!");
                 return Ok(());
             }
         }
 
         info!(
-            "FaceTime member add requested count={}",
-            new_members.len().min(32)
+            "Adding members {new_members:?} for session {}",
+            session.group_id
         );
+
+        // make sure we have quickrelay ids for our new guest!
+        self.ensure_allocations(session, &new_members).await?;
 
         let mut message = ConversationMessage::default();
         message.set_type(ConversationMessageType::AddMember);
@@ -2012,7 +1394,7 @@ impl FTClient {
     ) -> Result<(), PushError> {
         remove.retain(|member| session.members.contains(member));
         if remove.is_empty() {
-            warn!("FaceTime member removal ignored: no_matching_members");
+            warn!("(remove_members) all members are not in call!");
             return Ok(());
         }
 
@@ -2043,13 +1425,13 @@ impl FTClient {
     ) -> Result<LetMeInRequest, PushError> {
         let state = self.state.read().await;
         let Some(link) = &state.links.get(target) else {
-            warn!("FaceTime link lookup failed: missing");
+            warn!("Link not found!");
             return Err(PushError::BadMsg);
         };
 
-        let (public_key, nonce, body) = encrypted_letmein_parts(&encrypted)?;
-        let other_pubkey = CompactECKey::decompress(public_key);
-        debug!("FaceTime letmein key derivation stage=peer_key");
+        let other_pubkey =
+            CompactECKey::decompress(encrypted.public_key.try_into().expect("Bad pubkey length!"));
+        info!("A");
 
         let a = link.key.get_pkey();
         let b = other_pubkey.get_pkey();
@@ -2057,20 +1439,23 @@ impl FTClient {
         deriver.set_peer(&b)?;
         let letmein_secret = deriver.derive_to_vec()?;
 
-        debug!("FaceTime letmein key derivation stage=shared_secret");
+        info!("B");
 
         let hk = Hkdf::<Sha256>::new(None, &letmein_secret);
         let mut key = [0u8; 32];
         hk.expand("FT-LMI-RequestKey".as_bytes(), &mut key)
             .expect("Failed to expand key!");
-        debug!("FaceTime letmein key derivation stage=request_key");
+        info!("C");
+
+        let nonce = &encrypted.conversation_message_bytes[..NONCE_COUNT];
+        let body = &encrypted.conversation_message_bytes[NONCE_COUNT..];
 
         let cipher = Aes256Gcm::new(&key.into());
         let decrypted = cipher
             .decrypt(Nonce::from_slice(nonce), body)
             .map_err(|_| PushError::AESGCMError)?;
 
-        debug!("FaceTime letmein request decrypted");
+        info!("Decrypted {}", encode_hex(&decrypted));
         let decoded = ConversationMessage::decode(&mut Cursor::new(&decrypted))?;
 
         let mut request = LetMeInRequest {
@@ -2083,14 +1468,11 @@ impl FTClient {
             usage: link.usage.clone(),
         };
 
-        let delegation_session = link
+        if let Some(session) = link
             .session_link
             .as_ref()
             .and_then(|session| state.sessions.get(session))
-            .cloned();
-        drop(state);
-
-        if let Some(session) = delegation_session.as_ref() {
+        {
             // delegate
             let delegate_uuid = Uuid::new_v4().to_string().to_uppercase();
 
@@ -2100,7 +1482,7 @@ impl FTClient {
             delegate.conversation_group_uuid_string = session.group_id.clone();
             delegate.let_me_in_delegation_handle = request.requestor.clone();
             delegate.let_me_in_delegation_uuid = delegate_uuid.clone();
-            let my_handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+            let my_handle = session.my_handles.first().expect("No Handle??");
             // context if missing is
             //  6045   0    callservicesd: [com.apple.calls.callservicesd:Default] [WARN] Dropping let me in delegation request or response because it has the wrong intent {publicIntentAction: (null)}
             self.message_session(my_handle.clone(), delegate, session, Some(20001))
@@ -2120,71 +1502,20 @@ impl FTClient {
         letmein: LetMeInRequest,
         approved_group: Option<&str>,
     ) -> Result<(), PushError> {
-        if let Some(delegation) = letmein.delegation_uuid.clone() {
-            let claim = {
-                let requests = self.delegated_requests.lock().await;
-                let mut admissions = self.delegated_admissions.lock().await;
-                claim_delegated_admission(&requests, &mut admissions, &delegation)
-            };
-            match claim {
-                DelegatedAdmissionClaim::Completed => {
-                    info!("FaceTime delegated admission retry suppressed: completed");
-                    return Ok(());
-                }
-                DelegatedAdmissionClaim::InFlight => {
-                    warn!("FaceTime delegated admission retry rejected: in_flight");
-                    return Err(PushError::BadMsg);
-                }
-                DelegatedAdmissionClaim::Start => {}
-            }
-
-            let result = self.respond_letmein_inner(letmein, approved_group).await;
-            let mut requests = self.delegated_requests.lock().await;
-            let mut admissions = self.delegated_admissions.lock().await;
-            finish_delegated_admission(&mut requests, &mut admissions, &delegation, result.is_ok());
-            return result;
-        }
-
-        let key = direct_admission_key(&letmein, approved_group);
-        let now = SystemTime::now();
-        {
-            let mut admissions = self.direct_admissions.lock().await;
-            match claim_direct_admission(&mut admissions, key, now) {
-                DirectAdmissionClaim::Completed => {
-                    info!("FaceTime direct admission retry suppressed: completed");
-                    return Ok(());
-                }
-                DirectAdmissionClaim::InFlight => {
-                    warn!("FaceTime direct admission retry rejected: in_flight");
-                    return Err(PushError::BadMsg);
-                }
-                DirectAdmissionClaim::Start => {}
+        if let Some(delegation) = letmein.delegation_uuid {
+            let mut shared_lock = self.delegated_requests.lock().await;
+            let removed = shared_lock.remove(&delegation);
+            if removed.is_none() {
+                warn!("Already responded to letmein, ignoring request!");
+                return Ok(()); // already responded
             }
         }
-
-        let result = self.respond_letmein_inner(letmein, approved_group).await;
-        let mut admissions = self.direct_admissions.lock().await;
-        finish_direct_admission(&mut admissions, key, SystemTime::now(), result.is_ok());
-        result
-    }
-
-    async fn respond_letmein_inner(
-        &self,
-        letmein: LetMeInRequest,
-        approved_group: Option<&str>,
-    ) -> Result<(), PushError> {
-        let approved_group = approved_group.map(str::to_owned);
-        let mut approved_session = if let Some(approved) = approved_group.as_deref() {
-            let state = self.state.read().await;
-            Some(state.sessions.get(approved).cloned().ok_or_else(|| {
-                warn!("FaceTime admission rejected: approved_session_missing");
-                PushError::BadMsg
-            })?)
-        } else {
-            None
-        };
-        let approved_baseline = approved_session.clone();
-        if let Some(session) = approved_session.as_mut() {
+        if let Some(approved) = approved_group {
+            let mut state = self.state.write().await;
+            let session = state
+                .sessions
+                .get_mut(approved)
+                .expect("Approved session not found!");
             // MUST prop before we create a session link so caller associates our session properly
 
             // this is for when the call is in a OneOnOne mode AND there is only ONE participant in the call
@@ -2202,85 +1533,71 @@ impl FTClient {
                     .count()
                     == 1;
             if needs_prop {
-<<<<<<< HEAD
-                info!("FaceTime conversation prop requested");
+                info!("Propping conversation");
                 self.ensure_allocations(session, &[]).await?;
                 self.prop_up_conv(session, false).await?;
-=======
-                info!("Propping conversation");
-                self.join(session, false).await?;
                 // return Err(PushError::AESGCMError);
->>>>>>> origin/master
             }
+            drop(state);
+
+            // for native links
+            // info!("Ensuring letmein group has link!");
+            // let a = self.get_session_link(approved).await?;
+            // info!("Adding to group with link {a}");
         }
-        if let (Some(approved), Some(session)) = (approved_group.as_deref(), &approved_session) {
-            let mut state = self.state.write().await;
-            let Some(baseline) = approved_baseline.as_ref() else {
-                return Err(PushError::BadMsg);
-            };
-            if !commit_session_operation(&mut state, approved, baseline, session, false) {
-                warn!("FaceTime admission rejected: correlation_changed_before_response");
-                return Err(PushError::BadMsg);
-            }
-            (self.update_state)(&state);
-        }
-
-        let (pseud, encrypted_message) = {
-            let state = self.state.read().await;
-            let Some(link) = state.links.get(&letmein.pseud) else {
-                warn!("FaceTime link lookup failed: missing");
-                return Err(PushError::BadMsg);
-            };
-            let mut response = ConversationMessage::default();
-            response.is_let_me_in_approved = Some(approved_group.is_some());
-            response.set_type(ConversationMessageType::LetMeInResponse);
-            let mut link_data = ConversationLink::default();
-            link_data.set_link_lifetime_scope(ConversationLinkLifetimeScope::Indefinite);
-            link_data.pseudonym = link.pseud.clone();
-            link_data.public_key = link.key.compress().to_vec();
-            if let Some(to_group) = approved_group.as_deref() {
-                response.conversation_group_uuid_string = to_group.to_string();
-                link_data.group_uuid_string = to_group.to_string();
-                link_data.originator_handle = Some(handle_from_ids(&link.handle));
-            }
-            response.link = Some(link_data.clone());
-
-            let encoded = response.encode_to_vec();
-            let hk = Hkdf::<Sha256>::new(None, &letmein.shared_secret);
-            let mut key = [0u8; 32];
-            hk.expand("FT-LMI-ResponseKey".as_bytes(), &mut key)
-                .expect("Failed to expand key!");
-
-            let nonce: [u8; NONCE_COUNT] = rand::random();
-            let cipher = Aes256Gcm::new(&key.into());
-            let encrypted = cipher
-                .encrypt(Nonce::from_slice(&nonce), &encoded[..])
-                .map_err(|_| PushError::AESGCMError)?;
-
-            let mut encrypted_message = ConversationMessage::default();
-            encrypted_message.set_type(ConversationMessageType::EncryptedMessage);
-            encrypted_message.set_enclosed_encrypted_type(ConversationMessageType::LetMeInResponse);
-            link_data.originator_handle = None;
-            link_data.group_uuid_string = "".to_string();
-            encrypted_message.link = Some(link_data);
-            encrypted_message.encrypted_message = Some(EncryptedConversationMessage {
-                public_key: link.key.compress().to_vec(),
-                conversation_message_bytes: [nonce.to_vec(), encrypted].concat(),
-            });
-            (link.pseud.clone(), encrypted_message)
+        let mut state = self.state.write().await;
+        let Some(link) = &state.links.get(&letmein.pseud) else {
+            warn!("Link not found!");
+            return Err(PushError::BadMsg);
         };
+        let mut response = ConversationMessage::default();
+        response.is_let_me_in_approved = Some(approved_group.is_some());
+        response.set_type(ConversationMessageType::LetMeInResponse);
+        let mut link_data = ConversationLink::default();
+        link_data.set_link_lifetime_scope(ConversationLinkLifetimeScope::Indefinite);
+        link_data.pseudonym = link.pseud.clone();
+        link_data.public_key = link.key.compress().to_vec();
+        if let Some(to_group) = approved_group {
+            response.conversation_group_uuid_string = to_group.to_string();
+            link_data.group_uuid_string = to_group.to_string();
+            link_data.originator_handle = Some(handle_from_ids(&link.handle));
+        }
+        response.link = Some(link_data.clone());
+
+        let encoded = response.encode_to_vec();
+        let hk = Hkdf::<Sha256>::new(None, &letmein.shared_secret);
+        let mut key = [0u8; 32];
+        hk.expand("FT-LMI-ResponseKey".as_bytes(), &mut key)
+            .expect("Failed to expand key!");
+
+        let nonce: [u8; NONCE_COUNT] = rand::random();
+        let cipher = Aes256Gcm::new(&key.into());
+        let encrypted = cipher
+            .encrypt(Nonce::from_slice(&nonce), &encoded[..])
+            .map_err(|_| PushError::AESGCMError)?;
+
+        let mut encrypted_message = ConversationMessage::default();
+        encrypted_message.set_type(ConversationMessageType::EncryptedMessage);
+        encrypted_message.set_enclosed_encrypted_type(ConversationMessageType::LetMeInResponse);
+        link_data.originator_handle = None;
+        link_data.group_uuid_string = "".to_string();
+        encrypted_message.link = Some(link_data);
+        encrypted_message.encrypted_message = Some(EncryptedConversationMessage {
+            public_key: link.key.compress().to_vec(),
+            conversation_message_bytes: [nonce.to_vec(), encrypted].concat(),
+        });
 
         let topic = "com.apple.private.alloy.facetime.multi";
         let targets = self.identity.cache.lock().await.get_targets(
             &topic,
-            &pseud,
+            &letmein.pseud,
             &[letmein.requestor.clone()],
             &[MessageTarget::Token(letmein.token)],
         )?;
         self.identity
             .send_message(
                 topic,
-                send_for_message(pseud, encrypted_message, None),
+                send_for_message(letmein.pseud.clone(), encrypted_message, None),
                 targets,
             )
             .await?;
@@ -2293,8 +1610,7 @@ impl FTClient {
         // at the bottom removePendingConversationWithPseudonym, uses the link field of the LMI request
         // but we don't currently assign our link to the conversation. FT Web doesn't care
 
-        let session = approved_session.as_mut().ok_or(PushError::BadMsg)?;
-        let post_admission_baseline = session.clone();
+        let session = state.sessions.get_mut(to_group).expect("No session");
         let member = FTMember {
             handle: letmein.requestor.clone(),
             nickname: letmein.nickname.clone(),
@@ -2304,19 +1620,8 @@ impl FTClient {
                 .await?;
         } else {
             self.add_members(session, vec![member], true, None).await?;
+            (self.update_state)(&state);
         }
-        let mut state = self.state.write().await;
-        if !commit_session_operation(
-            &mut state,
-            &to_group,
-            &post_admission_baseline,
-            session,
-            true,
-        ) {
-            warn!("FaceTime admission commit rejected: correlation_changed");
-            return Err(PushError::BadMsg);
-        }
-        (self.update_state)(&state);
         Ok(())
     }
 
@@ -2380,7 +1685,6 @@ impl FTClient {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<FTMessage>, PushError> {
-<<<<<<< HEAD
         let Some(IDSRecvMessage {
             message_unenc: Some(message),
             target: Some(target),
@@ -2404,41 +1708,10 @@ impl FTClient {
         };
         Ok(if command == 242 {
             // NiceData
-=======
-        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = &msg else { return Ok(None) };
-        if topic == &sha1("com.apple.private.alloy.quickrelay".as_bytes()) {
-            let allocate_response = match plist::from_value::<QuickRelayAllocationsResponse>(payload) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!("Parsing QuickRelay message failed {e}!");
-                    return Err(e.into());
-                }
-            };
-
-            let uuid = Uuid::from_bytes(allocate_response.session_id.as_ref().try_into().unwrap());
-            let mut session = self.state.write().await;
-            let Some(item) = session.sessions.get_mut(&uuid.to_string().to_uppercase()) else { return Ok(None) };
-
-            item.import_allocations(&allocate_response);
-
-            if let Some(session) = &item.connection {
-                session.link.update_config(allocate_response).await;
-            } else {
-                warn!("Dropping QR message for call {uuid}!");
-            }
-            
-            return Ok(None)
-        }
-
-
-        let Some(IDSRecvMessage { message_unenc: Some(message), target: Some(target), command, token: Some(token), sender: Some(sender), ns_since_epoch: Some(ns_since_epoch), .. }) = 
-                self.identity.receive_message(msg, &["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video"]).await? else { return Ok(None) };
-        Ok(if command == 242 { // NiceData
->>>>>>> origin/master
             let bytes = message.bytes()?;
-            debug!("FaceTime IDS message received: kind=nice_data");
+            debug!("Facetime IDS message came in as {}", encode_hex(&bytes));
             let decoded = ConversationMessage::decode(&mut Cursor::new(&bytes))?;
-            debug!("FaceTime IDS message decoded");
+            debug!("Decoded {:#?}", decoded);
 
             match decoded.r#type() {
                 ConversationMessageType::LinkChanged | ConversationMessageType::LinkCreated => {
@@ -2466,56 +1739,32 @@ impl FTClient {
                             Some(FTMessage::LetMeInRequest(request))
                         }
                         _type => {
-                            warn!("FaceTime encrypted message ignored: unsupported_type");
+                            warn!("Couldn't handle encrypted message type {_type:?}");
                             None
                         }
                     }
                 }
                 ConversationMessageType::Decline => {
-<<<<<<< HEAD
-                    let group = decoded.conversation_group_uuid_string.clone();
-                    let snapshot = {
-                        let state = self.state.read().await;
-                        state.sessions.get(&group).cloned()
-                    };
-                    if let Some(baseline) = snapshot {
-                        let mut prepared = baseline.clone();
-                        prepared.is_ringing_inaccurate = false;
-                        prepared.mode = Some(FTMode::MissedOutgoing);
-                        self.unprop_conv(&mut prepared).await?;
-
-                        let mut state = self.state.write().await;
-                        let Some(current) = state.sessions.get_mut(&group) else {
-                            return Ok(None);
-                        };
-                        if !session_matches_operation(current, &baseline) {
-                            warn!("FaceTime decline commit rejected: correlation_changed");
-                            return Ok(None);
-                        }
-                        if current.is_ringing_inaccurate == baseline.is_ringing_inaccurate {
-                            current.is_ringing_inaccurate = prepared.is_ringing_inaccurate;
-                        }
-                        if current.mode == baseline.mode {
-                            current.mode = prepared.mode;
-                        }
-                        merge_session_operation(current, &baseline, &prepared, false);
-=======
                     let mut state = self.state.write().await;
-                    if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
+                    if let Some(session) = state
+                        .sessions
+                        .get_mut(&decoded.conversation_group_uuid_string)
+                    {
                         session.is_ringing_inaccurate = false;
                         session.mode = Some(FTMode::MissedOutgoing); // mark as incoming
-                        self.leave(session).await?;
->>>>>>> origin/master
+                        self.unprop_conv(session).await?;
                         (self.update_state)(&state);
                     }
-                    Some(FTMessage::Decline { guid: group })
+                    Some(FTMessage::Decline {
+                        guid: decoded.conversation_group_uuid_string.clone(),
+                    })
                 }
                 ConversationMessageType::LetMeInDelegationResponse => {
                     let requests = self.delegated_requests.lock().await;
                     let Some(request) = requests.get(&decoded.let_me_in_delegation_uuid) else {
                         return Ok(None);
                     };
-                    info!("FaceTime letmein delegation received");
+                    info!("Handling let me in delegation!");
                     let response = request.clone();
                     drop(requests);
                     self.respond_letmein(
@@ -2552,48 +1801,28 @@ impl FTClient {
                         session.is_ringing_inaccurate = false;
                         (self.update_state)(&state);
                     }
-<<<<<<< HEAD
                     Some(FTMessage::RespondedElsewhere {
                         guid: decoded.conversation_group_uuid_string.clone(),
                     })
-=======
-                    Some(FTMessage::RespondedElsewhere { guid: decoded.conversation_group_uuid_string.clone() })
-                },
-                ConversationMessageType::RequestVideoUpgrade => {
-                    self.upgrade_to_video(&decoded.conversation_group_uuid_string, false).await?;
-                    None
->>>>>>> origin/master
                 }
                 _type => {
-                    // `r#type()` is prost's accessor, which maps any wire value
-                    // outside ConversationMessageType back to the default
-                    // variant. That makes every unrecognised type log
-                    // identically as `Unknown` and discards the one piece of
-                    // information needed to identify it. 17, 18 and everything
-                    // above 30 are absent from the enum, so a real type Apple
-                    // sends is indistinguishable here from a genuine zero.
-                    warn!("FaceTime message ignored: unsupported_type");
+                    warn!("Couldn't handle message type {_type:?}");
                     None
                 }
             }
         } else {
             let received: Value = message.plist()?;
-            info!("FaceTime legacy message received");
+            info!("recieved {:?}", received);
             let mut received: FTWireMessage = plist::from_value(&received)?;
-            let connection_token = self.conn.get_token().await;
             let mut state = self.state.write().await;
             let session = state.sessions.entry(received.session.clone()).or_default();
             session.group_id = received.session.clone();
-            if !session.av_config.is_some() {
-                session.av_config = Some(AVConfig::new());
-            }
             if !session.my_handles.contains(&target) {
                 session.my_handles.push(target.clone());
             }
             let context = received.client_context_data_key.take();
             let participant_meta = received.participant_data_key.take(); // BORING
             match (command, context, participant_meta, &received) {
-<<<<<<< HEAD
                 (
                     207,
                     Some(context),
@@ -2603,17 +1832,7 @@ impl FTClient {
                         ..
                     },
                 ) => {
-                    info!("FaceTime participant joined");
-=======
-                (207, Some(context), Some(avc_data), FTWireMessage { participant_id_key: Some(participant), .. }) => {
                     info!("Someone joined!");
-                    // TODO remove this
-                    // if HAS_JOINED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    //     info!("Already set!");
-                    //     return Ok(None);
-                    // }
-
->>>>>>> origin/master
                     let participant = *participant;
                     let decoded_context =
                         ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
@@ -2621,11 +1840,6 @@ impl FTClient {
 
                     if let Some(link) = &message.link {
                         session.link = Some(link.clone());
-                    }
-
-                    info!("here");
-                    if let Some(video) = decoded_context.video {
-                        session.is_video = video;
                     }
 
                     if let Some(report) = &message.report_data {
@@ -2642,7 +1856,6 @@ impl FTClient {
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
 
-<<<<<<< HEAD
                     session.participants.insert(
                         participant.to_string(),
                         FTParticipant {
@@ -2677,20 +1890,13 @@ impl FTClient {
                             }),
                         },
                     );
-=======
-                    if let Some(conn) = &session.connection {
-                        let p: u64 = participant.into();
-                        conn.import_avc(participant.into(), avc_data.as_ref()).await?;
-                    }
 
-                    session.participants.insert(participant.to_string(), FTParticipant {
-                        token: Some(base64_encode(&token)),
-                        participant_id: participant.into(),
-                        last_join_date: Some(ns_since_epoch / 1000000),
-                        handle: sender.clone(),
-                        active: Some(participant_from_meta(participant, &sender, avc_data.into(), message, &decoded_context)),
-                    });
->>>>>>> origin/master
+                    // if we propped it up for a join, someone else (or us) have joined
+                    // so we don't need to prop it anymore
+                    // make sure web client to not hang up on people who are picking up for us
+                    if session.is_propped && sender.starts_with("temp:") {
+                        self.unprop_conv(session).await?;
+                    }
 
                     if message.r#type() == ConversationMessageType::Invitation {
                         if sender != target {
@@ -2701,29 +1907,9 @@ impl FTClient {
                     }
 
                     let guid = session.group_id.clone();
-                    // Persist the received participant event before network I/O,
-                    // then unprop a snapshot and merge only its operation fields.
-                    // This keeps the shared state write lock out of IDS waits.
-                    let unprop_work = if session.is_propped && sender.starts_with("temp:") {
-                        Some((session.clone(), session.clone()))
-                    } else {
-                        None
-                    };
                     (self.update_state)(&state);
-                    drop(state);
 
-                    if let Some((baseline, mut prepared)) = unprop_work {
-                        self.unprop_conv(&mut prepared).await?;
-                        let mut state = self.state.write().await;
-                        if !commit_session_operation(&mut state, &guid, &baseline, &prepared, false)
-                        {
-                            warn!("FaceTime join unprop commit rejected: correlation_changed");
-                        } else {
-                            (self.update_state)(&state);
-                        }
-                    }
-
-                    info!("FaceTime participant join processed");
+                    info!("Context {:#?} {:#?}", decoded_context, received);
                     Some(FTMessage::JoinEvent {
                         guid,
                         participant: participant.into(),
@@ -2733,7 +1919,7 @@ impl FTClient {
                     })
                 }
                 (209, Some(context), meta, _) => {
-                    info!("FaceTime group update received");
+                    info!("Group Updated!");
                     let decoded_context = ConversationParticipantDidJoinContext::decode(
                         &mut Cursor::new(context.as_ref()),
                     )?;
@@ -2743,9 +1929,6 @@ impl FTClient {
                     if let Some(link) = &message.link {
                         session.link = Some(link.clone());
                     }
-                    if let Some(video) = decoded_context.video {
-                        session.is_video = video;
-                    }
                     if let Some(report) = &message.report_data {
                         session.report_id = report.conversation_id.clone();
                         session.start_time = Some(
@@ -2753,23 +1936,26 @@ impl FTClient {
                                 as u64,
                         );
                     }
-                    session.unpack_participants(&message.active_participants, &connection_token);
-                    let mut rebroadcast_work = None;
+                    session.unpack_participants(
+                        &message.active_participants,
+                        &self.conn.get_token().await,
+                    );
                     let result: Option<FTMessage> = match message.r#type() {
                         ConversationMessageType::AddMember => {
+                            info!("Added a member!");
                             let new = session.new_members(&message.added_members);
-                            info!("FaceTime members added count={}", new.len().min(32));
 
                             if !stand_up_for.is_empty() {
-                                info!("FaceTime member rebroadcast requested");
+                                info!("Standing up for {:?} to {:?}", stand_up_for, new);
                                 // if some members we recently added were left out of this state change, we must tell
                                 // the new member that these members *do* exist and should be included in the session
-                                rebroadcast_work = Some((
-                                    session.clone(),
-                                    session.clone(),
+                                self.add_members(
+                                    session,
                                     stand_up_for,
-                                    new.iter().map(|a| a.handle.clone()).collect(),
-                                ));
+                                    false,
+                                    Some(new.iter().map(|a| a.handle.clone()).collect()),
+                                )
+                                .await?;
                             }
 
                             // if we were added, ring
@@ -2782,7 +1968,7 @@ impl FTClient {
                             })
                         }
                         ConversationMessageType::RemoveMember => {
-                            info!("FaceTime members removed");
+                            info!("Removed a member!");
                             Some(FTMessage::RemoveMembers {
                                 guid: session.group_id.clone(),
                                 members: session.remove_members(&message.removed_members),
@@ -2790,51 +1976,22 @@ impl FTClient {
                         }
                         _ => None,
                     };
-                    let group = session.group_id.clone();
                     (self.update_state)(&state);
-                    drop(state);
 
-                    if let Some((baseline, mut prepared, members, targets)) = rebroadcast_work {
-                        self.add_members(&mut prepared, members, false, Some(targets))
-                            .await?;
-                        let mut state = self.state.write().await;
-                        if !commit_session_operation(&mut state, &group, &baseline, &prepared, true)
-                        {
-                            warn!(
-                                "FaceTime member rebroadcast commit rejected: correlation_changed"
-                            );
-                        } else {
-                            (self.update_state)(&state);
-                        }
-                    }
-
-                    info!("FaceTime group update processed");
+                    info!(
+                        "Context {:#?} {:?} {:#?}",
+                        decoded_context,
+                        meta.map(|a| encode_hex(a.as_ref())),
+                        received
+                    );
                     result
-<<<<<<< HEAD
                 }
                 (210, _, _, _) => {
                     // we don't have any realtime connection so we use the peridic rekeys as heartbeats
-=======
-                },
-                (210, _, _, FTWireMessage { prekey: Some(prekey), prekey_wrap_mode: Some(wrap_mode), .. }) => {
->>>>>>> origin/master
                     session.last_rekey = Some(ns_since_epoch / 1000000);
-                    if let Some(session) = &session.connection {
-                        if let Some(participant) = session.link.token_to_participant(&token).await {
-                            session.handle_prekey(participant, QuickRelayPreKey {
-                                public_prekey: prekey.clone(),
-                                wrap_mode: *wrap_mode,
-                                creation_date: ns_since_epoch as f64 / 1000000000.0,
-                            }).await?;
-                        } else {
-                            warn!("Ignoring prekey for unknwon participant!");
-                        }
-                    }
-
                     (self.update_state)(&state);
                     None
                 }
-<<<<<<< HEAD
                 (
                     208,
                     a,
@@ -2844,27 +2001,8 @@ impl FTClient {
                         ..
                     },
                 ) => {
-=======
-                (211, _, _, wire) => {
-                    info!("Got keys message {wire:?}");
-                    if let Some(session) = &session.connection {
-                        if let Some(participant) = session.link.token_to_participant(&token).await {
-                            if let Some(skm) = &wire.session_key_material {
-                                session.handle_skm(participant, skm.clone()).await?;
-                            }
-                            if let Some(mkm) = &wire.media_key_material {
-                                session.handle_mkm(participant, mkm.clone()).await?;
-                            }
-                        } else {
-                            warn!("Ignoring keys for unknwon participant!");
-                        }
-                    }
-                    None
-                }
-                (208, a, b, FTWireMessage { participant_id_key: Some(participant), .. }) => {
->>>>>>> origin/master
                     let id = *participant;
-                    info!("FaceTime participant left");
+                    info!("Group member left!");
                     let participant = session
                         .participants
                         .get_mut(&id.to_string())
@@ -2900,365 +2038,22 @@ impl FTClient {
                         session.is_ringing_inaccurate = false;
                     }
                     (self.update_state)(&state);
-                    info!("FaceTime legacy message processed");
+                    info!("Context {:#?} {:?} {:#?}", a, b, received);
                     Some(FTMessage::LeaveEvent {
                         guid,
                         participant: id.into(),
                         handle: handle_left,
                     })
                 }
-                (_c, _a, _b, _) => {
-                    info!("FaceTime legacy message ignored: unsupported_command");
+                (_c, a, b, _) => {
+                    info!(
+                        "Received unknown command {_c} {} \n {} {received:#?}",
+                        encode_hex(a.unwrap_or(Data::new(vec![])).as_ref()),
+                        encode_hex(b.unwrap_or(Data::new(vec![])).as_ref())
+                    );
                     None
                 }
             }
         })
     }
 }
-<<<<<<< HEAD
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn session() -> FTSession {
-        FTSession {
-            group_id: "group".to_string(),
-            my_handles: vec!["self".to_string()],
-            participants: HashMap::new(),
-            link: None,
-            members: HashSet::new(),
-            report_id: "report".to_string(),
-            start_time: Some(0),
-            last_rekey: None,
-            is_propped: false,
-            is_ringing_inaccurate: true,
-            mode: Some(FTMode::Outgoing),
-            recent_member_adds: HashMap::new(),
-        }
-    }
-
-    fn member(handle: &str) -> FTMember {
-        FTMember {
-            nickname: None,
-            handle: handle.to_string(),
-        }
-    }
-
-    fn direct_request() -> LetMeInRequest {
-        LetMeInRequest {
-            shared_secret: vec![1, 2, 3],
-            pseud: "pseudonym".to_string(),
-            requestor: "requestor".to_string(),
-            nickname: None,
-            token: vec![4, 5, 6],
-            delegation_uuid: None,
-            usage: Some("incomingcall".to_string()),
-        }
-    }
-
-    #[test]
-    fn direct_admission_is_bounded_and_idempotent() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let key = direct_admission_key(&direct_request(), Some("group"));
-        let mut admissions = HashMap::new();
-
-        assert_eq!(
-            claim_direct_admission(&mut admissions, key, now),
-            DirectAdmissionClaim::Start
-        );
-        assert_eq!(
-            claim_direct_admission(&mut admissions, key, now),
-            DirectAdmissionClaim::InFlight
-        );
-
-        finish_direct_admission(&mut admissions, key, now, true);
-        assert_eq!(
-            claim_direct_admission(&mut admissions, key, now),
-            DirectAdmissionClaim::Completed
-        );
-        assert_eq!(
-            claim_direct_admission(&mut admissions, key, now + Duration::from_secs(121)),
-            DirectAdmissionClaim::Start
-        );
-    }
-
-    #[test]
-    fn failed_direct_admission_can_retry_without_cross_group_collision() {
-        let now = UNIX_EPOCH + Duration::from_secs(2_000);
-        let request = direct_request();
-        let first = direct_admission_key(&request, Some("first"));
-        let second = direct_admission_key(&request, Some("second"));
-        assert_ne!(first, second);
-
-        let mut admissions = HashMap::new();
-        assert_eq!(
-            claim_direct_admission(&mut admissions, first, now),
-            DirectAdmissionClaim::Start
-        );
-        finish_direct_admission(&mut admissions, first, now, false);
-        assert_eq!(
-            claim_direct_admission(&mut admissions, first, now),
-            DirectAdmissionClaim::Start
-        );
-    }
-
-    #[test]
-    fn delegated_admission_is_consumed_only_after_success() {
-        let delegation = "delegation".to_string();
-        let mut request = direct_request();
-        request.delegation_uuid = Some(delegation.clone());
-        let mut requests = HashMap::from([(delegation.clone(), request)]);
-        let mut in_flight = HashSet::new();
-
-        assert_eq!(
-            claim_delegated_admission(&requests, &mut in_flight, &delegation),
-            DelegatedAdmissionClaim::Start
-        );
-        assert_eq!(
-            claim_delegated_admission(&requests, &mut in_flight, &delegation),
-            DelegatedAdmissionClaim::InFlight
-        );
-
-        finish_delegated_admission(&mut requests, &mut in_flight, &delegation, false);
-        assert!(requests.contains_key(&delegation));
-        assert_eq!(
-            claim_delegated_admission(&requests, &mut in_flight, &delegation),
-            DelegatedAdmissionClaim::Start
-        );
-
-        finish_delegated_admission(&mut requests, &mut in_flight, &delegation, true);
-        assert!(!requests.contains_key(&delegation));
-        assert_eq!(
-            claim_delegated_admission(&requests, &mut in_flight, &delegation),
-            DelegatedAdmissionClaim::Completed
-        );
-    }
-
-    #[test]
-    fn malformed_encrypted_letmein_is_rejected_without_slicing_or_key_panics() {
-        let mut encrypted = EncryptedConversationMessage {
-            public_key: vec![0; 31],
-            conversation_message_bytes: vec![0; NONCE_COUNT + 1],
-        };
-        assert!(matches!(
-            encrypted_letmein_parts(&encrypted),
-            Err(PushError::BadMsg)
-        ));
-
-        encrypted.public_key = vec![0; 32];
-        encrypted.conversation_message_bytes = vec![0; NONCE_COUNT];
-        assert!(matches!(
-            encrypted_letmein_parts(&encrypted),
-            Err(PushError::BadMsg)
-        ));
-
-        encrypted.conversation_message_bytes = vec![0; NONCE_COUNT + 1];
-        let (_, nonce, body) = encrypted_letmein_parts(&encrypted).expect("valid framing");
-        assert_eq!(nonce.len(), NONCE_COUNT);
-        assert_eq!(body.len(), 1);
-    }
-
-    #[test]
-    fn session_merge_preserves_concurrent_activity() {
-        let mut baseline = session();
-        baseline.participants.insert(
-            "1".to_string(),
-            FTParticipant {
-                token: None,
-                handle: "peer".to_string(),
-                participant_id: 1,
-                last_join_date: None,
-                active: None,
-            },
-        );
-        let mut prepared = baseline.clone();
-        prepared.participants.get_mut("1").unwrap().token = Some("allocated".to_string());
-        prepared.is_propped = true;
-
-        let mut current = baseline.clone();
-        let participant = current.participants.get_mut("1").unwrap();
-        participant.active = Some(ConversationParticipant::default());
-        participant.last_join_date = Some(42);
-
-        let mut state = FTState::default();
-        state.sessions.insert("group".to_string(), current);
-        assert!(commit_session_operation(
-            &mut state, "group", &baseline, &prepared, false,
-        ));
-
-        let committed = state.sessions.get("group").unwrap();
-        let participant = committed.participants.get("1").unwrap();
-        assert_eq!(participant.token.as_deref(), Some("allocated"));
-        assert_eq!(participant.last_join_date, Some(42));
-        assert!(participant.active.is_some());
-        assert!(committed.is_propped);
-    }
-
-    #[test]
-    fn session_merge_does_not_overwrite_concurrent_allocation() {
-        let mut baseline = session();
-        baseline.participants.insert(
-            "1".to_string(),
-            FTParticipant {
-                token: Some("baseline".to_string()),
-                handle: "peer".to_string(),
-                participant_id: 1,
-                last_join_date: None,
-                active: None,
-            },
-        );
-        let mut prepared = baseline.clone();
-        prepared.participants.get_mut("1").unwrap().token = Some("operation".to_string());
-        let mut current = baseline.clone();
-        current.participants.get_mut("1").unwrap().token = Some("concurrent".to_string());
-
-        let mut state = FTState::default();
-        state.sessions.insert("group".to_string(), current);
-        assert!(commit_session_operation(
-            &mut state, "group", &baseline, &prepared, false,
-        ));
-        assert_eq!(
-            state
-                .sessions
-                .get("group")
-                .unwrap()
-                .participants
-                .get("1")
-                .unwrap()
-                .token
-                .as_deref(),
-            Some("concurrent")
-        );
-    }
-
-    #[test]
-    fn session_merge_adds_members_without_replacing_concurrent_members() {
-        let mut baseline = session();
-        baseline.members.insert(member("existing"));
-        let mut prepared = baseline.clone();
-        prepared.members.insert(member("approved"));
-        prepared
-            .recent_member_adds
-            .insert("approved".to_string(), 9);
-        let mut current = baseline.clone();
-        current.members.insert(member("concurrent"));
-
-        let mut state = FTState::default();
-        state.sessions.insert("group".to_string(), current);
-        assert!(commit_session_operation(
-            &mut state, "group", &baseline, &prepared, true,
-        ));
-        let committed = state.sessions.get("group").unwrap();
-        assert!(committed.members.contains(&member("existing")));
-        assert!(committed.members.contains(&member("approved")));
-        assert!(committed.members.contains(&member("concurrent")));
-        assert_eq!(committed.recent_member_adds.get("approved"), Some(&9));
-    }
-
-    #[test]
-    fn session_commit_does_not_resurrect_removed_or_replaced_session() {
-        let mut baseline = session();
-        baseline.participants.insert(
-            "removed".to_string(),
-            FTParticipant {
-                token: None,
-                handle: "removed".to_string(),
-                participant_id: 2,
-                last_join_date: None,
-                active: None,
-            },
-        );
-        let mut prepared = baseline.clone();
-        prepared.participants.get_mut("removed").unwrap().token = Some("allocated".to_string());
-
-        let mut state = FTState::default();
-        assert!(!commit_session_operation(
-            &mut state, "group", &baseline, &prepared, false,
-        ));
-
-        let mut current = baseline.clone();
-        current.participants.remove("removed");
-        state.sessions.insert("group".to_string(), current);
-        assert!(commit_session_operation(
-            &mut state, "group", &baseline, &prepared, false,
-        ));
-        assert!(!state
-            .sessions
-            .get("group")
-            .unwrap()
-            .participants
-            .contains_key("removed"));
-
-        let mut replacement = session();
-        replacement.report_id = "replacement".to_string();
-        state.sessions.insert("group".to_string(), replacement);
-        assert!(!commit_session_operation(
-            &mut state, "group", &baseline, &prepared, false,
-        ));
-        assert_eq!(
-            state.sessions.get("group").unwrap().report_id,
-            "replacement"
-        );
-    }
-
-    #[test]
-    fn production_logs_are_payload_free() {
-        let production = include_str!("facetime.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source is present");
-        let forbidden_fragments = [
-            "{:?}",
-            "{:#?}",
-            "encode_hex",
-            "{guid",
-            "{group",
-            "{session",
-            "{pseud",
-            "{handle",
-            "{requestor",
-            "{letmein",
-            "{new_members",
-            "{approved",
-            "{to_group",
-            "{_type",
-            "{received",
-            "{decoded",
-            "{context",
-            "{meta",
-            "{_c}",
-            "{_a}",
-            "{_b}",
-        ];
-
-        let mut in_log = false;
-        let mut log_source = String::new();
-        for line in production.lines() {
-            if !in_log
-                && ["info!(", "warn!(", "debug!(", "error!(", "trace!("]
-                    .iter()
-                    .any(|macro_start| line.contains(macro_start))
-            {
-                in_log = true;
-            }
-            if in_log {
-                log_source.push_str(line);
-                log_source.push('\n');
-                if line.contains(");") {
-                    for forbidden in forbidden_fragments {
-                        assert!(
-                            !log_source.contains(forbidden),
-                            "forbidden fragment {forbidden:?} in log: {log_source}"
-                        );
-                    }
-                    log_source.clear();
-                    in_log = false;
-                }
-            }
-        }
-        assert!(!in_log, "unterminated log invocation in production source");
-    }
-}
-=======
->>>>>>> origin/master

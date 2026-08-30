@@ -551,7 +551,6 @@ async fn main() {
         let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
-<<<<<<< HEAD
         let delegates = login_apple_delegates(
             &gsa.user,
             &pet,
@@ -566,10 +565,6 @@ async fn main() {
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref())
             .await
             .unwrap();
-=======
-        let delegates = login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
-        let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
->>>>>>> origin/master
 
         let mobileme = delegates.mobileme.unwrap();
         let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
@@ -835,7 +830,6 @@ async fn main() {
     .unwrap();
 
     let state: PasswordState = plist::from_file("passwords.plist").unwrap_or_default();
-<<<<<<< HEAD
     let passwords = PasswordManager::new(
         keychain.clone(),
         cloudkit.clone(),
@@ -847,13 +841,6 @@ async fn main() {
         }),
     )
     .await;
-=======
-    // let passwords = PasswordManager::new(
-    //     keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
-    //         plist::to_file_xml("passwords.plist", state).unwrap();
-    //     })).await;
-
->>>>>>> origin/master
 
     if let Some(mut s) = session {
         let mut subscription = connection.messages_cont.subscribe();
@@ -1160,9 +1147,9 @@ async fn main() {
         tokio::select! {
             msg = subscription.recv() => {
                 let msg = msg.unwrap();
-                // if let Err(e) = passwords.handle(msg.clone()).await {
-                //     info!("err {e}");
-                // }
+                if let Err(e) = passwords.handle(msg.clone()).await {
+                    info!("err {e}");
+                }
                 // if let Err(e) = findmy_client.handle(msg.clone()).await {
                 //     info!("err {e}");
                 // }

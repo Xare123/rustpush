@@ -1,14 +1,7 @@
 mod activation;
 mod aps;
 mod auth;
-<<<<<<< HEAD
 mod error;
-=======
-mod ids;
-pub mod avconference;
-pub mod sharedstreams;
-pub mod findmy;
->>>>>>> origin/master
 pub mod facetime;
 pub mod findmy;
 pub mod icloud;

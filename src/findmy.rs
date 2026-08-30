@@ -2472,12 +2472,11 @@ pub struct FindMyPhoneClient<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> FindMyPhoneClient<P> {
-    async fn build_request(
+    async fn make_request<T: for<'a> Deserialize<'a>>(
         &mut self,
         config: &dyn OSConfig,
         path: &str,
-        data: serde_json::Value,
-    ) -> Result<reqwest::RequestBuilder, PushError> {
+    ) -> Result<T, PushError> {
         let token = self.token_provider.get_mme_token("mmeFMIPAppToken").await?;
 
         let request = REQWEST
@@ -2516,30 +2515,12 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             "windowVisible": false
         });
 
-        let mut body = json!({
-            "clientContext": client_context,
-            "tapContext": [],
-            "serverContext": self.server_context,
-        });
-        let serde_json::Value::Object(body) = &mut body else {
-            unreachable!()
-        };
-        let serde_json::Value::Object(data) = data else {
-            unreachable!("Find My request data must be an object")
-        };
-        body.extend(data);
-
-        Ok(request.json(&body))
-    }
-
-    async fn make_state_request(
-        &mut self,
-        config: &dyn OSConfig,
-        path: &str,
-    ) -> Result<(), PushError> {
-        let raw_request: serde_json::Value = self
-            .build_request(config, path, json!({}))
-            .await?
+        let raw_request: serde_json::Value = request
+            .json(&json!({
+                "clientContext": client_context,
+                "tapContext": [],
+                "serverContext": self.server_context,
+            }))
             .send()
             .await?
             .json()
@@ -2549,7 +2530,8 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
 
         self.server_context = request.server_context;
         self.devices = request.content;
-        Ok(())
+
+        Ok(serde_json::from_value(raw_request)?)
     }
 
     pub async fn new(
@@ -2569,44 +2551,17 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             token_provider,
         };
 
-        client.make_state_request(config, "initClient").await?;
+        let _ = client
+            .make_request::<serde_json::Value>(config, "initClient")
+            .await?;
 
         Ok(client)
     }
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
-        self.make_state_request(config, "refreshClient").await
-    }
-
-    pub async fn play_sound(
-        &mut self,
-        config: &dyn OSConfig,
-        device_id: &str,
-    ) -> Result<(), PushError> {
-        if device_id.is_empty()
-            || !self
-                .devices
-                .iter()
-                .any(|device| device.id.as_deref() == Some(device_id))
-        {
-            return Err(PushError::DeviceNotFound);
-        }
-
-        let response = self
-            .build_request(
-                config,
-                "playSound",
-                json!({
-                    "device": device_id,
-                    "subject": "Find My Device Alert",
-                }),
-            )
-            .await?
-            .send()
+        let _ = self
+            .make_request::<serde_json::Value>(config, "refreshClient")
             .await?;
-        if !response.status().is_success() {
-            return Err(PushError::StatusError(response.status()));
-        }
         Ok(())
     }
 }

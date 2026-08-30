@@ -926,7 +926,6 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<StatusKitMessage>, PushError> {
-<<<<<<< HEAD
         let APSMessage::Notification {
             id: _,
             topic,
@@ -944,18 +943,9 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             }) {
                 local_channel.last_msg_ns = channel.last_msg_ns;
                 (self.update_state)(&state);
-=======
-        if let APSMessage::Notification { id: _, topic, token: _, payload: Value::Data(payload), channel } = msg.clone() {
-            if let Some(channel) = &channel {
-                let mut state = self.state.write().await;
-                if let Some(local_channel) = state.recent_channels.iter_mut().find(|c| c.identifier.id == channel.id && sha1(c.identifier.topic.as_bytes()) == topic) {
-                    local_channel.last_msg_ns = channel.last_msg_ns;
-                    (self.update_state)(&state);
-                }
->>>>>>> origin/master
             }
+        }
 
-<<<<<<< HEAD
         if topic == sha1("com.apple.icloud.presence.mode.status".as_bytes()) {
             let result: StatusKitOuterMessage = serde_json::from_slice(&payload)?;
             let inner: StatusKitInnerMessage =
@@ -972,21 +962,9 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else {
                 panic!("Channel not found!")
             };
-=======
-            if topic == sha1("com.apple.icloud.presence.mode.status".as_bytes()) {
-                let result: StatusKitOuterMessage = serde_json::from_slice(&payload)?;
-                let inner: StatusKitInnerMessage = plist::from_bytes(&base64_decode(&result.status_kit_data_key))?;
 
-                
-                let Some(channel) = &channel else { return Ok(None) };
-                debug!("Got statuskit message {inner:?} on channel {}", encode_hex(&channel.id));
-                let mut state = self.state.write().await;
-                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
->>>>>>> origin/master
+            let key = referenced_channel.get_key(inner.ratchet)?;
 
-                let key = referenced_channel.get_key(inner.ratchet)?;
-
-<<<<<<< HEAD
             let message = base64_decode(&inner.encrypted_message);
             referenced_channel.signature.verify(
                 MessageDigest::sha256(),
@@ -995,14 +973,9 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     .try_into()
                     .expect("Bad signature length!"),
             )?;
-=======
-                let message = base64_decode(&inner.encrypted_message);
-                referenced_channel.signature.verify(MessageDigest::sha256(), &message, base64_decode(&inner.signature).try_into().expect("Bad signature length!"))?;
->>>>>>> origin/master
 
-                let key = key.message_key();
+            let key = key.message_key();
 
-<<<<<<< HEAD
             let cipher = Aes256Gcm::new_from_slice(&key).expect("GCM key creation failed");
             let plaintext = cipher
                 .decrypt(
@@ -1013,18 +986,10 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     },
                 )
                 .expect("Failed to decrypt");
-=======
-                let cipher = Aes256Gcm::new_from_slice(&key).expect("GCM key creation failed");
-                let plaintext = cipher.decrypt(Nonce::from_slice(&message[..12]), aes_gcm::aead::Payload {
-                    msg: &message[12..],
-                    aad: &referenced_channel.signature.compress()
-                }).expect("Failed to decrypt");
->>>>>>> origin/master
 
-                let status = PublishedStatus::decode(Cursor::new(&plaintext))?;
-                let status: StatusKitStatus = plist::from_bytes(&status.message)?;
+            let status = PublishedStatus::decode(Cursor::new(&plaintext))?;
+            let status: StatusKitStatus = plist::from_bytes(&status.message)?;
 
-<<<<<<< HEAD
             let user = referenced_channel.from.clone();
             let is_available = status.active
                 || status
@@ -1032,28 +997,14 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     .as_ref()
                     .map(|s| referenced_channel.personal_config.allowed_modes.contains(s))
                     .unwrap_or(false);
-=======
-                let user = referenced_channel.from.clone();
-                let is_available = status.active || status.id.as_ref().map(|s| referenced_channel.personal_config.allowed_modes.contains(s)).unwrap_or(false);
->>>>>>> origin/master
 
-                (self.update_state)(&state); // we might have ratcheted it
+            (self.update_state)(&state); // we might have ratcheted it
 
-<<<<<<< HEAD
             return Ok(Some(StatusKitMessage::StatusChanged {
                 user,
                 mode: status.id.clone(),
                 allowed: is_available,
             }));
-=======
-
-                return Ok(Some(StatusKitMessage::StatusChanged {
-                    user,
-                    mode: status.id.clone(),
-                    allowed: is_available
-                }));
-            }
->>>>>>> origin/master
         }
 
         if let Some(IDSRecvMessage {
@@ -1075,7 +1026,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             match topic {
                 "com.apple.private.alloy.status.keysharing" => {
                     let parsed: StatusKitRawSharedDevice = message.plist()?;
-                    info!("StatusKit IDS message came in as {:?}", parsed);
+                    debug!("StatusKit IDS message came in as {:?}", parsed);
 
                     let config: StatusKitPersonalConfig =
                         plist::from_bytes(&base64_decode(&parsed.personal_config))?;

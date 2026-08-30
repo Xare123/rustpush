@@ -301,8 +301,7 @@ impl APSPackedEncoder {
         } else {
             // search in tag cache
             if let Some(existing) = self.key_table.get_buf_idx(&attribute.id) {
-                info!("Using kcache {existing}");
-                writer.write_all(&[0x20 | flags | existing as u8])?;
+                self.write_tagged_value(5, existing as u64, 0x20 | flags, writer)?;
             } else {
                 self.write_tagged_value(4, attribute.id.len() as u64 - 1, 0x10 | flags, writer)?;
 
@@ -313,7 +312,6 @@ impl APSPackedEncoder {
 
         // actually write the value
         if let Some(existing) = existing {
-            info!("Using vcache {existing}");
             self.write_tagged_value(8, existing as u64, 0, writer)?;
         } else if let Some(cached_buf) = cached_buf {
             writer.write_all(&cached_buf)?;
@@ -1465,152 +1463,6 @@ impl APSMessage {
     }
 }
 
-// Interactive developer harness: requires private proxy TLS material, binds
-// port 5223, and waits for an external APS client. It must never be part of the
-// ordinary offline unit suite or CI will either fail at compile time or hang.
-#[cfg(feature = "aps-proxy-test")]
-#[tokio::test]
-async fn replay_test() {
-    use keystore::{init_keystore, software::{SoftwareKeystore, NoEncryptor}};
-    init_keystore(SoftwareKeystore {
-        state: plist::from_file("jerrytest/keystore.plist").unwrap(),
-        update_state: Box::new(|state| {
-            plist::to_file_xml("jerrytest/keystore.plist", state).unwrap();
-        }),
-        encryptor: NoEncryptor,
-    });
-
-    if let Err(_) = std::env::var("RUST_LOG") {
-        std::env::set_var("RUST_LOG", "debug");
-    }
-    let _ = pretty_env_logger::try_init();
-
-    let state_path = std::env::var("APS_REPLAY_STATE")
-        .unwrap_or_else(|_| if std::path::Path::new("jerrytest/push.plist").exists() {
-            "jerrytest/push.plist".to_string()
-        } else {
-            "jerrytest/push.plist".to_string()
-        });
-    let log_path = std::env::var("APS_REPLAY_LOG")
-        .unwrap_or_else(|_| if std::path::Path::new("jerrytest/replaytest.log").exists() {
-            "jerrytest/replaytest.log".to_string()
-        } else {
-            "jerrytest/replaytest.log".to_string()
-        });
-
-    let mut state: APSState = plist::from_file(&state_path).unwrap();
-    let pair = state.keypair.as_ref().expect("replay APS state must already contain a keypair");
-
-    let (socket, encoder, mut decoder) = open_socket().await.unwrap();
-    let (mut read, write) = split(socket);
-    let (send, _) = tokio::sync::broadcast::channel(999);
-    let socket = Arc::new(DebugMutex::new(Some((write, encoder))));
-
-    let reader_send = send.clone();
-    let mut reader = task::spawn(async move {
-        loop {
-            match APSMessage::read_from_stream(&mut read, &mut decoder).await {
-                Ok(Some(msg)) => {
-                    let _ = reader_send.send(msg);
-                },
-                Ok(None) => {},
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<(), PushError>(())
-    });
-
-    let nonce = generate_nonce(NonceType::APNS);
-    let signature = do_ids_signature(&pair.private, &nonce).unwrap();
-    let mut recv = send.subscribe();
-    replay_send(&socket, APSMessage::Connect {
-        flags: 0b01000001,
-        certificate: Some(pair.cert.clone()),
-        nonce: Some(nonce),
-        signature: Some(signature),
-        token: state.token,
-    }).await.unwrap();
-
-    let (token, status) = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let APSMessage::ConnectResponse { token, status } = recv.recv().await.unwrap() {
-                return (token, status);
-            }
-        }
-    }).await.unwrap();
-
-    assert_eq!(status, 0, "APS connect failed with status {status}");
-    if let Some(token) = token {
-        state.token = Some(token);
-    }
-
-    let replay = std::fs::read_to_string(&log_path).unwrap();
-    let mut sent = 0usize;
-    let mut skipped_first_send = false;
-    for (line_index, line) in replay.lines().enumerate() {
-        let Some((_, rest)) = line.split_once("Sending \"") else {
-            continue;
-        };
-        if !skipped_first_send {
-            skipped_first_send = true;
-            continue;
-        }
-        if sent >= 0 {
-            break;
-        }
-        let Some((hex, _)) = rest.split_once('"') else {
-            panic!("bad Sending line {}: missing closing quote", line_index + 1);
-        };
-        info!("Sending {}", sent + 1);
-        let bytes = decode_hex(hex).unwrap();
-        let message: APSMessage = plist::from_bytes(&bytes).unwrap();
-        replay_send(&socket, message).await.unwrap();
-        sent += 1;
-    }
-
-    assert!(skipped_first_send, "no Sending lines found in {log_path}");
-    info!("replayed {sent} APS messages from {log_path}");
-
-    tokio::select! {
-        result = &mut reader => {
-            match result {
-                Ok(Ok(())) => panic!("replay APS reader ended before observation window ended"),
-                Ok(Err(err)) => panic!("replay APS reader stopped before observation window ended: {err}"),
-                Err(err) => panic!("replay APS reader task failed before observation window ended: {err}"),
-            }
-        }
-        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-    }
-
-    reader.abort();
-}
-
-#[cfg(test)]
-async fn replay_send(
-    socket: &DebugMutex<Option<(WriteHalf<TlsStream<TcpStream>>, Option<APSPackedEncoder>)>>,
-    message: APSMessage,
-) -> Result<(), PushError> {
-    let mut socket_guard = socket.lock().await;
-    let socket = socket_guard.as_mut().ok_or(PushError::NotConnected)?;
-    if let Some(encoder) = &mut socket.1 {
-        let mut buf = vec![];
-        encoder.encode_message(message.to_packed_raw(), Cursor::new(&mut buf))?;
-        socket.0.write_all(&buf).await?;
-    } else {
-        let mut raw = message.to_raw();
-        for message in &mut raw.body {
-            message.update()?;
-        }
-        raw.update()?;
-        socket.0.write_all(&raw.to_bytes()?).await?;
-    }
-    Ok(())
-}
-
 #[tokio::test]
 async fn proxy() {
     if let Err(_) = std::env::var("RUST_LOG") {
@@ -1936,7 +1788,6 @@ async fn open_socket(
     if let Some(protocol) = stream.get_ref().1.alpn_protocol() {
         let protocol = std::str::from_utf8(protocol).unwrap();
         if protocol.starts_with("apns-pack-v1") {
-<<<<<<< HEAD
             let mut parts = protocol.split(":");
             let encoder_count: usize = parts
                 .nth(1)
@@ -1950,18 +1801,6 @@ async fn open_socket(
                 .expect("Bad alpn4!");
             encoder = Some(APSPackedEncoder::new_with_cache_size(encoder_count));
             decoder = Some(APSPackedDecoder::new_with_cache_size(decoder_count));
-=======
-            if protocol.contains(":") {
-                let mut parts = protocol.split(":");
-                let encoder_count: usize = parts.nth(1).expect("Bad ALPN1!").parse().expect("Bad alpn3!");
-                let decoder_count: usize = parts.next().expect("Bad ALPN2!").parse().expect("Bad alpn4!");
-                encoder = Some(APSPackedEncoder::new_with_cache_size(encoder_count));
-                decoder = Some(APSPackedDecoder::new_with_cache_size(decoder_count));
-            } else {
-                encoder = Some(APSPackedEncoder::default());
-                decoder = Some(APSPackedDecoder::default());
-            }
->>>>>>> origin/master
         }
     }
 
@@ -2360,8 +2199,7 @@ impl APSConnectionResource {
 
             let mut buf = vec![];
             encoder.encode_message(message.to_packed_raw(), Cursor::new(&mut buf))?;
-            
-            debug!("Sendin2g {:?}", encode_hex(&buf));
+
             socket.0.write_all(&buf).await
         } else {
             let mut raw = message.to_raw();

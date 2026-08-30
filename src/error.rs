@@ -241,12 +241,4 @@ pub enum PushError {
     FailedToAcceptTOS(String),
     #[error("The device you have chosen is invalid! Please choose a different device.")]
     PeerNoShares,
-    #[error("Participant key missing!")]
-    FTKeyMissing,
-    #[error("Wrong Key ID!")]
-    SFrameWrongKeyId,
-    #[error("Participant key missing!")]
-    SFrameBadSignature,
-    #[error("No Asset!")]
-    NoAsset,
 }

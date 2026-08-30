@@ -26,25 +26,14 @@ use openssl::{
     symm::{decrypt, encrypt, Cipher},
 };
 use plist::{Data, Dictionary, Value};
-<<<<<<< HEAD
-=======
-use serde::{Deserialize, Serialize};
-use srp::groups;
-use tokio::{task::JoinHandle};
-use backon::Retryable;
->>>>>>> origin/master
 use rand::Rng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-<<<<<<< HEAD
 use std::str::FromStr;
 use tokio::select;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-=======
-use crate::{aps::new_aps_id, ids::link::QuickRelayAllocationsResponse, util::{DebugMutex, DebugRwLock}};
->>>>>>> origin/master
 
 use crate::{
     aps::{get_message, APSConnection, APSInterestToken},
@@ -76,7 +65,7 @@ const REFRESH_MIN: Duration = Duration::from_secs(60);
 use deku::{DekuContainerWrite, DekuUpdate};
 
 #[repr(C)]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub enum MessageTarget {
     Token(Vec<u8>),
     Uuid(String),
@@ -499,7 +488,7 @@ pub struct IdentityResource {
     pub users: DebugRwLock<Vec<IDSUser>>,
     pub identity: IDSNGMIdentity,
     config: Arc<dyn OSConfig>,
-    pub aps: APSConnection,
+    aps: APSConnection,
     query_lock: DebugMutex<()>,
     manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
     services: &'static [&'static IDSService],
@@ -900,7 +889,6 @@ impl IdentityResource {
             .clone()
     }
 
-<<<<<<< HEAD
     pub async fn ensure_private_self(
         &self,
         cache_lock: &mut KeyCache,
@@ -913,47 +901,6 @@ impl IdentityResource {
             .unwrap()
             .get_mut(handle)
             .unwrap();
-=======
-    pub async fn request_relay_allocations(&self, handle: &str, participants: &[String], group_id: &str) -> Result<QuickRelayAllocationsResponse, PushError> {
-        const TOPIC: &'static str = "com.apple.private.alloy.facetime.multi";
-        self.cache_keys(
-            TOPIC,
-            participants,
-            &handle,
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true }
-        ).await?;
-
-        let targets = self.cache.lock().await.get_participants_targets(&TOPIC, handle, participants);
-        let receiver = self.aps.subscribe().await;
-        let uuid = Uuid::new_v4();
-        self.send_message(TOPIC, IDSSendMessage::quickrelay(handle.to_string(), uuid, IDSQuickRelaySettings {
-            reason: 0, // something along the lines of 'someone joined'
-            group_id: group_id.to_string(),
-            request_type: 3, // allocate relay
-            member_count: participants.len() as u32,
-        }), targets).await?;
-
-        let response: QuickRelayAllocationsResponse = self.aps.wait_for_timeout(receiver, get_message(|payload| {
-            info!("Got relay {:?}", payload);
-            let parsed = match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    info!("Failed to parse {e}");
-                    return None;
-                }
-            };
-            if parsed.for_id.as_ref() == uuid.as_bytes() { Some(parsed) } else { None }
-        }, &["com.apple.private.alloy.quickrelay"])).await?;
-
-        assert_eq!(&*Uuid::from_str(group_id).unwrap().as_bytes(), response.session_id.as_ref());
-
-        Ok(response)
-    }
-
-    pub async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
-        let my_cache = cache_lock.cache.get_mut("com.apple.madrid").unwrap().get_mut(handle).unwrap();
->>>>>>> origin/master
         if my_cache.private_data.len() != 0 && !refresh {
             return Ok(());
         }

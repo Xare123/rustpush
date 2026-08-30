@@ -32,13 +32,6 @@ enum ConversationMessageType {
     GuestModeUpdated = 28;
     Endorse = 29;
     AddHighlight = 30;
-    RemoveHighlight = 31;
-    UpdateJoinedMetadata = 32;
-    ParticipantUpdated = 33;
-    RegisterMessagesGroupUUID = 34;
-    ScreenShareRequest = 35;
-    ScreenShareResponse = 36;
-    SharePlayAvailable = 37;
 }
 
 enum HandleType {
@@ -86,18 +79,6 @@ message ConversationParticipant {
     optional bool guestModeEnabled = 13;
     ConversationParticipantAssociation association = 14;
     optional bool isUPlusNDowngradeAvailable = 15;
-    optional int32 avMode = 16;
-    optional bool supportsLeaveContext = 17;
-    optional bool isUPlusOneScreenSharingAvailable = 18;
-    optional bytes personaHandshakeData = 19;
-    optional bool isSpatialPersonaEnabled = 20;
-    optional bool isUPlusOneAVLessAvailable = 21;
-    optional uint32 visionFeatureVersion = 22;
-    optional uint32 visionCallEstablishmentVersion = 23;
-    optional bool isUPlusOneVisionToVisionAvailable = 24;
-    optional bool supportsRequestToScreenShare = 25;
-    optional uint32 spatialPersonaGenerationCounter = 26;
-    optional bool isPhotosSharePlayAvailable = 27;
 }
 
 message ConversationActivityContext {
@@ -128,17 +109,8 @@ message ConversationParticipantDidJoinContext {
     optional bool isGFTDowngradeToOneToOneAvailable = 18;
     ConversationParticipantAssociation participantAssociation = 19;
     optional bool isUPlusNDowngradeAvailable = 20;
-    optional bool supportsLeaveContext = 22;
-    optional bool isUPlusOneScreenSharingAvailable = 23;
-    optional bool isSpatialPersonaEnabled = 24;
+    optional uint32 avMode = 21;
     optional bool isUPlusOneAVLessAvailable = 25;
-    optional uint32 visionFeatureVersion = 26;
-    optional uint32 visionCallEstablishmentVersion = 27;
-    // proto
-    optional bytes screenSharingRequest = 28;
-    optional bool isUPlusOneVisionToVisionAvailable = 29;
-    optional bool supportsRequestToScreenShare = 30;
-    optional bool isPhotosSharePlayAvailable = 31;
 }
 
 message ConversationActivity {
@@ -238,3 +210,4 @@ message ConversationMessage {
     string highlightIdentifier = 25;
     optional int32 avMode = 28;
 }
+

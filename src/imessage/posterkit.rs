@@ -510,7 +510,6 @@ pub struct SimplifiedTranscriptPoster {
 impl SimplifiedTranscriptPoster {
     pub fn parse_payload(payload: &[u8]) -> Result<Self, PushError> {
         let mut archive = ZipArchive::new(Cursor::new(&payload))?;
-<<<<<<< HEAD
         let watch: WatchBackground =
             read_file(&mut archive, "transcriptBackground/watchBackground")?;
 
@@ -518,20 +517,6 @@ impl SimplifiedTranscriptPoster {
         archive
             .by_name("transcriptBackground/poster")?
             .read_to_end(&mut poster)?;
-=======
-        // apple changed this to prefix a slash in later versions. This breaks compatilbity with older versions.
-        // Don't ask me questions.
-        let watch: WatchBackground = read_file(&mut archive, "/transcriptBackground/watchBackground").or_else(|_| read_file(&mut archive, "transcriptBackground/watchBackground"))?;
-
-        let mut poster = vec![];
-        let mut a = archive.by_name("/transcriptBackground/poster");
-
-        if a.is_err() {
-            drop(a);
-            a = archive.by_name("transcriptBackground/poster");
-        }
-        a?.read_to_end(&mut poster)?;
->>>>>>> origin/master
         Ok(Self {
             watch,
             poster: SimplifiedPoster::from_archive(Cursor::new(&poster))?,
@@ -864,7 +849,7 @@ fn read_file<T: Read + Seek, R: DeserializeOwned>(
 ) -> Result<R, PushError> {
     let mut manifest = vec![];
     if let Err(_) = archive.by_name(path) {
-        warn!("Error reading poster archive entry");
+        warn!("Error reading file {path}");
     }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_bytes(&manifest)?)
@@ -876,7 +861,7 @@ fn read_archive<T: Read + Seek, R: DeserializeOwned>(
 ) -> Result<R, PushError> {
     let mut manifest = vec![];
     if let Err(_) = archive.by_name(path) {
-        warn!("Error reading poster archive entry");
+        warn!("Error reading file {path}");
     }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_value(&KeyedArchive::expand_root(&manifest)?)?)

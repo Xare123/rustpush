@@ -191,13 +191,8 @@ pub async fn prepare_cloudkit_put(file: impl Read + Send + Sync) -> Result<Prepa
 }
 
 pub struct FetchedRecords {
-<<<<<<< HEAD
     pub assets: Vec<AssetGetResponse>,
     responses: Vec<ResponseOperation>,
-=======
-    pub assets: Vec<AssetGetResponse>, 
-    pub responses: Vec<ResponseOperation>,
->>>>>>> origin/master
 }
 
 impl FetchedRecords {
@@ -724,17 +719,8 @@ impl SaveRecordOperation {
                 record_protection_info_tag: update,
                 zone_protection_info_tag: key.zone_protection_tag.clone(),
             }),
-<<<<<<< HEAD
             tag,
         )
-=======
-            merge: Some(true),
-            save_semantics: Some(if update.is_some() { 3 } else { 2 }),
-            record_protection_info_tag: update,
-            zone_protection_info_tag: key.zone_protection_tag.clone(),
-            fields_to_delete_if_exist_on_merge: vec![],
-        }), tag)
->>>>>>> origin/master
     }
 
     pub fn new<R: CloudKitRecord>(
@@ -770,7 +756,6 @@ impl SaveRecordOperation {
             save_semantics: Some(if update { 3 } else { 2 }),
             record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
             zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
-            fields_to_delete_if_exist_on_merge: vec![]
         })
     }
 }
@@ -837,7 +822,6 @@ impl CloudKitOp for FetchRecordOperation {
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError> {
         let mut clonedresponse = response.clone();
-<<<<<<< HEAD
         if clonedresponse
             .record_retrieve_response
             .as_ref()
@@ -847,11 +831,6 @@ impl CloudKitOp for FetchRecordOperation {
             return Err(cloudkit_protocol_error(
                 "CloudKit record response was missing",
             ));
-=======
-        FetchedRecord {
-            assets: clonedresponse.header.take().map(|b| b.bundled).unwrap_or_default(),
-            response: clonedresponse,
->>>>>>> origin/master
         }
         Ok(FetchedRecord {
             assets: clonedresponse
@@ -1061,7 +1040,6 @@ impl<R: CloudKitRecord> CloudKitOp for QueryRecordOperation<R> {
     fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
         output.query_retrieve_request = Some(self.0.clone());
     }
-<<<<<<< HEAD
     fn retrieve_response(
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError> {
@@ -1075,11 +1053,6 @@ impl<R: CloudKitRecord> CloudKitOp for QueryRecordOperation<R> {
             .clone()
             .ok_or_else(|| cloudkit_protocol_error("CloudKit query response was missing"))?
             .query_results;
-=======
-    fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
-        let extras = response.header.clone().map(|a| a.bundled).unwrap_or_default();
-        let retrieve = response.query_retrieve_response.clone().expect("No retrieve response??").query_results;
->>>>>>> origin/master
 
         let records = retrieve
             .into_iter()
@@ -1167,7 +1140,6 @@ impl CloudKitOp for FetchRecordChangesOperation {
     fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
         output.retrieve_changes_request = Some(self.0.clone());
     }
-<<<<<<< HEAD
     fn retrieve_response(
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError> {
@@ -1182,11 +1154,6 @@ impl CloudKitOp for FetchRecordChangesOperation {
                 cloudkit_protocol_error("CloudKit record-changes response was missing")
             })?,
         ))
-=======
-    fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
-        let extras = response.header.clone().map(|a| a.bundled).unwrap_or_default();
-        (extras, response.retrieve_changes_response.clone().unwrap())
->>>>>>> origin/master
     }
     fn flow_control_key() -> &'static str {
         "CKDFetchRecordZoneChangesOperation"
@@ -2416,19 +2383,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         }
     }
 
-<<<<<<< HEAD
     pub async fn clear_cache_zone_encryption_config(
         &self,
         zone: &cloudkit_proto::RecordZoneIdentifier,
     ) {
-=======
-    pub async fn clear_key_cache(&self) {
-        let mut cached_keys = self.keys.lock().await;
-        cached_keys.clear();
-    }
-
-    pub async fn clear_cache_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier) {
->>>>>>> origin/master
         let mut cached_keys = self.keys.lock().await;
         let zone_name = zone.value.as_ref().unwrap().name().to_string();
         cached_keys.remove(&zone_name);
@@ -3306,7 +3264,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                             .map(|(h, v)| cloudkit_proto::NamedHeader {
                                 name: Some(h.to_string()),
                                 value: Some(v),
-<<<<<<< HEAD
                             })
                             .collect(),
                             unk1: Some(0),
@@ -3350,18 +3307,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             } else {
                 None
             },
-=======
-                            }).collect(),
-                        unk1: Some(0)
-                    })
-                } else { None },
-                active_throttling_labels: if Op::tags() { vec![] } else { vec![] },
-                unk2: if Op::is_fetch() { None } else { Some(encode_hex(&sha1(config.get_device_uuid().as_bytes()))) }, // tied to user or device, can be random
-                device_serial: if Op::is_fetch() { None } else { Some(debugmeta.serial_number) },
-                unk3: Some(0),
-                unk4: Some(1),
-            }) } else { None },
->>>>>>> origin/master
             request: Some(cloudkit_proto::Operation {
                 operation_uuid: Some(uuid),
                 r#type: Some(Op::operation().into()),
@@ -3513,7 +3458,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         let max_attempts = retry_policy.max_attempts.max(1);
         let mut authentication_refreshed = false;
 
-<<<<<<< HEAD
         let mut attempt = 1usize;
         loop {
             let token = self
@@ -3668,23 +3612,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     .into_iter()
                     .map(|outcome| outcome.result),
             );
-=======
-        let mut responses = vec![];
-        for request_uuid in request_uuids {
-            let op = response.iter().find(|r| r.response.as_ref().unwrap().operation_uuid() == &request_uuid).expect("Operation UUID has no response?");
-            let result = op.result.as_ref().expect("No Result?");
-
-            let throttle_configs = op.header.as_ref().map(|i| &i.throttle_configs[..]).unwrap_or(&[]);
-            if !throttle_configs.is_empty() {
-                info!("Throttle configs {throttle_configs:?}");
-            }
-            
-            responses.push(if result.code() != cloudkit_proto::response_operation::result::Code::Success {
-                Err(PushError::CloudKitError(result.clone()))
-            } else {
-                Ok(Op::retrieve_response(op))
-            });
->>>>>>> origin/master
         }
 
         Ok(responses)
@@ -3708,7 +3635,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     ) -> Result<(), PushError> {
         let mut requests: HashMap<&String, Vec<(&cloudkit_proto::Asset, V)>> = HashMap::new();
         for asset in assets {
-<<<<<<< HEAD
             requests
                 .entry(
                     asset
@@ -3719,9 +3645,6 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 )
                 .or_default()
                 .push(asset);
-=======
-            requests.entry(asset.0.bundled_request_id.as_ref().ok_or(PushError::NoAsset)?).or_default().push(asset);
->>>>>>> origin/master
         }
 
         let mmcs_config = MMCSConfig {
