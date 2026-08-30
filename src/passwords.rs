@@ -1,19 +1,64 @@
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::{Duration, SystemTime}};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
+use crate::{
+    aps::APSInterestToken,
+    cloudkit::{
+        create_share, get_participant_id, CloudKitClient, CloudKitContainer, CloudKitOpenContainer,
+        CloudKitShare, FetchRecordChangesOperation, FetchZoneChangesOperation, NO_ASSETS,
+    },
+    ids::{
+        identity_manager::{IDSSendMessage, Raw},
+        user::QueryOptions,
+        IDSRecvMessage,
+    },
+    keychain::{decrypt_entry, KeychainClientState, SavedKeychainZone},
+    pcs::{PCSPrivateKey, PCSService},
+    util::{
+        bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec,
+        date_deserialize, date_deserialize_opt, date_serialize, date_serialize_opt, date_to_ms,
+        ec_key_from_apple, ec_key_to_apple, ms_to_date, proto_deserialize, proto_serialize,
+    },
+    APSConnection, APSMessage, IdentityManager,
+};
+use crate::{
+    cloudkit::{
+        handle_to_alias, pcs_keys_for_record, record_identifier, CloudKitNotifWatcher,
+        CloudKitSession, DeleteRecordOperation, SaveRecordOperation, UserQueryOperation,
+        ZoneDeleteOperation,
+    },
+    cloudkit_proto::CloudKitEncryptor,
+    keychain::{SivKey, SECURITYD_CONTAINER},
+    passwords::passwordsp::{SharingInternetPassword, SharingItem, SharingPrivateKey},
+    util::{base64_decode, duration_since_epoch, encode_hex, DebugMutex, DebugRwLock},
+};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{CloudKitRecord, RecordZoneIdentifier, UserQueryRequest, base64_encode, request_operation::header::Database};
+use cloudkit_proto::{
+    base64_encode, request_operation::header::Database, CloudKitRecord, RecordZoneIdentifier,
+    UserQueryRequest,
+};
 use keystore::software::plist_to_bin;
 use log::{info, warn};
 use omnisette::AnisetteProvider;
-use openssl::{conf, ec::{EcGroup, EcKey}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha1, sign::Signer};
+use openssl::{
+    conf,
+    ec::{EcGroup, EcKey},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    sha::sha1,
+    sign::Signer,
+};
 use plist::{Data, Date, Dictionary, Value};
 use prost::Message;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{cloudkit::{CloudKitNotifWatcher, CloudKitSession, DeleteRecordOperation, SaveRecordOperation, UserQueryOperation, ZoneDeleteOperation, handle_to_alias, pcs_keys_for_record, record_identifier}, cloudkit_proto::CloudKitEncryptor, keychain::{SECURITYD_CONTAINER, SivKey}, passwords::passwordsp::{SharingInternetPassword, SharingItem, SharingPrivateKey}, util::{DebugMutex, DebugRwLock, base64_decode, duration_since_epoch, encode_hex}};
-use crate::{APSConnection, APSMessage, IdentityManager, aps::APSInterestToken, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitShare, FetchRecordChangesOperation, FetchZoneChangesOperation, NO_ASSETS, create_share, get_participant_id}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, keychain::{KeychainClientState, SavedKeychainZone, decrypt_entry}, pcs::{PCSPrivateKey, PCSService}, util::{bin_deserialize, bin_serialize, date_deserialize, date_deserialize_opt, date_serialize, date_serialize_opt, date_to_ms, ec_key_from_apple, ec_key_to_apple, ms_to_date, proto_deserialize, proto_serialize, bin_serialize_opt_vec, bin_deserialize_opt_vec}};
 
-use crate::{PushError, keychain::KeychainClient};
+use crate::{keychain::KeychainClient, PushError};
 
 pub mod passwordsp {
     include!(concat!(env!("OUT_DIR"), "/passwordsp.rs"));
@@ -21,10 +66,16 @@ pub mod passwordsp {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct SavedPasswordGroup {
-    #[serde(serialize_with="proto_serialize", deserialize_with="proto_deserialize")]
+    #[serde(
+        serialize_with = "proto_serialize",
+        deserialize_with = "proto_deserialize"
+    )]
     id: RecordZoneIdentifier,
     pub share: Option<CloudKitShare>,
-    #[serde(serialize_with="bin_serialize_opt_vec", deserialize_with="bin_deserialize_opt_vec")]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec"
+    )]
     sync_continuation_token: Option<Vec<u8>>,
     invitations: HashMap<String, PasswordInvite>,
     items: HashMap<String, PasswordKeychainEntry>,
@@ -34,9 +85,15 @@ pub struct SavedPasswordGroup {
 #[derive(Serialize, Deserialize, Default)]
 pub struct PasswordState {
     pub groups: HashMap<String, SavedPasswordGroup>,
-    #[serde(serialize_with="bin_serialize_opt_vec", deserialize_with="bin_deserialize_opt_vec")]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec"
+    )]
     zone_continuation_token: Option<Vec<u8>>,
-    #[serde(serialize_with="bin_serialize_opt_vec", deserialize_with="bin_deserialize_opt_vec")]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec"
+    )]
     shared_zone_continuation_token: Option<Vec<u8>>,
     pub invite_groups: HashMap<String, ShareInviteContentData>,
     #[serde(default)]
@@ -47,10 +104,14 @@ fn zone_identifier_key(id: &RecordZoneIdentifier) -> String {
     base64_encode(&id.encode_to_vec())
 }
 
-
 pub struct PasswordManager<P: AnisetteProvider> {
     keychain: Arc<KeychainClient<P>>,
-    pub container: DebugMutex<Option<(Arc<CloudKitOpenContainer<'static, P>>, Arc<CloudKitOpenContainer<'static, P>>)>>,
+    pub container: DebugMutex<
+        Option<(
+            Arc<CloudKitOpenContainer<'static, P>>,
+            Arc<CloudKitOpenContainer<'static, P>>,
+        )>,
+    >,
     pub client: Arc<CloudKitClient<P>>,
     pub conn: APSConnection,
     pub identity: IdentityManager,
@@ -82,7 +143,7 @@ pub const SHARED_PASSWORDS_SERVICE: PCSService = PCSService {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareInviteContentData {
-    #[serde(serialize_with="bin_serialize", deserialize_with="bin_deserialize")]
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub invitation_token: Vec<u8>,
     #[serde(rename = "groupID", default)]
     pub group_id: String,
@@ -269,7 +330,7 @@ impl PasswordEntry for PasswordRawEntry {
 pub struct PasswordInvite {
     send_handle: String,
     group: String,
-    #[serde(serialize_with="bin_serialize", deserialize_with="bin_deserialize")]
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     invite: Vec<u8>,
     invite_id: String,
     time: SystemTime,
@@ -298,7 +359,10 @@ impl PasswordEntry for PasswordManagerMeta {
 
     fn make_keychain(&self) -> PasswordKeychainEntry {
         PasswordKeychainEntry {
-            label: Some(format!("Password Manager Metadata: {} ({})", self.srvr, self.acct)),
+            label: Some(format!(
+                "Password Manager Metadata: {} ({})",
+                self.srvr, self.acct
+            )),
             account: Some(self.acct.clone()),
             data: Some(Data::new(self.data.clone())),
             authentication_type: Some("form".to_string()),
@@ -346,14 +410,19 @@ impl PasswordEntry for PasswordManagerMeta {
                 notes: None,
                 formerly_shared: None,
                 ocpid: None,
-            }).unwrap(),
+            })
+            .unwrap(),
         }
     }
 }
 
 #[derive(Deserialize, Serialize, Default)]
 pub struct PasswordManagerMetaChange {
-    #[serde(rename = "d", deserialize_with = "date_deserialize", serialize_with = "date_serialize")]
+    #[serde(
+        rename = "d",
+        deserialize_with = "date_deserialize",
+        serialize_with = "date_serialize"
+    )]
     pub date: u64,
     #[serde(rename = "p")]
     pub password: Option<String>,
@@ -378,7 +447,11 @@ pub struct PasswordManagerTotp {
     pub digits: u32,
     pub issuer: Option<String>,
     pub period: u32,
-    #[serde(rename = "_initialDate", deserialize_with = "date_deserialize", serialize_with = "date_serialize")]
+    #[serde(
+        rename = "_initialDate",
+        deserialize_with = "date_deserialize",
+        serialize_with = "date_serialize"
+    )]
     pub initial_date: u64,
     pub algorithm: u32,
     pub account_name: Option<String>,
@@ -388,23 +461,34 @@ pub struct PasswordManagerTotp {
 
 impl PasswordManagerTotp {
     pub fn generate_otp(&self) -> Result<(u32, u64), PushError> {
-        let time_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64 - self.initial_date;
+        let time_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - self.initial_date;
         let counter = time_ms / 1000 / self.period as u64;
 
         let sig_hmac = PKey::hmac(&self.secret)?;
-        let h = Signer::new(match self.algorithm {
-            0 => MessageDigest::sha1(),
-            1 => MessageDigest::sha256(),
-            2 => MessageDigest::sha512(),
-            _unk => return Err(PushError::UnknownTotpAlgorithm(_unk))
-        }, &sig_hmac)?.sign_oneshot_to_vec(&counter.to_be_bytes())?;
+        let h = Signer::new(
+            match self.algorithm {
+                0 => MessageDigest::sha1(),
+                1 => MessageDigest::sha256(),
+                2 => MessageDigest::sha512(),
+                _unk => return Err(PushError::UnknownTotpAlgorithm(_unk)),
+            },
+            &sig_hmac,
+        )?
+        .sign_oneshot_to_vec(&counter.to_be_bytes())?;
 
         let offset = (h.last().unwrap() & 0x0f) as usize;
 
         let result = u32::from_be_bytes(h[offset..offset + 4].try_into().unwrap()) & 0x7fffffff;
         let otp = result % 10_u32.pow(self.digits);
 
-        Ok((otp, (counter + 1) * self.period as u64 + self.initial_date / 1000))
+        Ok((
+            otp,
+            (counter + 1) * self.period as u64 + self.initial_date / 1000,
+        ))
     }
 }
 
@@ -423,41 +507,66 @@ pub struct PasswordManagerMetaDataFormerlyShared {
 
 #[derive(Deserialize, Serialize)]
 pub struct PasswordManagerMetaData {
-    #[serde(rename = "s_hi", default, skip_serializing_if="Vec::is_empty")]
+    #[serde(rename = "s_hi", default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<PasswordManagerMetaChange>,
     #[serde(rename = "s_as", default)]
     pub alt_domains: Vec<PasswordManagerAltDomain>,
     pub totp: Option<PasswordManagerTotp>,
-    #[serde(default, skip_serializing_if="HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ctxt: HashMap<String, PasswordManagerMetaDataCtx>,
-    #[serde(deserialize_with = "bin_deserialize_opt_vec", serialize_with = "bin_serialize_opt_vec", default)]
+    #[serde(
+        deserialize_with = "bin_deserialize_opt_vec",
+        serialize_with = "bin_serialize_opt_vec",
+        default
+    )]
     pub title: Option<Vec<u8>>,
-    #[serde(deserialize_with = "bin_deserialize_opt_vec", serialize_with = "bin_serialize_opt_vec", default)]
+    #[serde(
+        deserialize_with = "bin_deserialize_opt_vec",
+        serialize_with = "bin_serialize_opt_vec",
+        default
+    )]
     pub notes: Option<Vec<u8>>,
     #[serde(rename = "fsm")]
     pub formerly_shared: Option<PasswordManagerMetaDataFormerlyShared>,
     // cloudkit user ID
-    #[serde(deserialize_with = "bin_deserialize_opt_vec", serialize_with = "bin_serialize_opt_vec", default)]
+    #[serde(
+        deserialize_with = "bin_deserialize_opt_vec",
+        serialize_with = "bin_serialize_opt_vec",
+        default
+    )]
     pub ocpid: Option<Vec<u8>>,
 }
 
 impl PasswordManagerMetaData {
     pub fn set_last_used(&mut self, time: SystemTime) {
         let result = self.ctxt.entry("".to_string()).or_default();
-        result.last_used = time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
+        result.last_used = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
     }
 
     pub fn change_password(&mut self, new_password: String) {
-        let last_password = 
-            self.history.iter().filter(|i| i.password.is_some()).last()
+        let last_password = self
+            .history
+            .iter()
+            .filter(|i| i.password.is_some())
+            .last()
             .and_then(|i| i.password.clone());
 
         self.history.push(PasswordManagerMetaChange {
-            date: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
+            date: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
             password: Some(new_password),
             old_password: last_password.clone(),
             id: Uuid::new_v4().to_string().to_uppercase(),
-            typ: if last_password.is_some() { "pwch".to_string() } else { "pwcr".to_string() },
+            typ: if last_password.is_some() {
+                "pwch".to_string()
+            } else {
+                "pwcr".to_string()
+            },
             ..Default::default()
         })
     }
@@ -472,7 +581,11 @@ pub struct PasswordManagerMetaDataCtx {
 impl PasswordManagerMeta {
     pub fn get_password_data(&self) -> Result<PasswordManagerMetaData, PushError> {
         if let Err(e) = plist::from_bytes::<PasswordManagerMetaData>(self.data.as_ref()) {
-            warn!("Err decoding password data {e} {:?} {:?}", plist::from_bytes::<Value>(self.data.as_ref()), self);
+            warn!(
+                "Err decoding password data {e} {:?} {:?}",
+                plist::from_bytes::<Value>(self.data.as_ref()),
+                self
+            );
         }
         Ok(plist::from_bytes(self.data.as_ref())?)
     }
@@ -792,7 +905,9 @@ pub struct PasswordKeychainEntry {
 
 impl PasswordKeychainEntry {
     fn encrypt(&self, key: &SivKey) -> Self {
-        let Some(d) = &self.data else { return self.clone() };
+        let Some(d) = &self.data else {
+            return self.clone();
+        };
         Self {
             encrypted_data: Some(key.encrypt(d.as_ref()).into()),
             data: None,
@@ -801,7 +916,9 @@ impl PasswordKeychainEntry {
     }
 
     fn decrypt(&self, key: &SivKey) -> Self {
-        let Some(d) = &self.encrypted_data else { return self.clone() };
+        let Some(d) = &self.encrypted_data else {
+            return self.clone();
+        };
         Self {
             data: Some(key.decrypt(d.as_ref()).into()),
             encrypted_data: None,
@@ -1068,9 +1185,19 @@ pub struct CreditCardData {
     // and now come the PascalCase ones, because, Apple
     #[serde(rename = "CardholderName")]
     pub cardholder_name: String,
-    #[serde(rename = "ExpirationDate", default, deserialize_with = "date_deserialize_opt", serialize_with = "date_serialize_opt")]
+    #[serde(
+        rename = "ExpirationDate",
+        default,
+        deserialize_with = "date_deserialize_opt",
+        serialize_with = "date_serialize_opt"
+    )]
     pub expiration_date: Option<u64>,
-    #[serde(rename = "LastUsedDate", default, deserialize_with = "date_deserialize_opt", serialize_with = "date_serialize_opt")]
+    #[serde(
+        rename = "LastUsedDate",
+        default,
+        deserialize_with = "date_deserialize_opt",
+        serialize_with = "date_serialize_opt"
+    )]
     pub last_used_date: Option<u64>,
     #[serde(rename = "CardNameUIString")]
     pub card_name_ui_string: String,
@@ -1087,14 +1214,23 @@ pub struct SiteConfig {
     pub passkeys: HashMap<String, Passkey>,
 }
 
-
 impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
-    pub async fn new(keychain: Arc<KeychainClient<P>>, client: Arc<CloudKitClient<P>>, identity: IdentityManager, conn: APSConnection, state: PasswordState, update_state: Box<dyn Fn(&PasswordState) + Send + Sync>, data_updated: Box<dyn Fn(Arc<Self>, bool) + Send + Sync>) -> Arc<Self> {
+    pub async fn new(
+        keychain: Arc<KeychainClient<P>>,
+        client: Arc<CloudKitClient<P>>,
+        identity: IdentityManager,
+        conn: APSConnection,
+        state: PasswordState,
+        update_state: Box<dyn Fn(&PasswordState) + Send + Sync>,
+        data_updated: Box<dyn Fn(Arc<Self>, bool) + Send + Sync>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             keychain,
             container: DebugMutex::new(None),
             client,
-            _interest_token: conn.request_topics(&["com.apple.private.alloy.kcsharing.invite"]).await,
+            _interest_token: conn
+                .request_topics(&["com.apple.private.alloy.kcsharing.invite"])
+                .await,
             identity,
             notif_watcher: SHARED_PASSWORDS_CONTAINER.watch_notifs(&conn).await,
             keychain_notif_watch: SECURITYD_CONTAINER.watch_notifs(&conn).await,
@@ -1108,7 +1244,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
         if let Some(container) = &*locked {
-            return Ok(container.clone().0)
+            return Ok(container.clone().0);
         }
         let container = SHARED_PASSWORDS_CONTAINER.init(self.client.clone()).await?;
         let shared_container = container.shared();
@@ -1116,10 +1252,12 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         Ok(locked.clone().unwrap().0)
     }
 
-    pub async fn get_shared_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+    pub async fn get_shared_container(
+        &self,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
         if let Some(container) = &*locked {
-            return Ok(container.clone().1)
+            return Ok(container.clone().1);
         }
         let container = SHARED_PASSWORDS_CONTAINER.init(self.client.clone()).await?;
         let shared_container = container.shared();
@@ -1129,10 +1267,14 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
     async fn handle_notif(self: &Arc<Self>, msg: &APSMessage) -> Result<(), PushError> {
         let handle = self.notif_watcher.handle(&msg).await?;
-        if handle.is_empty() { return Ok(()) }
+        if handle.is_empty() {
+            return Ok(());
+        }
 
         let container = self.get_container().await?;
-        let (mine, others) = handle.into_iter().partition::<Vec<_>, _>(|i| i.owner_identifier.as_ref().unwrap().name() == &container.user_id);
+        let (mine, others) = handle.into_iter().partition::<Vec<_>, _>(|i| {
+            i.owner_identifier.as_ref().unwrap().name() == &container.user_id
+        });
         if !mine.is_empty() {
             self.sync_zones(&container, &mine).await?;
         }
@@ -1146,9 +1288,14 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
     async fn handle_keychain_notif(self: &Arc<Self>, msg: &APSMessage) -> Result<(), PushError> {
         let handle = self.keychain_notif_watch.handle(&msg).await?;
-        if handle.is_empty() { return Ok(()) }
+        if handle.is_empty() {
+            return Ok(());
+        }
 
-        let zones = handle.into_iter().map(|i| i.value.unwrap().name.unwrap()).collect::<Vec<_>>();
+        let zones = handle
+            .into_iter()
+            .map(|i| i.value.unwrap().name.unwrap())
+            .collect::<Vec<_>>();
         let zonesref = zones.iter().map(|i| i.as_str()).collect::<Vec<_>>();
         self.keychain.sync_keychain(&zonesref).await?;
         (self.data_updated)(self.clone(), zonesref.contains(&"WiFi"));
@@ -1157,7 +1304,9 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
     async fn prepare_watch(&self, connection: &APSConnection) -> Result<(), PushError> {
         let mut state = self.state.write().await;
-        if state.token_registered { return Ok(()) }
+        if state.token_registered {
+            return Ok(());
+        }
 
         let container = self.get_container().await?;
         let shared_container = self.get_shared_container().await?;
@@ -1177,7 +1326,8 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     pub async fn handle(self: &Arc<Self>, msg: APSMessage) -> Result<Option<String>, PushError> {
         if let APSMessage::Notification { topic, .. } = &msg {
             if topic == &sha1("com.apple.icloud-container.com.apple.security.kcsharing".as_bytes())
-                || topic == &sha1("com.apple.icloud-container.com.apple.securityd".as_bytes()) {
+                || topic == &sha1("com.apple.icloud-container.com.apple.securityd".as_bytes())
+            {
                 let msg_copy = msg.clone();
                 let self_copy = self.clone();
                 tokio::task::spawn(async move {
@@ -1188,9 +1338,17 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                         warn!("Failed to sync in response to update {e}");
                     }
                 });
-            } 
+            }
         }
-        if let Some(IDSRecvMessage { message_unenc: Some(message), sender: Some(sender), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.kcsharing.invite"]).await? {
+        if let Some(IDSRecvMessage {
+            message_unenc: Some(message),
+            sender: Some(sender),
+            ..
+        }) = self
+            .identity
+            .receive_message(msg, &["com.apple.private.alloy.kcsharing.invite"])
+            .await?
+        {
             let plist: ShareInvite = message.plist()?;
             let mut data = plist.content.data;
             let mut groups = self.state.write().await;
@@ -1205,20 +1363,30 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                 // revoke
                 groups.invite_groups.remove(&id);
             }
-            
+
             (self.update_state)(&groups);
 
-            Ok(if plist.status == 1 {
-                Some(id)
-            } else { None })
-        } else { Ok(None) }
+            Ok(if plist.status == 1 { Some(id) } else { None })
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn accept_invite(&self, invite_id: &str) -> Result<(), PushError> {
         let container = self.get_shared_container().await?;
         let mut groups = self.state.write().await;
-        let group = groups.invite_groups.get(invite_id).expect("invite not found!!");
-        container.accept_participant(&self.keychain, &SHARED_PASSWORDS_SERVICE, group.invitation_token.as_ref(), &group.share_url).await?;
+        let group = groups
+            .invite_groups
+            .get(invite_id)
+            .expect("invite not found!!");
+        container
+            .accept_participant(
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                group.invitation_token.as_ref(),
+                &group.share_url,
+            )
+            .await?;
         groups.invite_groups.remove(invite_id);
         Ok(())
     }
@@ -1226,7 +1394,10 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     pub async fn decline_invite(&self, invite_id: &str) -> Result<(), PushError> {
         let container = self.get_shared_container().await?;
         let mut groups = self.state.write().await;
-        let group = groups.invite_groups.get(invite_id).expect("invite not found!!");
+        let group = groups
+            .invite_groups
+            .get(invite_id)
+            .expect("invite not found!!");
         container.decline_participant(&group.share_url).await?;
         groups.invite_groups.remove(invite_id);
         Ok(())
@@ -1242,9 +1413,16 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
     pub async fn query_handle(&self, handle: &str) -> Result<bool, PushError> {
         let my_handle = self.identity.get_handles().await.remove(0);
-        let ids_targets = self.identity.validate_targets(&[handle.to_string()], "com.apple.private.alloy.kcsharing.invite", &my_handle).await?;
+        let ids_targets = self
+            .identity
+            .validate_targets(
+                &[handle.to_string()],
+                "com.apple.private.alloy.kcsharing.invite",
+                &my_handle,
+            )
+            .await?;
         if ids_targets.is_empty() {
-            return Ok(false)
+            return Ok(false);
         }
 
         let cloudkit_query = self.get_container().await?;
@@ -1252,14 +1430,21 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         Ok(cloudkit_query.query_user(handle).await.is_ok())
     }
 
-    async fn sync_groups_inner(&self, container: &CloudKitOpenContainer<'_, P>) -> Result<(), PushError> {
+    async fn sync_groups_inner(
+        &self,
+        container: &CloudKitOpenContainer<'_, P>,
+    ) -> Result<(), PushError> {
         let mut groups = self.state.write().await;
-        let (changes, continuation) = FetchZoneChangesOperation::do_sync(&container, if container.database_type == Database::SharedDb {
-            groups.shared_zone_continuation_token.clone()
-        } else {
-            groups.zone_continuation_token.clone()
-        }).await?;
-        
+        let (changes, continuation) = FetchZoneChangesOperation::do_sync(
+            &container,
+            if container.database_type == Database::SharedDb {
+                groups.shared_zone_continuation_token.clone()
+            } else {
+                groups.zone_continuation_token.clone()
+            },
+        )
+        .await?;
+
         if container.database_type == Database::SharedDb {
             groups.shared_zone_continuation_token = continuation;
         } else {
@@ -1267,23 +1452,36 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         }
 
         let new_changes = changes.iter().filter(|c| {
-            let identifier = c.identifier.as_ref().unwrap().value.as_ref().unwrap().name();
+            let identifier = c
+                .identifier
+                .as_ref()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .name();
             c.change_type() != 2 && identifier.starts_with("group-")
         });
         for removed_change in changes.iter().filter(|c| c.change_type() == 2) {
-            groups.groups.remove(&zone_identifier_key(&removed_change.identifier.as_ref().unwrap()));
+            groups.groups.remove(&zone_identifier_key(
+                &removed_change.identifier.as_ref().unwrap(),
+            ));
         }
 
         // collect to hashmap to dedup
-        let zones = groups.groups.values()
+        let zones = groups
+            .groups
+            .values()
             .filter(|i| {
-                let is_shared = i.id.owner_identifier.as_ref().unwrap().name() != &container.user_id;
+                let is_shared =
+                    i.id.owner_identifier.as_ref().unwrap().name() != &container.user_id;
                 let is_db_shared = container.database_type == Database::SharedDb;
                 is_shared == is_db_shared
             })
             .map(|i| i.id.clone())
             .chain(new_changes.map(|c| c.identifier.clone().expect("no identifier")))
-            .map(|i| (zone_identifier_key(&i), i)).collect::<HashMap<String, RecordZoneIdentifier>>();
+            .map(|i| (zone_identifier_key(&i), i))
+            .collect::<HashMap<String, RecordZoneIdentifier>>();
 
         let zones_to_fetch: Vec<RecordZoneIdentifier> = zones.into_values().collect();
 
@@ -1292,45 +1490,95 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         self.sync_zones(container, &zones_to_fetch).await
     }
 
-    async fn sync_zones(&self, container: &CloudKitOpenContainer<'_, P>, zones_to_fetch: &[RecordZoneIdentifier]) -> Result<(), PushError> {
+    async fn sync_zones(
+        &self,
+        container: &CloudKitOpenContainer<'_, P>,
+        zones_to_fetch: &[RecordZoneIdentifier],
+    ) -> Result<(), PushError> {
         let mut groups = self.state.write().await;
-        
-        let zone_records = FetchRecordChangesOperation::do_sync(&container, &zones_to_fetch.iter().map(|identifier| {
-            let existing = groups.groups.get(&zone_identifier_key(identifier))
-                .and_then(|p| p.sync_continuation_token.clone());
-            (identifier.clone(), existing)
-        }).collect::<Vec<_>>(), &NO_ASSETS).await?;
 
-        let zone_details = zone_records.iter().zip(zones_to_fetch).map(|((_, changes, _), zone)| {
-            let this_group = groups.groups.get(&zone_identifier_key(&zone));
+        let zone_records = FetchRecordChangesOperation::do_sync(
+            &container,
+            &zones_to_fetch
+                .iter()
+                .map(|identifier| {
+                    let existing = groups
+                        .groups
+                        .get(&zone_identifier_key(identifier))
+                        .and_then(|p| p.sync_continuation_token.clone());
+                    (identifier.clone(), existing)
+                })
+                .collect::<Vec<_>>(),
+            &NO_ASSETS,
+        )
+        .await?;
 
-            let share_info = this_group.and_then(|g| g.share.as_ref())
-                    .map(|share| &share.share_info).or_else(|| {
-                changes.iter().find(|c| {
-                    let identifier = c.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
-                    identifier == "cloudkit.zoneshare"
-                })?.record.as_ref()?.share_info.as_ref()
-            });
+        let zone_details = zone_records
+            .iter()
+            .zip(zones_to_fetch)
+            .map(|((_, changes, _), zone)| {
+                let this_group = groups.groups.get(&zone_identifier_key(&zone));
 
-            (zone.clone(), share_info.cloned())
-        }).collect::<Vec<_>>();
+                let share_info = this_group
+                    .and_then(|g| g.share.as_ref())
+                    .map(|share| &share.share_info)
+                    .or_else(|| {
+                        changes
+                            .iter()
+                            .find(|c| {
+                                let identifier = c
+                                    .identifier
+                                    .as_ref()
+                                    .unwrap()
+                                    .value
+                                    .as_ref()
+                                    .unwrap()
+                                    .name()
+                                    .to_string();
+                                identifier == "cloudkit.zoneshare"
+                            })?
+                            .record
+                            .as_ref()?
+                            .share_info
+                            .as_ref()
+                    });
 
-        let encrypt_tokens = container.get_zone_encryption_config_sev(&zone_details, &self.keychain, &SHARED_PASSWORDS_SERVICE, true).await?;
+                (zone.clone(), share_info.cloned())
+            })
+            .collect::<Vec<_>>();
+
+        let encrypt_tokens = container
+            .get_zone_encryption_config_sev(
+                &zone_details,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                true,
+            )
+            .await?;
 
         let keychain = self.keychain.state.read().await;
         let siv_key = keychain.get_keychain_access_key()?;
         drop(keychain);
 
-        for (((_, changes, token), zone), encrypt_token) in zone_records.into_iter().zip(zones_to_fetch).zip(encrypt_tokens) {
+        for (((_, changes, token), zone), encrypt_token) in zone_records
+            .into_iter()
+            .zip(zones_to_fetch)
+            .zip(encrypt_tokens)
+        {
             let encrypt_token = match encrypt_token {
                 Ok(token) => token,
                 Err(_e) => {
                     warn!("Failed to get token; skipping");
-                    continue
+                    continue;
                 }
             };
 
-            let zone_identifier = zone.value.as_ref().expect("no zid").name().replacen("group-", "", 1);
+            let zone_identifier = zone
+                .value
+                .as_ref()
+                .expect("no zid")
+                .name()
+                .replacen("group-", "", 1);
             groups.invite_groups.remove(&zone_identifier);
 
             let this_group = groups.groups.entry(zone_identifier_key(&zone)).or_default();
@@ -1338,9 +1586,17 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             this_group.sync_continuation_token = token.clone();
             this_group.id = zone.clone();
             this_group.is_owner = container.database_type != Database::SharedDb;
-            
+
             for change in changes {
-                let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
+                let identifier = change
+                    .identifier
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .name()
+                    .to_string();
 
                 let Some(record) = &change.record else {
                     this_group.items.remove(&identifier);
@@ -1348,34 +1604,56 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                 };
 
                 if record.r#type.as_ref().unwrap().name() == SharedPasswordItem::record_type() {
-                    let item = SharedPasswordItem::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &encrypt_token)?));
+                    let item = SharedPasswordItem::from_record_encrypted(
+                        &record.record_field,
+                        Some(&pcs_keys_for_record(&record, &encrypt_token)?),
+                    );
                     let decoded = SharingItem::decode(Cursor::new(&item.payload))?;
 
                     info!("item {:?}", item.r#type);
                     let item: PasswordKeychainEntry = match decoded {
-                        SharingItem { private_key: Some(private_key), .. } => private_key.into(),
-                        SharingItem { internet_password: Some(internet_password), .. } => internet_password.into(),
-                        _other => panic!("unknown keychain type!")
+                        SharingItem {
+                            private_key: Some(private_key),
+                            ..
+                        } => private_key.into(),
+                        SharingItem {
+                            internet_password: Some(internet_password),
+                            ..
+                        } => internet_password.into(),
+                        _other => panic!("unknown keychain type!"),
                     };
 
                     let item = item.encrypt(&siv_key);
-                    this_group.items.insert(identifier.replacen("item-", "", 1), item);
+                    this_group
+                        .items
+                        .insert(identifier.replacen("item-", "", 1), item);
                 }
 
                 if identifier == "cloudkit.zoneshare" {
                     let decoded = CloudKitShare::from_record(record, &encrypt_token);
                     for participant in &decoded.share_info.participants {
                         // if not removed
-                        if participant.state() != 3 { continue }
+                        if participant.state() != 3 {
+                            continue;
+                        }
                         // delete any invitations
-                        let Some(contact) = &participant.contact_information else { continue };
-                        this_group.invitations.remove(&format!("mailto:{}", contact.email_address()));
-                        this_group.invitations.remove(&format!("tel:+{}", contact.phone_number()));
+                        let Some(contact) = &participant.contact_information else {
+                            continue;
+                        };
+                        this_group
+                            .invitations
+                            .remove(&format!("mailto:{}", contact.email_address()));
+                        this_group
+                            .invitations
+                            .remove(&format!("tel:+{}", contact.phone_number()));
                     }
                     this_group.share = Some(decoded);
                 }
             }
-            info!("group name {:?}", this_group.share.as_ref().map(|i| i.display_name.clone()));
+            info!(
+                "group name {:?}",
+                this_group.share.as_ref().map(|i| i.display_name.clone())
+            );
         }
 
         (self.update_state)(&groups);
@@ -1393,7 +1671,10 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             container.perform(&CloudKitSession::new(), delete).await?;
         } else {
             let container = self.get_shared_container().await?;
-            let delete = DeleteRecordOperation::new(record_identifier(group.id.clone(), "cloudkit.zoneshare"));
+            let delete = DeleteRecordOperation::new(record_identifier(
+                group.id.clone(),
+                "cloudkit.zoneshare",
+            ));
             container.perform(&CloudKitSession::new(), delete).await?;
         }
         groups.groups.remove(id);
@@ -1406,27 +1687,44 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         let group = Uuid::new_v4().to_string().to_uppercase();
         let zone = container.private_zone(format!("group-{group}"));
 
-        let service = PCSPrivateKey::get_service_key(&self.keychain, &SHARED_PASSWORDS_SERVICE, self.client.config.as_ref()).await?;
+        let service = PCSPrivateKey::get_service_key(
+            &self.keychain,
+            &SHARED_PASSWORDS_SERVICE,
+            self.client.config.as_ref(),
+        )
+        .await?;
 
         // this will create the zone for us
-        let mut keys = container.get_zone_encryption_config(&zone, &self.keychain, &SHARED_PASSWORDS_SERVICE).await?;
+        let mut keys = container
+            .get_zone_encryption_config(&zone, &self.keychain, &SHARED_PASSWORDS_SERVICE)
+            .await?;
         let mut share = CloudKitShare {
             display_name: name.to_string(),
             share_info: create_share(&zone, "cloudkit.zoneshare", &service)?,
             url: None,
             public_sharing_key: vec![],
         };
-        container.update_zone_share(&mut keys, &self.keychain, &SHARED_PASSWORDS_SERVICE, &mut share).await?;
-        
+        container
+            .update_zone_share(
+                &mut keys,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                &mut share,
+            )
+            .await?;
+
         let mut groups = self.state.write().await;
-        groups.groups.insert(zone_identifier_key(&zone), SavedPasswordGroup {
-            id: zone.clone(),
-            share: Some(share),
-            sync_continuation_token: None,
-            invitations: HashMap::new(),
-            items: HashMap::new(),
-            is_owner: true,
-        });
+        groups.groups.insert(
+            zone_identifier_key(&zone),
+            SavedPasswordGroup {
+                id: zone.clone(),
+                share: Some(share),
+                sync_continuation_token: None,
+                invitations: HashMap::new(),
+                items: HashMap::new(),
+                is_owner: true,
+            },
+        );
         (self.update_state)(&groups);
 
         Ok(zone_identifier_key(&zone))
@@ -1439,12 +1737,21 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         share.display_name = new_name.to_string();
 
         let container = self.get_container().await?;
-        let mut keys = container.get_zone_encryption_config(&group.id, &self.keychain, &SHARED_PASSWORDS_SERVICE).await?;
-        container.update_zone_share(&mut keys, &self.keychain, &SHARED_PASSWORDS_SERVICE, share).await?;
+        let mut keys = container
+            .get_zone_encryption_config(&group.id, &self.keychain, &SHARED_PASSWORDS_SERVICE)
+            .await?;
+        container
+            .update_zone_share(&mut keys, &self.keychain, &SHARED_PASSWORDS_SERVICE, share)
+            .await?;
         Ok(())
     }
 
-    async fn send_invite_message(&self, invite: &PasswordInvite, state: u32, zone: &CloudKitShare) -> Result<(), PushError> {
+    async fn send_invite_message(
+        &self,
+        invite: &PasswordInvite,
+        state: u32,
+        zone: &CloudKitShare,
+    ) -> Result<(), PushError> {
         let invite_message = ShareInvite {
             user_id: invite.invite_id.to_string(),
             status: state,
@@ -1458,9 +1765,12 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
                     group_name: zone.display_name.clone(),
                     share_url: zone.get_share_url()?,
                     // yes plus here
-                    invitee_handle: invite.send_handle.replacen("mailto:", "", 1).replacen("tel:", "", 1),
-                }
-            }
+                    invitee_handle: invite
+                        .send_handle
+                        .replacen("mailto:", "", 1)
+                        .replacen("tel:", "", 1),
+                },
+            },
         };
 
         info!("Sedning invite message {:?}", invite_message);
@@ -1477,27 +1787,34 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             queue_id: None,
             relay: None,
             extras: if state == 3 {
-                Dictionary::from_iter([
-                    ("H", Value::Integer(3.into()))
-                ])
-            } else { Default::default() },
+                Dictionary::from_iter([("H", Value::Integer(3.into()))])
+            } else {
+                Default::default()
+            },
         };
 
         let ids_handles = [invite.send_handle.to_string()];
-        self.identity.cache_keys(
-            "com.apple.private.alloy.kcsharing.invite",
-            &ids_handles,
-            &my_handle,
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true }
-        ).await?;
+        self.identity
+            .cache_keys(
+                "com.apple.private.alloy.kcsharing.invite",
+                &ids_handles,
+                &my_handle,
+                false,
+                &QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await?;
 
         let targets = self.identity.cache.lock().await.get_participants_targets(
-            "com.apple.private.alloy.kcsharing.invite", 
-            &my_handle, 
+            "com.apple.private.alloy.kcsharing.invite",
+            &my_handle,
             &ids_handles,
         );
-        self.identity.send_message("com.apple.private.alloy.kcsharing.invite", message, targets).await?;
+        self.identity
+            .send_message("com.apple.private.alloy.kcsharing.invite", message, targets)
+            .await?;
 
         Ok(())
     }
@@ -1505,27 +1822,57 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     pub async fn remove_user(&self, group: &str, send_handle: &str) -> Result<(), PushError> {
         let container = self.get_container().await?;
 
-        
         let mut groups = self.state.write().await;
-        
+
         let group = groups.groups.get_mut(group).expect("Zone not found!");
         let zone_identifier = group.id.clone();
         let zone = group.share.as_mut().expect("no share");
-        let participant = zone.find_participant_by_handle(&send_handle).expect("Particiupant remove nto found!").clone();
-        
-        let mut pcs_config = container.get_zone_encryption_config_share(&zone_identifier, &self.keychain, &SHARED_PASSWORDS_SERVICE, Some(zone.share_info.clone())).await?;
-        
+        let participant = zone
+            .find_participant_by_handle(&send_handle)
+            .expect("Particiupant remove nto found!")
+            .clone();
+
+        let mut pcs_config = container
+            .get_zone_encryption_config_share(
+                &zone_identifier,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                Some(zone.share_info.clone()),
+            )
+            .await?;
 
         let participant_id = get_participant_id(&participant).to_string();
 
-        container.remove_participant(&mut pcs_config, &self.keychain, &SHARED_PASSWORDS_SERVICE, zone, &participant_id).await?;
+        container
+            .remove_participant(
+                &mut pcs_config,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                zone,
+                &participant_id,
+            )
+            .await?;
 
         let zone_copy = zone.clone();
         (self.update_state)(&groups);
 
-        let group = groups.groups.get_mut(&zone_identifier_key(&zone_identifier)).expect("Zone not found!");
-        let invite = participant.contact_information.as_ref().and_then(|c| group.invitations.remove(&format!("tel:+{}", c.phone_number())))
-            .or(participant.contact_information.as_ref().and_then(|c| group.invitations.remove(&format!("mailto:{}", c.email_address()))));
+        let group = groups
+            .groups
+            .get_mut(&zone_identifier_key(&zone_identifier))
+            .expect("Zone not found!");
+        let invite = participant
+            .contact_information
+            .as_ref()
+            .and_then(|c| {
+                group
+                    .invitations
+                    .remove(&format!("tel:+{}", c.phone_number()))
+            })
+            .or(participant.contact_information.as_ref().and_then(|c| {
+                group
+                    .invitations
+                    .remove(&format!("mailto:{}", c.email_address()))
+            }));
         if let Some(invite) = invite {
             self.send_invite_message(&invite, 3, &zone_copy).await?;
         }
@@ -1538,18 +1885,38 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         let container = self.get_container().await?;
 
         let mut groups = self.state.write().await;
-        
+
         let group = groups.groups.get_mut(group_id).expect("Zone not found!");
         let zone_id = group.id.clone();
         let zone = group.share.as_mut().expect("no share");
-        
-        let mut pcs_config = container.get_zone_encryption_config_share(&zone_id, &self.keychain, &SHARED_PASSWORDS_SERVICE, Some(zone.share_info.clone())).await?;
 
-        let invite = container.add_participant(&mut pcs_config, &self.keychain, &SHARED_PASSWORDS_SERVICE, zone, send_handle).await?;
-        
+        let mut pcs_config = container
+            .get_zone_encryption_config_share(
+                &zone_id,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                Some(zone.share_info.clone()),
+            )
+            .await?;
+
+        let invite = container
+            .add_participant(
+                &mut pcs_config,
+                &self.keychain,
+                &SHARED_PASSWORDS_SERVICE,
+                zone,
+                send_handle,
+            )
+            .await?;
+
         let invite_id = Uuid::new_v4().to_string().to_uppercase();
 
-        let zone_identifier = zone_id.value.as_ref().expect("no zid").name().replacen("group-", "", 1);
+        let zone_identifier = zone_id
+            .value
+            .as_ref()
+            .expect("no zid")
+            .name()
+            .replacen("group-", "", 1);
         let password_invite = PasswordInvite {
             send_handle: send_handle.to_string(),
             group: zone_identifier,
@@ -1560,50 +1927,81 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
         let zone_copy = zone.clone();
 
-        
         (self.update_state)(&groups);
-        self.send_invite_message(&password_invite, 1, &zone_copy).await?;
+        self.send_invite_message(&password_invite, 1, &zone_copy)
+            .await?;
 
-        let group = groups.groups.get_mut(&zone_identifier_key(&zone_id)).expect("Zone not found!");
-        group.invitations.insert(send_handle.to_string(), password_invite);
+        let group = groups
+            .groups
+            .get_mut(&zone_identifier_key(&zone_id))
+            .expect("Zone not found!");
+        group
+            .invitations
+            .insert(send_handle.to_string(), password_invite);
         (self.update_state)(&groups);
-        
+
         Ok(())
     }
 
     pub async fn sync_passwords(&self, connection: &APSConnection) -> Result<(), PushError> {
         self.prepare_watch(connection).await?;
-        self.keychain.sync_keychain(&["WiFi", "Passwords", "CreditCards"]).await?;
+        self.keychain
+            .sync_keychain(&["WiFi", "Passwords", "CreditCards"])
+            .await?;
 
         self.sync_groups().await?;
         Ok(())
     }
 
-    pub fn iter_password_entries<'a, T: PasswordEntry>(&self, items: &'a KeychainClientState, state: &'a PasswordState) -> impl Iterator<Item = (String, (Option<String>, T))> + 'a {
-        let siv_key = items.get_keychain_access_key().expect("Could not get password entry");
+    pub fn iter_password_entries<'a, T: PasswordEntry>(
+        &self,
+        items: &'a KeychainClientState,
+        state: &'a PasswordState,
+    ) -> impl Iterator<Item = (String, (Option<String>, T))> + 'a {
+        let siv_key = items
+            .get_keychain_access_key()
+            .expect("Could not get password entry");
         let siv_key_2 = siv_key.clone();
-        items.items.get(T::view()).into_iter().flat_map(|i| i.keys.iter()).filter_map(move |(i, k)| {
-            let dict = decrypt_entry(k, &siv_key);
-            let v: T = plist::from_value(&Value::Dictionary(dict)).ok()?;
-            if v.verify() {
-                Some((i.clone(), (None, v)))
-            } else { None }
-        }).chain(state.groups.iter().flat_map(move |(key, g)| {
-            let siv_key_3 = siv_key_2.clone();
-            g.items.iter().filter_map(move |(i, k)| {
-                let v: T = plist::from_value(&plist::to_value(&k.decrypt(&siv_key_3)).ok()?).ok()?;
+        items
+            .items
+            .get(T::view())
+            .into_iter()
+            .flat_map(|i| i.keys.iter())
+            .filter_map(move |(i, k)| {
+                let dict = decrypt_entry(k, &siv_key);
+                let v: T = plist::from_value(&Value::Dictionary(dict)).ok()?;
                 if v.verify() {
-                    Some((i.clone(), (Some(key.clone()), v)))
-                } else { None }
+                    Some((i.clone(), (None, v)))
+                } else {
+                    None
+                }
             })
-        }))
+            .chain(state.groups.iter().flat_map(move |(key, g)| {
+                let siv_key_3 = siv_key_2.clone();
+                g.items.iter().filter_map(move |(i, k)| {
+                    let v: T =
+                        plist::from_value(&plist::to_value(&k.decrypt(&siv_key_3)).ok()?).ok()?;
+                    if v.verify() {
+                        Some((i.clone(), (Some(key.clone()), v)))
+                    } else {
+                        None
+                    }
+                })
+            }))
     }
 
-    pub fn iter_password_entries_untagged<'a, T: PasswordEntry>(&self, items: &'a KeychainClientState, state: &'a PasswordState) -> impl Iterator<Item = (String, T)> + 'a {
-        self.iter_password_entries(items, state).map(|i| (i.0, i.1.1))
+    pub fn iter_password_entries_untagged<'a, T: PasswordEntry>(
+        &self,
+        items: &'a KeychainClientState,
+        state: &'a PasswordState,
+    ) -> impl Iterator<Item = (String, T)> + 'a {
+        self.iter_password_entries(items, state)
+            .map(|i| (i.0, i.1 .1))
     }
-    
-    pub async fn get_password_entries<T: PasswordEntry>(&self) -> HashMap<String, (Option<String>, T)> {
+
+    pub async fn get_password_entries<T: PasswordEntry>(
+        &self,
+    ) -> HashMap<String, (Option<String>, T)> {
         let pwstate = self.state.read().await;
         let state = self.keychain.state.read().await;
         self.iter_password_entries::<T>(&state, &pwstate).collect()
@@ -1614,8 +2012,12 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         let keychain = self.keychain.state.read().await;
         let siv_key = keychain.get_keychain_access_key()?;
         for group in shared.groups.values() {
-            let Some(item) = group.items.get(id) else { continue };
-            return Ok(plist::from_value(&plist::to_value(&item.decrypt(&siv_key))?)?);
+            let Some(item) = group.items.get(id) else {
+                continue;
+            };
+            return Ok(plist::from_value(&plist::to_value(
+                &item.decrypt(&siv_key),
+            )?)?);
         }
 
         let result = &keychain.items[T::view()].keys[id];
@@ -1627,37 +2029,65 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         let pwstate = self.state.read().await;
         let state = self.keychain.state.read().await;
         let config = SiteConfig {
-            website_meta: self.iter_password_entries_untagged::<PasswordWebsiteMeta>(&state, &pwstate).find(|(_, p)| p.srvr == site),
-            passwords: self.iter_password_entries_untagged::<PasswordRawEntry>(&state, &pwstate).filter(|(_, p)| p.srvr == site).collect(),
-            passwords_meta: self.iter_password_entries_untagged::<PasswordManagerMeta>(&state, &pwstate).filter(|(_, p)| {
-                if let Ok(details) = p.get_password_data() {
-                    if details.alt_domains.iter().any(|d| d.domain == site) {
-                        return true
+            website_meta: self
+                .iter_password_entries_untagged::<PasswordWebsiteMeta>(&state, &pwstate)
+                .find(|(_, p)| p.srvr == site),
+            passwords: self
+                .iter_password_entries_untagged::<PasswordRawEntry>(&state, &pwstate)
+                .filter(|(_, p)| p.srvr == site)
+                .collect(),
+            passwords_meta: self
+                .iter_password_entries_untagged::<PasswordManagerMeta>(&state, &pwstate)
+                .filter(|(_, p)| {
+                    if let Ok(details) = p.get_password_data() {
+                        if details.alt_domains.iter().any(|d| d.domain == site) {
+                            return true;
+                        }
                     }
-                }
-                p.srvr == site
-            }).collect(),
-            passkeys: self.iter_password_entries_untagged::<Passkey>(&state, &pwstate).filter(|(_, p)| p.labl == site).collect(),
+                    p.srvr == site
+                })
+                .collect(),
+            passkeys: self
+                .iter_password_entries_untagged::<Passkey>(&state, &pwstate)
+                .filter(|(_, p)| p.labl == site)
+                .collect(),
         };
         config
     }
 
-    pub async fn modify_password_entry<T: PasswordEntry>(&self, criteria: &T::SearchCriteria, apply: impl FnOnce(&mut T), default_group: Option<String>) -> Result<(), PushError> {
+    pub async fn modify_password_entry<T: PasswordEntry>(
+        &self,
+        criteria: &T::SearchCriteria,
+        apply: impl FnOnce(&mut T),
+        default_group: Option<String>,
+    ) -> Result<(), PushError> {
         let pwstate = self.state.read().await;
         let state = self.keychain.state.read().await;
-        let mut existing = self.iter_password_entries::<T>(&state, &pwstate)
-            .find(|i| i.1.1.match_criteria(criteria))
-            .unwrap_or_else(|| (Uuid::new_v4().to_string().to_uppercase(), (default_group, T::new_with_criteria(criteria))));
+        let mut existing = self
+            .iter_password_entries::<T>(&state, &pwstate)
+            .find(|i| i.1 .1.match_criteria(criteria))
+            .unwrap_or_else(|| {
+                (
+                    Uuid::new_v4().to_string().to_uppercase(),
+                    (default_group, T::new_with_criteria(criteria)),
+                )
+            });
 
         drop(state);
         drop(pwstate);
 
-        apply(&mut existing.1.1);
+        apply(&mut existing.1 .1);
 
-        self.insert_password_entry(&existing.0, &existing.1.1, existing.1.0).await
+        self.insert_password_entry(&existing.0, &existing.1 .1, existing.1 .0)
+            .await
     }
 
-    pub async fn insert_password_entry<T: PasswordEntry>(&self, id: &str, entry: &T, group: Option<String>) -> Result<(), PushError> {
+    pub async fn insert_password_entry<T: PasswordEntry>(
+        &self,
+        id: &str,
+        entry: &T,
+        group: Option<String>,
+    ) -> Result<(), PushError> {
         if !entry.verify() {
             panic!("Attempt to save malformed entry!");
         }
@@ -1666,7 +2096,8 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             unreachable!("PasswordKeychainEntry always serializes to plist dictionary")
         };
         if let Some(group) = group {
-            let keychain: PasswordKeychainEntry = plist::from_value(&Value::Dictionary(keychain_dict))?;
+            let keychain: PasswordKeychainEntry =
+                plist::from_value(&Value::Dictionary(keychain_dict))?;
 
             let result = if T::is_pubkey() {
                 SharingItem {
@@ -1682,18 +2113,33 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
             let shared_item = SharedPasswordItem {
                 payload: result.encode_to_vec(),
-                r#type: Some(if T::is_pubkey() { 1 } else { 2 })
+                r#type: Some(if T::is_pubkey() { 1 } else { 2 }),
             };
 
             let mut groups = self.state.write().await;
 
             let group = groups.groups.get_mut(&group).expect("Zone not found!");
-            let container = if group.is_owner { self.get_container().await? } else { self.get_shared_container().await? };
-            let key = container.get_zone_encryption_config_share(&group.id, &self.keychain, &SHARED_PASSWORDS_SERVICE, group.share.as_ref().map(|i| i.share_info.clone())).await?;
-            
-            let save = SaveRecordOperation::new(record_identifier(group.id.clone(), &format!("item-{id}")), 
-                shared_item, Some(&key), true);
-            
+            let container = if group.is_owner {
+                self.get_container().await?
+            } else {
+                self.get_shared_container().await?
+            };
+            let key = container
+                .get_zone_encryption_config_share(
+                    &group.id,
+                    &self.keychain,
+                    &SHARED_PASSWORDS_SERVICE,
+                    group.share.as_ref().map(|i| i.share_info.clone()),
+                )
+                .await?;
+
+            let save = SaveRecordOperation::new(
+                record_identifier(group.id.clone(), &format!("item-{id}")),
+                shared_item,
+                Some(&key),
+                true,
+            );
+
             container.perform(&CloudKitSession::new(), save).await?;
 
             group.items.insert(id.to_string(), keychain.clone());
@@ -1706,15 +2152,28 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         Ok(())
     }
 
-    pub async fn delete_password_entry<T: PasswordEntry>(&self, id: &str, group: Option<String>) -> Result<(), PushError> {
+    pub async fn delete_password_entry<T: PasswordEntry>(
+        &self,
+        id: &str,
+        group: Option<String>,
+    ) -> Result<(), PushError> {
         if let Some(group) = group {
             let mut groups = self.state.write().await;
 
             let group = groups.groups.get_mut(&group).expect("Zone not found!");
-            let container = if group.is_owner { self.get_container().await? } else { self.get_shared_container().await? };
+            let container = if group.is_owner {
+                self.get_container().await?
+            } else {
+                self.get_shared_container().await?
+            };
 
-            let operation = DeleteRecordOperation::new(record_identifier(group.id.clone(), &format!("item-{id}")));
-            container.perform(&CloudKitSession::new(), operation).await?;
+            let operation = DeleteRecordOperation::new(record_identifier(
+                group.id.clone(),
+                &format!("item-{id}"),
+            ));
+            container
+                .perform(&CloudKitSession::new(), operation)
+                .await?;
 
             group.items.remove(id);
             (self.update_state)(&groups);

@@ -1,14 +1,37 @@
-use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
-use openssl::{hash::MessageDigest, nid::Nid, pkey::{PKey, Params}, rsa::{Padding, Rsa}, sign::Signer, x509::{X509, X509Name, X509Req}};
+use keystore::{
+    KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey,
+    RsaKey,
+};
+use openssl::{
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Params},
+    rsa::{Padding, Rsa},
+    sign::Signer,
+    x509::{X509Name, X509Req, X509},
+};
 use plist::{Data, Value};
 use rand::{seq::SliceRandom, thread_rng};
 use rasn::types::Oid;
 use regex::Regex;
 use reqwest::Version;
 use serde::Serialize;
-use x509_cert::{attr::AttributeTypeAndValue, der::{Decode, Encode, EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
+use x509_cert::{
+    attr::AttributeTypeAndValue,
+    der::{
+        asn1::{BitString, Null, SetOfVec, Utf8StringRef},
+        pem::LineEnding,
+        Decode, Encode, EncodePem,
+    },
+    name::{Name, RdnSequence, RelativeDistinguishedName},
+    request::{CertReq, CertReqInfo},
+    spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo},
+};
 
-use crate::{OSConfig, PushError, util::{KeyPair, KeyPairNew, REQWEST, get_nested_value, plist_to_buf, plist_to_string}};
+use crate::{
+    util::{get_nested_value, plist_to_buf, plist_to_string, KeyPair, KeyPairNew, REQWEST},
+    OSConfig, PushError,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -22,7 +45,7 @@ pub struct ActivationInfo {
     pub product_version: String,
     pub serial_number: String,
     #[serde(rename = "UniqueDeviceID")]
-    pub unique_device_id: String
+    pub unique_device_id: String,
 }
 
 #[derive(Serialize)]
@@ -32,12 +55,15 @@ struct ActivationRequest {
     #[serde(rename = "ActivationInfoXML")]
     activation_info_xml: Data,
     fair_play_cert_chain: Data,
-    fair_play_signature: Data
+    fair_play_signature: Data,
 }
 
 macro_rules! include_cert {
     ($name:literal) => {
-        (include_bytes!(concat!("../certs/fairplay/", $name, ".crt")), include_bytes!(concat!("../certs/fairplay/", $name, ".pem")))
+        (
+            include_bytes!(concat!("../certs/fairplay/", $name, ".crt")),
+            include_bytes!(concat!("../certs/fairplay/", $name, ".pem")),
+        )
     };
 }
 
@@ -65,24 +91,29 @@ fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
 }
 
 pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, PushError> {
-    let key = RsaKey::overwrite(&format!("activation:{}", os_config.get_serial_number()), 1024, KeystoreAccessRules {
-        signature_padding: vec![KeystorePadding::PKCS1],
-        digests: vec![KeystoreDigest::Sha1],
-        can_sign: true,
-        ..Default::default()
-    })?;
+    let key = RsaKey::overwrite(
+        &format!("activation:{}", os_config.get_serial_number()),
+        1024,
+        KeystoreAccessRules {
+            signature_padding: vec![KeystorePadding::PKCS1],
+            digests: vec![KeystoreDigest::Sha1],
+            can_sign: true,
+            ..Default::default()
+        },
+    )?;
 
     let public_key = SubjectPublicKeyInfo::from_der(&key.get_public_key()?).unwrap();
     let request = CertReqInfo {
         version: x509_cert::request::Version::V1,
-        subject: RdnSequence(vec![
-            RelativeDistinguishedName(SetOfVec::from_iter([
-                AttributeTypeAndValue {
-                    oid: ObjectIdentifier::new("2.5.4.3").unwrap(),
-                    value: Utf8StringRef::new("Client Push Certificate").unwrap().into(),
-                }
-            ]).unwrap())
-        ]),
+        subject: RdnSequence(vec![RelativeDistinguishedName(
+            SetOfVec::from_iter([AttributeTypeAndValue {
+                oid: ObjectIdentifier::new("2.5.4.3").unwrap(),
+                value: Utf8StringRef::new("Client Push Certificate")
+                    .unwrap()
+                    .into(),
+            }])
+            .unwrap(),
+        )]),
         public_key,
         attributes: SetOfVec::new(),
     };
@@ -99,14 +130,14 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
         },
         signature: BitString::from_bytes(&sign).unwrap(),
     };
-    
+
     let csr = result.to_pem(LineEnding::LF).unwrap();
 
     let activation = os_config.build_activation_info(csr.into_bytes());
     let activation_bytes = plist_to_buf(&activation)?;
 
     let (fair_play_cert_chain, fair_play_signature) = fairplay_sign(&activation_bytes)?;
-    
+
     let request = ActivationRequest {
         activation_info_complete: true,
         activation_info_xml: activation_bytes.into(),
@@ -121,22 +152,42 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
     }
 
     let request = REQWEST
-        .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
-        .header("User-Agent", os_config.get_normal_ua("ApplePushService/4.0"))
-        .form(&FormBody { activation_info: plist_to_string(&request)? })
-        .send().await?
-        .text().await?;
+        .post(format!(
+            "https://albert.apple.com/deviceservices/deviceActivation?device={}",
+            os_config.get_activation_device()
+        ))
+        .header(
+            "User-Agent",
+            os_config.get_normal_ua("ApplePushService/4.0"),
+        )
+        .form(&FormBody {
+            activation_info: plist_to_string(&request)?,
+        })
+        .send()
+        .await?
+        .text()
+        .await?;
 
     let protocol = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap();
-    let captures = protocol.captures(&request).ok_or(PushError::AlbertCertParseError)?;
-    
+    let captures = protocol
+        .captures(&request)
+        .ok_or(PushError::AlbertCertParseError)?;
+
     let parsed: Value = plist::from_bytes(captures[1].as_bytes())?;
 
-    let certificate = get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()).ok_or(PushError::AlbertCertParseError)?;
+    let certificate = get_nested_value(
+        &parsed,
+        &[
+            "device-activation",
+            "activation-record",
+            "DeviceCertificate",
+        ],
+    )
+    .and_then(|v| v.as_data())
+    .ok_or(PushError::AlbertCertParseError)?;
 
     Ok(KeyPairNew {
         cert: X509::from_pem(certificate)?.to_der()?,
-        private: key
+        private: key,
     })
 }
-

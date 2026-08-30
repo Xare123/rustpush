@@ -1,18 +1,43 @@
-use std::{collections::HashSet, path::PathBuf, pin::Pin, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    pin::Pin,
+    process::id,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use log::{debug, error, info, warn};
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
+use tokio::{
+    select,
+    sync::{broadcast, Mutex},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{
+    aps::{get_message, APSConnection, APSInterestToken},
+    ids::{
+        identity_manager::{IDSSendMessage, MessageTarget, SendJob},
+        user::{IDSNGMIdentity, IDSService},
+        CertifiedContext,
+    },
+    imessage::messages::ErrorMessage,
+    util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip},
+    APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig,
+    PushError,
+};
 
-use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
-use std::str::FromStr;
-use rand::RngCore;
 use crate::ids::IDSRecvMessage;
+use crate::ids::{
+    identity_manager::{DeliveryHandle, IdentityManager, IdentityResource},
+    user::{IDSUserIdentity, QueryOptions},
+};
 use async_recursion::async_recursion;
+use rand::RngCore;
+use std::str::FromStr;
 
 pub const MADRID_SERVICE: IDSService = IDSService {
     name: "com.apple.madrid",
@@ -60,7 +85,10 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-hdr", Value::Boolean(true)),
         ("supports-heif", Value::Boolean(true)),
         ("supports-dq-nr", Value::Boolean(true)),
-        ("supports-family-invite-message-bubble", Value::Boolean(true)),
+        (
+            "supports-family-invite-message-bubble",
+            Value::Boolean(true),
+        ),
         ("supports-live-delivery", Value::Boolean(true)),
         ("supports-findmy-plugin-messages", Value::Boolean(true)),
         ("supports-stick-moji-backs", Value::Boolean(true)),
@@ -72,11 +100,15 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-polls", Value::Boolean(true)),
     ],
     flags: 17,
-    capabilities_name: "Messenger"
+    capabilities_name: "Messenger",
 };
 
 impl IDSRecvMessage {
-    pub fn to_message(&self, conversation: Option<ConversationData>, message: Message) -> Result<MessageInst, PushError> {
+    pub fn to_message(
+        &self,
+        conversation: Option<ConversationData>,
+        message: Message,
+    ) -> Result<MessageInst, PushError> {
         let Self {
             sender,
             uuid: Some(uuid),
@@ -84,12 +116,15 @@ impl IDSRecvMessage {
             token,
             send_delivered,
             ..
-        } = self else {
-            return Err(PushError::BadMsg)
+        } = self
+        else {
+            return Err(PushError::BadMsg);
         };
         Ok(MessageInst {
             sender: sender.clone(),
-            id: Uuid::from_bytes(uuid.clone().try_into().unwrap()).to_string().to_uppercase(),
+            id: Uuid::from_bytes(uuid.clone().try_into().unwrap())
+                .to_string()
+                .to_uppercase(),
             sent_timestamp: ns_since_epoch / 1000000,
             conversation,
             message,
@@ -102,14 +137,25 @@ impl IDSRecvMessage {
 
     pub fn certified_context(&self) -> Option<CertifiedContext> {
         let Self {
-            certified_delivery_receipt: Some(receipt), 
-            certified_delivery_version: Some(version), 
-            sender: Some(sender), 
-            target: Some(target), 
-            token: Some(token), 
-            uuid: Some(uuid), ..
-        } = self else { return None };
-        Some(CertifiedContext { version: *version, receipt: receipt.clone(), sender: sender.clone(), target: target.clone(), uuid: uuid.clone(), token: token.clone() })
+            certified_delivery_receipt: Some(receipt),
+            certified_delivery_version: Some(version),
+            sender: Some(sender),
+            target: Some(target),
+            token: Some(token),
+            uuid: Some(uuid),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(CertifiedContext {
+            version: *version,
+            receipt: receipt.clone(),
+            sender: sender.clone(),
+            target: target.clone(),
+            uuid: uuid.clone(),
+            token: token.clone(),
+        })
     }
 }
 
@@ -121,8 +167,18 @@ pub struct IMClient {
 }
 
 impl IMClient {
-    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSNGMIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
-        let interest = conn.request_topics(&["com.apple.private.alloy.sms", "com.apple.madrid"]).await;
+    pub async fn new(
+        conn: APSConnection,
+        users: Vec<IDSUser>,
+        identity: IDSNGMIdentity,
+        services: &'static [&'static IDSService],
+        cache_path: PathBuf,
+        os_config: Arc<dyn OSConfig>,
+        mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>,
+    ) -> IMClient {
+        let interest = conn
+            .request_topics(&["com.apple.private.alloy.sms", "com.apple.madrid"])
+            .await;
         let _ = Self::setup_conn(&conn).await;
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -131,25 +187,33 @@ impl IMClient {
             loop {
                 match to_refresh.recv().await {
                     Ok(()) => {
-                        let Some(conn) = reconn_conn.upgrade() else { break };
+                        let Some(conn) = reconn_conn.upgrade() else {
+                            break;
+                        };
                         let _ = Self::setup_conn(&conn).await;
-                    },
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
 
-        let identity = IdentityResource::new(users, identity, services, cache_path, conn.clone(), os_config.clone()).await;
+        let identity = IdentityResource::new(
+            users,
+            identity,
+            services,
+            cache_path,
+            conn.clone(),
+            os_config.clone(),
+        )
+        .await;
 
         let mut to_refresh = identity.generated_signal.subscribe();
         let my_ident_ref = identity.resource.clone();
         tokio::spawn(async move {
             loop {
                 match to_refresh.recv().await {
-                    Ok(()) => {
-                        keys_updated(my_ident_ref.users.read().await.clone())
-                    },
+                    Ok(()) => keys_updated(my_ident_ref.users.read().await.clone()),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -165,11 +229,20 @@ impl IMClient {
     }
 
     async fn setup_conn(conn: &APSConnection) -> Result<(), PushError> {
-        if let Err(_) = tokio::time::timeout(Duration::from_millis(500), conn.wait_for_timeout(conn.subscribe().await,
-            |msg| if let APSMessage::NoStorage = msg { Some(()) } else { None })).await {
-
+        if let Err(_) = tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.wait_for_timeout(conn.subscribe().await, |msg| {
+                if let APSMessage::NoStorage = msg {
+                    Some(())
+                } else {
+                    None
+                }
+            }),
+        )
+        .await
+        {
             debug!("Flushing cache!");
-            
+
             #[derive(Serialize)]
             struct FlushCacheMsg {
                 c: u64,
@@ -198,30 +271,45 @@ impl IMClient {
                 send_delivered: false,
                 verification_failed: false,
                 certified_context: None,
-            }))
+            }));
         }
-        if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
+        if let Some(received) = self
+            .identity
+            .receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"])
+            .await?
+        {
             let recieved = self.process_msg(received).await;
-            if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
+            if let Ok(Some(recieved)) = &recieved {
+                info!("recieved {recieved}");
+            }
             recieved
         } else {
             Ok(None)
         }
     }
-    
-    async fn process_msg(&self, mut payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
+
+    async fn process_msg(
+        &self,
+        mut payload: IDSRecvMessage,
+    ) -> Result<Option<MessageInst>, PushError> {
         let command = payload.command;
         // delivered/read
         if let IDSRecvMessage {
             command: 101 | 102 | 113,
             ..
-        } = &payload {
-            return Ok(payload.to_message(None, match command {
-                101 => Message::Delivered,
-                102 => Message::Read,
-                113 => Message::NotifyAnyways,
-                _ => panic!("no")
-            }).ok())
+        } = &payload
+        {
+            return Ok(payload
+                .to_message(
+                    None,
+                    match command {
+                        101 => Message::Delivered,
+                        102 => Message::Read,
+                        113 => Message::NotifyAnyways,
+                        _ => panic!("no"),
+                    },
+                )
+                .ok());
         }
 
         if let IDSRecvMessage {
@@ -230,13 +318,19 @@ impl IMClient {
             is_typing: Some(0),
             message: None,
             ..
-        } = &payload {
-            return Ok(payload.to_message(Some(ConversationData {
-                participants: vec![sender.clone(), target.clone()],
-                cv_name: None,
-                sender_guid: None,
-                after_guid: None,
-            }), Message::Typing(true, None)).ok())
+        } = &payload
+        {
+            return Ok(payload
+                .to_message(
+                    Some(ConversationData {
+                        participants: vec![sender.clone(), target.clone()],
+                        cv_name: None,
+                        sender_guid: None,
+                        after_guid: None,
+                    }),
+                    Message::Typing(true, None),
+                )
+                .ok());
         }
 
         // errors
@@ -249,17 +343,23 @@ impl IMClient {
             sender: Some(sender),
             target: Some(target),
             ..
-        } = &payload {
+        } = &payload
+        {
             if error_string == "ec-com.apple.messageprotection-802" {
                 // refreshing identity cache can fix this
                 let mut cache_lock = self.identity.cache.lock().await;
                 cache_lock.invalidate(&target, &sender);
             }
-            return Ok(payload.to_message(None, Message::Error(ErrorMessage {
-                for_uuid: for_str.clone(),
-                status: *error_status,
-                status_str: error_string.clone(),
-            })).ok())
+            return Ok(payload
+                .to_message(
+                    None,
+                    Message::Error(ErrorMessage {
+                        for_uuid: for_str.clone(),
+                        status: *error_status,
+                        status_str: error_string.clone(),
+                    }),
+                )
+                .ok());
         }
 
         // TODO rewrite
@@ -269,10 +369,11 @@ impl IMClient {
             target: Some(target),
             token: Some(sender_token),
             ..
-        } = &payload {
+        } = &payload
+        {
             let mut cache_lock = self.identity.cache.lock().await;
             cache_lock.invalidate(&target, &sender);
-            return Ok(None)
+            return Ok(None);
         }
 
         if let IDSRecvMessage {
@@ -280,49 +381,75 @@ impl IMClient {
             no_reply: None | Some(false),
             sender: Some(sender),
             ..
-        } = &payload {
-            let _ = self.send(&mut MessageInst::new(ConversationData {
-                participants: vec![sender.clone()],
-                cv_name: None,
-                sender_guid: Some(Uuid::new_v4().to_string()),
-                after_guid: None,
-            }, &sender, Message::MessageReadOnDevice)).await;
+        } = &payload
+        {
+            let _ = self
+                .send(&mut MessageInst::new(
+                    ConversationData {
+                        participants: vec![sender.clone()],
+                        cv_name: None,
+                        sender_guid: Some(Uuid::new_v4().to_string()),
+                        after_guid: None,
+                    },
+                    &sender,
+                    Message::MessageReadOnDevice,
+                ))
+                .await;
         }
 
         if payload.message_unenc.is_none() {
             if let Some(context) = payload.certified_context() {
                 // we weren't delivered, but we got this
-                self.identity.certify_delivery("com.apple.madrid", &context, false).await?;
+                self.identity
+                    .certify_delivery("com.apple.madrid", &context, false)
+                    .await?;
             }
             return Ok(None);
         }
 
-        match MessageInst::from_raw(payload.message_unenc.take().unwrap().plist()?, &payload, &self.conn).await {
+        match MessageInst::from_raw(
+            payload.message_unenc.take().unwrap().plist()?,
+            &payload,
+            &self.conn,
+        )
+        .await
+        {
             Err(PushError::BadMsg) => {
                 if let Some(context) = payload.certified_context() {
                     // we weren't delivered, but we got this
-                    self.identity.certify_delivery("com.apple.madrid", &context, false).await?;
+                    self.identity
+                        .certify_delivery("com.apple.madrid", &context, false)
+                        .await?;
                 }
                 Ok(None)
-            },
+            }
             Err(err) => Err(err),
-            Ok(msg) => Ok(Some(msg))
+            Ok(msg) => Ok(Some(msg)),
         }
     }
 
     pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
-        let topic = if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" };
+        let topic = if message.message.is_sms() {
+            "com.apple.private.alloy.sms"
+        } else {
+            "com.apple.madrid"
+        };
 
         let targets = message.prepare_send(&handles);
-        self.identity.cache_keys(
-            topic,
-            &targets,
-            message.sender.as_ref().unwrap(),
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true }
-        ).await?;
+        self.identity
+            .cache_keys(
+                topic,
+                &targets,
+                message.sender.as_ref().unwrap(),
+                false,
+                &QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await?;
 
         let handle = message.sender.as_ref().unwrap().to_string();
         let ident_cache = self.identity.cache.lock().await;
@@ -334,11 +461,14 @@ impl IMClient {
         drop(ident_cache);
 
         // if we have other people, but not a single target going to not us, we cannot "send" this message.
-        if targets.iter().any(|target| !handles.contains(target)) && 
-            !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
+        if targets.iter().any(|target| !handles.contains(target))
+            && !message_targets
+                .iter()
+                .any(|target| !handles.contains(&target.participant))
+        {
             return Err(PushError::NoValidTargets);
         }
-        
+
         let my_handles = self.identity.get_handles().await;
 
         if message.is_queued() {
@@ -346,20 +476,21 @@ impl IMClient {
             targets.retain(|t| t.participant == handle);
 
             let ids_message = message.get_ids(&my_handles, &self.conn, false).await?;
-            let sendjob = self.identity.send_message(topic, ids_message, targets).await;
+            let sendjob = self
+                .identity
+                .send_message(topic, ids_message, targets)
+                .await;
 
             if !message.message.should_schedule() {
                 // we aren't actually sending this. It is just a draft
-                return sendjob
+                return sendjob;
             }
         }
 
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
-        self.identity.send_message(topic, ids_message, message_targets).await
+        self.identity
+            .send_message(topic, ids_message, message_targets)
+            .await
     }
 }
-
-
-
-

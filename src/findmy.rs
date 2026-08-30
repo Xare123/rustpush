@@ -1,27 +1,76 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+    u8,
+};
 
+use crate::{
+    aps::APSInterestToken,
+    auth::{MobileMeDelegateResponse, TokenProvider},
+    cloudkit::{
+        pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer,
+        CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation,
+        ALL_ASSETS, NO_ASSETS,
+    },
+    ids::{
+        identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw},
+        user::IDSService,
+        IDSRecvMessage,
+    },
+    keychain::{derive_key_into, KeychainClient},
+    login_apple_delegates,
+    pcs::PCSService,
+    util::{duration_since_epoch, encode_hex, REQWEST},
+    APSConnection, APSMessage, LoginDelegate, OSConfig, PushError,
+};
+use crate::{
+    cloudkit::{should_reset, DeleteRecordOperation, SaveRecordOperation},
+    ids::user::QueryOptions,
+    util::{
+        base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize,
+        bin_serialize_opt_vec, decode_hex, plist_to_bin, DebugMutex,
+    },
+    CompactECKey,
+};
 use aes::{cipher::consts::U16, Aes128, Aes256};
-use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
+use aes_gcm::KeyInit;
+use aes_gcm::{
+    aead::{Aead, AeadMutInPlace},
+    Aes256Gcm, AesGcm, Nonce, Tag,
+};
 use chrono::{DateTime, NaiveTime, Utc};
 use cloudkit_derive::CloudKitRecord;
 use deku::{DekuContainerRead, DekuRead};
 use hkdf::Hkdf;
-use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
-use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
-use sha2::Sha256;
 use icloud_auth::AppleAccount;
+use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
 use log::{debug, warn};
-use omnisette::{AnisetteClient, AnisetteError, AnisetteHeaders, AnisetteProvider, ArcAnisetteClient};
+use omnisette::{
+    AnisetteClient, AnisetteError, AnisetteHeaders, AnisetteProvider, ArcAnisetteClient,
+};
+use openssl::{
+    bn::{BigNum, BigNumContext},
+    derive::Deriver,
+    ec::{EcGroup, EcKey, EcPoint},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    sha::sha256,
+    sign::{Signer, Verifier},
+};
 use plist::{Data, Dictionary, Value};
 use rand::Rng;
-use reqwest::{Request, header::{HeaderMap, HeaderName, HeaderValue}};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue},
+    Request,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, broadcast};
-use aes_gcm::KeyInit;
+use sha2::Sha256;
+use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
-use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{DebugMutex, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
-use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
@@ -41,7 +90,7 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
         ("supports-beacon-sharing-v2", Value::Boolean(true)),
     ],
     flags: 1,
-    capabilities_name: "com.apple.private.alloy"
+    capabilities_name: "com.apple.private.alloy",
 };
 
 #[derive(Deserialize, Serialize, Default, Clone)]
@@ -75,37 +124,66 @@ pub struct FindMyShareState {
 }
 
 impl FindMyShareState {
-    async fn send_circle_message(&self, circle_id: &str, identity: &IdentityManager, msg: ItemSharingMessage) -> Result<(), PushError> {
-        let circle = self.circles_member.get(circle_id).ok_or(PushError::CircleNotFound(circle_id.to_string()))?;
+    async fn send_circle_message(
+        &self,
+        circle_id: &str,
+        identity: &IdentityManager,
+        msg: ItemSharingMessage,
+    ) -> Result<(), PushError> {
+        let circle = self
+            .circles_member
+            .get(circle_id)
+            .ok_or(PushError::CircleNotFound(circle_id.to_string()))?;
 
         let topic = "com.apple.private.alloy.findmy.itemsharing-crossaccount";
 
         let handle = identity.get_handles().await.remove(0);
-        let peer_trust = self.peer_trust_member.get(&circle.owner).expect("Member not found!");
-        let target = plist::from_bytes::<CommunicationId>(&peer_trust.communications_identifier)?.ids.destination.destination;
-        identity.cache_keys(
-            topic,
-            &[target.clone()],
+        let peer_trust = self
+            .peer_trust_member
+            .get(&circle.owner)
+            .expect("Member not found!");
+        let target = plist::from_bytes::<CommunicationId>(&peer_trust.communications_identifier)?
+            .ids
+            .destination
+            .destination;
+        identity
+            .cache_keys(
+                topic,
+                &[target.clone()],
+                &handle,
+                false,
+                &QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await?;
+        let targets = identity.cache.lock().await.get_participants_targets(
+            &topic,
             &handle,
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true }
-        ).await?;
-        let targets = identity.cache.lock().await.get_participants_targets(&topic, &handle, &[target.clone()]);
-        identity.send_message(topic, IDSSendMessage {
-            sender: handle,
-            raw: Raw::Body(plist_to_bin(&msg)?),
-            send_delivered: false,
-            command: 242,
-            no_response: true,
-            id: Uuid::new_v4().to_string().to_uppercase(),
-            scheduled_ms: None,
-            queue_id: None,
-            relay: None,
-            extras: Dictionary::from_iter([
-                // wants App Ack
-                ("wA".to_string(), Value::Boolean(true))
-            ]),
-        }, targets).await?;
+            &[target.clone()],
+        );
+        identity
+            .send_message(
+                topic,
+                IDSSendMessage {
+                    sender: handle,
+                    raw: Raw::Body(plist_to_bin(&msg)?),
+                    send_delivered: false,
+                    command: 242,
+                    no_response: true,
+                    id: Uuid::new_v4().to_string().to_uppercase(),
+                    scheduled_ms: None,
+                    queue_id: None,
+                    relay: None,
+                    extras: Dictionary::from_iter([
+                        // wants App Ack
+                        ("wA".to_string(), Value::Boolean(true)),
+                    ]),
+                },
+                targets,
+            )
+            .await?;
         Ok(())
     }
 }
@@ -113,7 +191,11 @@ impl FindMyShareState {
 #[derive(Serialize, Deserialize)]
 pub struct FindMyState {
     pub dsid: String,
-    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec",
+        default
+    )]
     state_token: Option<Vec<u8>>,
     #[serde(default)]
     pub accessories: HashMap<String, BeaconAccessory>,
@@ -132,24 +214,34 @@ impl FindMyState {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PushError> {
-        let findmy_key = AesKeystoreKey::ensure("findmy:state-key", 256, KeystoreAccessRules {
-            block_modes: vec![EncryptMode::Gcm],
-            can_encrypt: true,
-            can_decrypt: true,
-            ..Default::default()
-        })?;
+        let findmy_key = AesKeystoreKey::ensure(
+            "findmy:state-key",
+            256,
+            KeystoreAccessRules {
+                block_modes: vec![EncryptMode::Gcm],
+                can_encrypt: true,
+                can_decrypt: true,
+                ..Default::default()
+            },
+        )?;
         let result = findmy_key.encrypt(&plist_to_bin(self)?, &mut EncryptMode::Gcm)?;
         Ok(result)
     }
 
     pub fn restore(data: &[u8]) -> Result<Self, PushError> {
-        let findmy_key = AesKeystoreKey::ensure("findmy:state-key", 256, KeystoreAccessRules {
-            block_modes: vec![EncryptMode::Gcm],
-            can_encrypt: true,
-            can_decrypt: true,
-            ..Default::default()
-        })?;
-        Ok(plist::from_bytes(&findmy_key.decrypt(data, &EncryptMode::Gcm)?)?)
+        let findmy_key = AesKeystoreKey::ensure(
+            "findmy:state-key",
+            256,
+            KeystoreAccessRules {
+                block_modes: vec![EncryptMode::Gcm],
+                can_encrypt: true,
+                can_decrypt: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(plist::from_bytes(
+            &findmy_key.decrypt(data, &EncryptMode::Gcm)?,
+        )?)
     }
 }
 
@@ -159,16 +251,12 @@ pub struct FindMyStateManager {
 }
 
 impl FindMyStateManager {
-    
-
     pub fn new(data: &[u8], update: Box<dyn Fn(Vec<u8>) + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             state: DebugMutex::new(FindMyState::restore(data).expect("Failed to restore!")),
-            update
+            update,
         })
     }
-
-    
 
     pub fn save(&self, state: &FindMyState) -> Result<(), PushError> {
         (self.update)(state.encode()?);
@@ -176,7 +264,12 @@ impl FindMyStateManager {
     }
 }
 
-async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver: &str, anisette: &mut AnisetteClient<T>, ua: &str) -> Result<HeaderMap, PushError> {
+async fn get_find_my_headers<T: AnisetteProvider>(
+    config: &dyn OSConfig,
+    api_ver: &str,
+    anisette: &mut AnisetteClient<T>,
+    ua: &str,
+) -> Result<HeaderMap, PushError> {
     let mut map = HeaderMap::new();
     map.insert("User-Agent", config.get_normal_ua(ua).parse().unwrap());
     map.insert("X-Apple-Realm-Support", "1.0".parse().unwrap());
@@ -189,9 +282,19 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
 
     let mut base_headers = anisette.get_headers().await?.clone();
 
-    base_headers.insert("X-Mme-Client-Info".to_string(), config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.findmy/375.20)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
+    base_headers.insert(
+        "X-Mme-Client-Info".to_string(),
+        config.get_adi_mme_info(
+            "com.apple.AuthKit/1 (com.apple.findmy/375.20)",
+            !base_headers["X-Mme-Client-Info"].contains("iPhone OS"),
+        ),
+    );
 
-    map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
+    map.extend(
+        base_headers
+            .into_iter()
+            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())),
+    );
 
     Ok(map)
 }
@@ -199,9 +302,7 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
 #[derive(Deserialize)]
 #[serde(tag = "kFMFServicePayloadKey", rename_all = "camelCase")]
 enum FMFPayload {
-    MappingPacket {
-        p: String
-    }
+    MappingPacket { p: String },
 }
 
 pub struct FindMyClient<P: AnisetteProvider> {
@@ -225,9 +326,11 @@ const SEARCH_PARTY_CONTAINER: CloudKitContainer = CloudKitContainer {
     env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
 };
 
-use log::info;
-use cloudkit_proto::{request_operation::header::IsolationLevel, CloudKitEncryptor, CloudKitRecord};
 use crate::cloudkit_proto::RecordIdentifier;
+use cloudkit_proto::{
+    request_operation::header::IsolationLevel, CloudKitEncryptor, CloudKitRecord,
+};
+use log::info;
 
 #[derive(CloudKitRecord, Default, Debug, Serialize, Deserialize, Clone)]
 #[cloudkit_record(type = "OwnerPeerTrust", encrypted, rename_all = "camelCase")]
@@ -293,19 +396,25 @@ impl SharingCircleSecret {
     pub fn circle_shared_secret(&self) -> Option<CircleSecretKey> {
         if self.secret_type.as_str() == "circleSharedSecret" {
             Some(CircleSecretKey(self.secret_data.clone()))
-        } else { None }
+        } else {
+            None
+        }
     }
 
     pub fn wild_root_key(&self) -> Option<WildRootKey> {
         if self.secret_type.as_str() == "circleWildRootKey" {
             Some(WildRootKey(self.secret_data.clone()))
-        } else { None }
+        } else {
+            None
+        }
     }
 
     pub fn join_token(&self) -> Option<DecodedCircleJoinToken> {
         if self.secret_type.as_str() == "joinToken" {
             plist::from_bytes(&self.secret_data).ok()
-        } else { None }
+        } else {
+            None
+        }
     }
 }
 
@@ -362,7 +471,8 @@ impl WildRootKey {
     pub fn idx(&self, idx: u64) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut recv_send = [0u8; 32];
-        hk.expand(idx.to_string().as_bytes(), &mut recv_send).expect("Failed to expand key!");
+        hk.expand(idx.to_string().as_bytes(), &mut recv_send)
+            .expect("Failed to expand key!");
         recv_send
     }
 
@@ -385,7 +495,14 @@ impl CircleSecretKey {
 
         let mut cipher = Aes256Gcm::new_from_slice(&self.0).unwrap();
         let mut data = decoded[2].as_ref().to_vec();
-        cipher.decrypt_in_place_detached(Nonce::from_slice(decoded[0].as_ref()), &[], &mut data, Tag::from_slice(decoded[1].as_ref())).unwrap();
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(decoded[0].as_ref()),
+                &[],
+                &mut data,
+                Tag::from_slice(decoded[1].as_ref()),
+            )
+            .unwrap();
 
         Ok(data)
     }
@@ -412,9 +529,17 @@ pub struct MasterBeaconRecord {
     pub stable_identifier: String,
     pub pairing_date: Option<SystemTime>, // option for default
     pub battery_level: i64,
-    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec",
+        default
+    )]
     pub shared_secret_2: Option<Vec<u8>>,
-    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    #[serde(
+        serialize_with = "bin_serialize_opt_vec",
+        deserialize_with = "bin_deserialize_opt_vec",
+        default
+    )]
     pub secure_locations_shared_secret: Option<Vec<u8>>,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub private_key: Vec<u8>,
@@ -476,8 +601,10 @@ impl UnifiedTimestamp {
         match self {
             Self::Date(d) => {
                 let time: SystemTime = (*d).into();
-                time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
-            },
+                time.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            }
             Self::MsSinceEpoch(e) => *e,
         }
     }
@@ -524,7 +651,7 @@ pub struct IDSTrustedPeerSharedSecret {
 struct IDSTrustedPeer {
     identifier: String,
     display_identifier: String,
-    shared_secret: IDSTrustedPeerSharedSecret
+    shared_secret: IDSTrustedPeerSharedSecret,
 }
 
 #[derive(Deserialize, Debug)]
@@ -548,9 +675,8 @@ struct IDSSharedItem {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareIdObject {
-    share_identifier: String
+    share_identifier: String,
 }
-
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -569,7 +695,7 @@ struct CommunicationIdIds {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommunicationId {
-    ids: CommunicationIdIds
+    ids: CommunicationIdIds,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -581,10 +707,7 @@ pub struct BeaconRatchet {
 
 impl BeaconRatchet {
     fn new(secret: Vec<u8>) -> Self {
-        Self {
-            index: 0,
-            secret,
-        }
+        Self { index: 0, secret }
     }
 
     fn ratchet(&self) -> Self {
@@ -595,10 +718,10 @@ impl BeaconRatchet {
             index: self.index + 1,
         }
     }
-    
+
     fn seek(&self, idx: usize, original: &[u8]) -> Self {
         let mut ratchet = self.clone();
-        if idx < ratchet.index { 
+        if idx < ratchet.index {
             ratchet = Self::new(original.to_vec());
         }
         while ratchet.index < idx {
@@ -652,7 +775,6 @@ pub struct BeaconAccessory {
     // not in cloudkit
     pub local_alignment: KeyAlignmentRecord,
 
-
     pub last_report: Option<LocationReport>,
 
     pub primary_ratchet: BeaconRatchet,
@@ -667,7 +789,14 @@ impl BeaconAccessory {
     ) -> Self {
         Self {
             primary_ratchet: BeaconRatchet::new(master_record.shared_secret.clone()),
-            secondary_ratchet: BeaconRatchet::new(master_record.shared_secret_2.clone().unwrap_or_else(|| master_record.secure_locations_shared_secret.clone().unwrap())),
+            secondary_ratchet: BeaconRatchet::new(
+                master_record.shared_secret_2.clone().unwrap_or_else(|| {
+                    master_record
+                        .secure_locations_shared_secret
+                        .clone()
+                        .unwrap()
+                }),
+            ),
 
             last_report: None,
 
@@ -706,7 +835,9 @@ impl BeaconAccessory {
         v1.nnmod(&v, &n1, &mut ctx)?;
         v1.add_word(1)?;
 
-        let private_number = BigNum::from_slice(&self.master_record.private_key[self.master_record.private_key.len() - 28..])?;
+        let private_number = BigNum::from_slice(
+            &self.master_record.private_key[self.master_record.private_key.len() - 28..],
+        )?;
         let mut i1 = BigNum::new()?;
         i1.mod_mul(&u1, &private_number, &n, &mut ctx)?;
         let mut result = BigNum::new()?;
@@ -721,13 +852,18 @@ impl BeaconAccessory {
     fn get_current(&mut self) -> Result<Vec<(usize, EcKey<Private>)>, PushError> {
         let mut primary = self.get_current_primary();
         primary.extend(self.get_current_secondary());
-        primary.into_iter().map(|i| Ok((i.index, self.derive_ps_key(&i.secret)?))).collect()
+        primary
+            .into_iter()
+            .map(|i| Ok((i.index, self.derive_ps_key(&i.secret)?)))
+            .collect()
     }
 
     fn get_current_primary(&mut self) -> Vec<BeaconRatchet> {
         // how long has it been since we last saw them?
-        let time_since_last_seen = SystemTime::now().duration_since(self.local_alignment.last_index_observation_date.unwrap()).unwrap_or(Duration::ZERO);
-        
+        let time_since_last_seen = SystemTime::now()
+            .duration_since(self.local_alignment.last_index_observation_date.unwrap())
+            .unwrap_or(Duration::ZERO);
+
         // keys refresh every 15 mins
         let slots_elapsed = time_since_last_seen.as_secs() / (60 * 15);
 
@@ -737,7 +873,9 @@ impl BeaconAccessory {
         let seek_slots = slots_elapsed.saturating_sub(LOOKBACK_TIME);
 
         let start_slot = (self.local_alignment.last_index_observed as u64) + seek_slots;
-        self.primary_ratchet = self.primary_ratchet.seek(start_slot as usize, &self.master_record.shared_secret);
+        self.primary_ratchet = self
+            .primary_ratchet
+            .seek(start_slot as usize, &self.master_record.shared_secret);
 
         let slot_window = slots_elapsed - seek_slots + LOOKAHEAD_TIME;
         info!("primary range {}-{}", start_slot, slot_window + start_slot);
@@ -745,20 +883,24 @@ impl BeaconAccessory {
     }
 
     fn get_current_secondary(&mut self) -> Vec<BeaconRatchet> {
-        let rotations = count_4am_between_dt(self.master_record.pairing_date.unwrap().into(), (SystemTime::now() + Duration::from_secs(60 * 60 * 12)).into());
+        let rotations = count_4am_between_dt(
+            self.master_record.pairing_date.unwrap().into(),
+            (SystemTime::now() + Duration::from_secs(60 * 60 * 12)).into(),
+        );
 
         const LOOKAHEAD_TIME: u64 = 1;
         const LOOKBACK_TIME: u64 = 7; // week
         let seek_slots = rotations.saturating_sub(LOOKBACK_TIME);
 
-        self.secondary_ratchet = self.secondary_ratchet.seek(seek_slots as usize, &self.master_record.shared_secret);
+        self.secondary_ratchet = self
+            .secondary_ratchet
+            .seek(seek_slots as usize, &self.master_record.shared_secret);
 
         let slot_window = rotations - seek_slots + LOOKAHEAD_TIME;
         info!("primary range {}-{}", seek_slots, slot_window + seek_slots);
         self.secondary_ratchet.window(slot_window as usize)
     }
 }
-
 
 #[derive(CloudKitRecord, Default, Debug, Serialize, Deserialize, Clone)]
 #[cloudkit_record(type = "KeyAlignmentRecord", encrypted, rename_all = "camelCase")]
@@ -771,7 +913,7 @@ pub struct KeyAlignmentRecord {
 #[derive(DekuRead, Debug)]
 #[deku(endian = "big")]
 pub struct EncryptedReport {
-    lat: i32, // multiplied by 10000000
+    lat: i32,  // multiplied by 10000000
     long: i32, // multiplied by 10000000
     horizontal_accuracy: u8,
     status: u8,
@@ -805,10 +947,33 @@ const FIND_MY_SERVICE: PCSService = PCSService {
 };
 
 impl<P: AnisetteProvider> FindMyClient<P> {
-    pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
-        let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
+    pub async fn new(
+        conn: APSConnection,
+        client: Arc<CloudKitClient<P>>,
+        keychain: Arc<KeychainClient<P>>,
+        config: Arc<dyn OSConfig>,
+        state: Arc<FindMyStateManager>,
+        token_provider: Arc<TokenProvider<P>>,
+        anisette: ArcAnisetteClient<P>,
+        identity: IdentityManager,
+    ) -> Result<FindMyClient<P>, PushError> {
+        let daemon = FindMyFriendsClient::new(
+            config.as_ref(),
+            state.state.lock().await.dsid.clone(),
+            token_provider.clone(),
+            conn.clone(),
+            anisette.clone(),
+            true,
+        )
+        .await?;
         Ok(FindMyClient {
-            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
+            _interest_token: conn
+                .request_topics(&[
+                    "com.apple.private.alloy.fmf",
+                    "com.apple.private.alloy.fmd",
+                    "com.apple.private.alloy.findmy.itemsharing-crossaccount",
+                ])
+                .await,
             conn,
             identity,
             daemon: DebugMutex::new(daemon),
@@ -825,36 +990,52 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         let mut locked = self.container.lock().await;
         if let Some(container) = &*locked {
-            return Ok(container.clone())
+            return Ok(container.clone());
         }
-        *locked = Some(Arc::new(SEARCH_PARTY_CONTAINER.init(self.client.clone()).await?));
-        return Ok(locked.clone().unwrap())
+        *locked = Some(Arc::new(
+            SEARCH_PARTY_CONTAINER.init(self.client.clone()).await?,
+        ));
+        return Ok(locked.clone().unwrap());
     }
 
     pub async fn sync_items(&self, fetch_shares: bool) -> Result<(), PushError> {
         let container = self.get_container().await?;
-        
-        let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
 
-        let key = container.get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE).await?;
+        let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+            container.private_zone("BeaconStore".to_string());
 
+        let key = container
+            .get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE)
+            .await?;
 
         let mut beacon_records: HashMap<String, MasterBeaconRecord> = HashMap::new();
-        let mut naming_records: HashMap<String, (String, Option<String>, BeaconNamingRecord)> = HashMap::new();
-        let mut alignment_records: HashMap<String, (String, Option<String>, KeyAlignmentRecord)> = HashMap::new();
+        let mut naming_records: HashMap<String, (String, Option<String>, BeaconNamingRecord)> =
+            HashMap::new();
+        let mut alignment_records: HashMap<String, (String, Option<String>, KeyAlignmentRecord)> =
+            HashMap::new();
 
         let mut state = self.state.state.lock().await;
 
-        let mut result = FetchRecordChangesOperation::do_sync(&container, &[(beacon_zone.clone(), state.state_token.clone())], &NO_ASSETS).await;
+        let mut result = FetchRecordChangesOperation::do_sync(
+            &container,
+            &[(beacon_zone.clone(), state.state_token.clone())],
+            &NO_ASSETS,
+        )
+        .await;
         if should_reset(result.as_ref().err()) {
             state.state_token = None;
             state.accessories.clear();
             state.share_state = Default::default();
-            result = FetchRecordChangesOperation::do_sync(&container, &[(beacon_zone.clone(), state.state_token.clone())], &NO_ASSETS).await;
+            result = FetchRecordChangesOperation::do_sync(
+                &container,
+                &[(beacon_zone.clone(), state.state_token.clone())],
+                &NO_ASSETS,
+            )
+            .await;
         }
 
         let (_, changes, continuation) = result?.remove(0);
-        
+
         state.state_token = continuation.clone();
 
         let state = &mut *state;
@@ -868,9 +1049,17 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         let shared_beacons = &mut state.share_state.shared_beacons;
         let tags = &mut state.share_state.tags;
         let shared_beacons_client = &mut state.share_state.shared_beacons_client;
-        
+
         for change in changes {
-            let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
+            let identifier = change
+                .identifier
+                .as_ref()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .name()
+                .to_string();
             let Some(record) = change.record else {
                 accessories.remove(&identifier);
                 circles.remove(&identifier);
@@ -881,13 +1070,18 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 circles_member.remove(&identifier);
                 peer_trust_member.remove(&identifier);
                 shared_beacons_client.remove(&identifier);
-                continue
+                continue;
             };
-            let Some(protection_info) = &record.protection_info else { continue };
+            let Some(protection_info) = &record.protection_info else {
+                continue;
+            };
             let protection_info_tag = protection_info.protection_info_tag().to_string();
 
             if record.r#type.as_ref().unwrap().name() == MasterBeaconRecord::record_type() {
-                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = MasterBeaconRecord::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 info!("Got beacon {:?} {}", item, identifier);
 
@@ -897,85 +1091,147 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     beacon_records.insert(identifier, item);
                 }
             } else if record.r#type.as_ref().unwrap().name() == BeaconNamingRecord::record_type() {
-                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = BeaconNamingRecord::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 if let Some(accessory) = accessories.get_mut(&item.associated_beacon) {
                     accessory.naming = item;
                     accessory.naming_id = identifier;
                 } else {
-                    naming_records.insert(item.associated_beacon.clone(), (identifier, Some(protection_info_tag), item));
+                    naming_records.insert(
+                        item.associated_beacon.clone(),
+                        (identifier, Some(protection_info_tag), item),
+                    );
                 }
             } else if record.r#type.as_ref().unwrap().name() == KeyAlignmentRecord::record_type() {
-                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = KeyAlignmentRecord::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 if let Some(accessory) = accessories.get_mut(&item.beacon_identifier) {
                     accessory.alignment = item.clone();
                     accessory.local_alignment = item;
                     accessory.alignment_id = identifier;
                 } else {
-                    alignment_records.insert(item.beacon_identifier.clone(), (identifier, Some(protection_info_tag), item));
+                    alignment_records.insert(
+                        item.beacon_identifier.clone(),
+                        (identifier, Some(protection_info_tag), item),
+                    );
                 }
             } else if record.r#type.as_ref().unwrap().name() == SharingCircleSecret::record_type() {
-                let item = SharingCircleSecret::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = SharingCircleSecret::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 secrets.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerSharingCircle::record_type() {
-                let item = OwnerSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = OwnerSharingCircle::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 circles.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerPeerTrust::record_type() {
-                let item = OwnerPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = OwnerPeerTrust::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 peer_trust.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberPeerTrust::record_type() {
-                let item = MemberPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = MemberPeerTrust::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 peer_trust_member.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberSharingCircle::record_type() {
-                let item = MemberSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = MemberSharingCircle::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 circles_member.insert(identifier.clone(), item);
                 tags.insert(identifier, protection_info_tag);
             } else if record.r#type.as_ref().unwrap().name() == SharedBeaconRecord::record_type() {
-                let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
+                let item = SharedBeaconRecord::from_record_encrypted(
+                    &record.record_field,
+                    Some(&pcs_keys_for_record(&record, &key)?),
+                );
 
                 shared_beacons.insert(identifier, item);
-            } else { continue }
+            } else {
+                continue;
+            }
         }
 
         for (id, record) in beacon_records {
-            let Some(naming) = naming_records.remove(&id) else { continue };
+            let Some(naming) = naming_records.remove(&id) else {
+                continue;
+            };
             let last_index_observation_date = record.pairing_date;
-            accessories.insert(id.clone(), BeaconAccessory::new(
-                record,
-                naming,
-                alignment_records.remove(&id).unwrap_or((Uuid::new_v4().to_string().to_uppercase(), None, KeyAlignmentRecord { 
-                    beacon_identifier: id.clone(), 
-                    last_index_observed: 0, 
-                    last_index_observation_date,
-                })),
-            ));
+            accessories.insert(
+                id.clone(),
+                BeaconAccessory::new(
+                    record,
+                    naming,
+                    alignment_records.remove(&id).unwrap_or((
+                        Uuid::new_v4().to_string().to_uppercase(),
+                        None,
+                        KeyAlignmentRecord {
+                            beacon_identifier: id.clone(),
+                            last_index_observed: 0,
+                            last_index_observation_date,
+                        },
+                    )),
+                ),
+            );
         }
 
-        
         for (id, circle) in circles_member {
             // we haven't joined the circle yet
-            if circle.acceptance_state != 1 || !fetch_shares { continue }
+            if circle.acceptance_state != 1 || !fetch_shares {
+                continue;
+            }
 
-            let Some(join_key) = secrets.iter().filter(|(_, a)| a.sharing_circle_identifier == circle.sharing_circle_identifier)
-                .find_map(|(_, a)| a.join_token()) else { continue };
+            let Some(join_key) = secrets
+                .iter()
+                .filter(|(_, a)| a.sharing_circle_identifier == circle.sharing_circle_identifier)
+                .find_map(|(_, a)| a.join_token())
+            else {
+                continue;
+            };
 
-            let Some(shared_secret) = secrets.iter().filter(|(_, a)| a.sharing_circle_identifier == circle.sharing_circle_identifier)
-                .find_map(|(_, a)| a.circle_shared_secret()) else { continue };
+            let Some(shared_secret) = secrets
+                .iter()
+                .filter(|(_, a)| a.sharing_circle_identifier == circle.sharing_circle_identifier)
+                .find_map(|(_, a)| a.circle_shared_secret())
+            else {
+                continue;
+            };
 
             let key_packages = self.query_share(&state.dsid, &circle, &join_key).await?;
 
-            let Some(primary) = key_packages.iter().find(|k| &k.r#type == "primaryAddress") else { continue };
-            let Some(attributes) = key_packages.iter().find(|k| &k.r#type == "beaconAttributes") else { continue };
-            
-            let beacon_attrs: BeaconAttributes = plist::from_bytes(&attributes.keys[0].decrypt(&shared_secret)?)?;
-            
-            let item = shared_beacons_client.entry(circle.beacon_identifier.clone()).or_default();
+            let Some(primary) = key_packages.iter().find(|k| &k.r#type == "primaryAddress") else {
+                continue;
+            };
+            let Some(attributes) = key_packages
+                .iter()
+                .find(|k| &k.r#type == "beaconAttributes")
+            else {
+                continue;
+            };
+
+            let beacon_attrs: BeaconAttributes =
+                plist::from_bytes(&attributes.keys[0].decrypt(&shared_secret)?)?;
+
+            let item = shared_beacons_client
+                .entry(circle.beacon_identifier.clone())
+                .or_default();
             item.start_date = primary.alignment.base_date.get_ms_since_epoch();
             item.attributes = beacon_attrs;
         }
@@ -985,35 +1241,63 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         Ok(())
     }
 
-    fn build_secrets(share: &str, secret_key: &CircleSecretKey, queried_packages: &[KeyPackage], existing: &HashMap<String, SharingCircleSecret>) -> Result<HashMap<String, SharingCircleSecret>, PushError> {
+    fn build_secrets(
+        share: &str,
+        secret_key: &CircleSecretKey,
+        queried_packages: &[KeyPackage],
+        existing: &HashMap<String, SharingCircleSecret>,
+    ) -> Result<HashMap<String, SharingCircleSecret>, PushError> {
         let mut secrets = HashMap::new();
-        
-        if !existing.values().any(|e| &e.secret_type == "circleWildRootKey" && &e.sharing_circle_identifier == share) {
-            if let Some(root_key) = queried_packages.iter().find(|k| &k.r#type == "circleWildRootKey") {
+
+        if !existing
+            .values()
+            .any(|e| &e.secret_type == "circleWildRootKey" && &e.sharing_circle_identifier == share)
+        {
+            if let Some(root_key) = queried_packages
+                .iter()
+                .find(|k| &k.r#type == "circleWildRootKey")
+            {
                 let root_key = root_key.keys[0].decrypt(secret_key)?;
-                secrets.insert(Uuid::new_v4().to_string().to_uppercase(), SharingCircleSecret {
-                    secret_data: root_key,
-                    sharing_circle_identifier: share.to_string(),
-                    secret_type: "circleWildRootKey".to_string(),
-                });
+                secrets.insert(
+                    Uuid::new_v4().to_string().to_uppercase(),
+                    SharingCircleSecret {
+                        secret_data: root_key,
+                        sharing_circle_identifier: share.to_string(),
+                        secret_type: "circleWildRootKey".to_string(),
+                    },
+                );
             }
         }
-        
-        if !existing.values().any(|e| &e.secret_type == "nearOwnerKey" && &e.sharing_circle_identifier == share) {
-            if let Some(near_owner_key) = queried_packages.iter().find(|k| &k.r#type == "nearOwnerKey") {
+
+        if !existing
+            .values()
+            .any(|e| &e.secret_type == "nearOwnerKey" && &e.sharing_circle_identifier == share)
+        {
+            if let Some(near_owner_key) = queried_packages
+                .iter()
+                .find(|k| &k.r#type == "nearOwnerKey")
+            {
                 let near_owner_key = near_owner_key.keys[0].decrypt(secret_key)?;
-                secrets.insert(Uuid::new_v4().to_string().to_uppercase(), SharingCircleSecret {
-                    secret_data: near_owner_key,
-                    sharing_circle_identifier: share.to_string(),
-                    secret_type: "nearOwnerKey".to_string(),
-                });
+                secrets.insert(
+                    Uuid::new_v4().to_string().to_uppercase(),
+                    SharingCircleSecret {
+                        secret_data: near_owner_key,
+                        sharing_circle_identifier: share.to_string(),
+                        secret_type: "nearOwnerKey".to_string(),
+                    },
+                );
             }
         }
 
         Ok(secrets)
     }
 
-    async fn query_share(&self, dsid: &str, circle: &MemberSharingCircle, join_key: &DecodedCircleJoinToken) -> Result<Vec<KeyPackage>, PushError> {
+    async fn query_share(
+        &self,
+        dsid: &str,
+        circle: &MemberSharingCircle,
+        join_key: &DecodedCircleJoinToken,
+    ) -> Result<Vec<KeyPackage>, PushError> {
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase")]
         struct ReturnedShare {
@@ -1060,75 +1344,134 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         let mut item = self.state.state.lock().await;
         let item = &mut *item;
 
+        let circle = item
+            .share_state
+            .circles_member
+            .get(circle_id)
+            .ok_or(PushError::CircleNotFound(circle_id.to_string()))?;
 
-        let circle = item.share_state.circles_member.get(circle_id).ok_or(PushError::CircleNotFound(circle_id.to_string()))?;
-        
-        let Some(join_key) = item.share_state.secrets.iter().filter(|(_, a)| a.sharing_circle_identifier == circle_id)
-                .find_map(|(_, a)| a.join_token()) else { panic!("Circle not found!d") };
-    
-        let Some(secret_key) = item.share_state.secrets.iter().filter(|(_, a)| a.sharing_circle_identifier == circle_id)
-                .find_map(|(_, a)| a.circle_shared_secret()) else { panic!("Circle not found!de") };
+        let Some(join_key) = item
+            .share_state
+            .secrets
+            .iter()
+            .filter(|(_, a)| a.sharing_circle_identifier == circle_id)
+            .find_map(|(_, a)| a.join_token())
+        else {
+            panic!("Circle not found!d")
+        };
+
+        let Some(secret_key) = item
+            .share_state
+            .secrets
+            .iter()
+            .filter(|(_, a)| a.sharing_circle_identifier == circle_id)
+            .find_map(|(_, a)| a.circle_shared_secret())
+        else {
+            panic!("Circle not found!de")
+        };
 
         // make sure the share still exists before adding it
         let queried_packages = self.query_share(&item.dsid, &circle, &join_key).await?;
 
-        item.share_state.secrets.extend(Self::build_secrets(circle_id, &secret_key, &queried_packages, &item.share_state.secrets)?);
+        item.share_state.secrets.extend(Self::build_secrets(
+            circle_id,
+            &secret_key,
+            &queried_packages,
+            &item.share_state.secrets,
+        )?);
 
-
-
-        item.share_state.send_circle_message(circle_id, &self.identity, ItemSharingMessage::new(&vec![ShareIdObject {
-            share_identifier: circle_id.to_string(),
-        }], 4 /* accept */)).await?;
-
+        item.share_state
+            .send_circle_message(
+                circle_id,
+                &self.identity,
+                ItemSharingMessage::new(
+                    &vec![ShareIdObject {
+                        share_identifier: circle_id.to_string(),
+                    }],
+                    4, /* accept */
+                ),
+            )
+            .await?;
 
         let mut circle_modified = circle.clone();
         circle_modified.acceptance_state = 1;
 
         let container = self.get_container().await?;
-        let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
-        let key = container.get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE).await?;
-        let (op, id) = SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), circle_id), 
-                    &circle_modified, &key, item.share_state.tags.get(circle_id).cloned());
+        let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+            container.private_zone("BeaconStore".to_string());
+        let key = container
+            .get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE)
+            .await?;
+        let (op, id) = SaveRecordOperation::new_protected(
+            record_identifier(beacon_zone.clone(), circle_id),
+            &circle_modified,
+            &key,
+            item.share_state.tags.get(circle_id).cloned(),
+        );
         container.perform(&CloudKitSession::new(), op).await?;
         item.share_state.tags.insert(circle_id.to_string(), id);
 
-        item.share_state.circles_member.insert(circle_id.to_string(), circle_modified);
+        item.share_state
+            .circles_member
+            .insert(circle_id.to_string(), circle_modified);
 
         self.state.save(&item)?;
 
         Ok(())
     }
 
-    pub async fn make_searchparty_request<T: DeserializeOwned + Default>(&self, dsid: &str, url: &str, body: &impl Serialize, sign_key: Option<CompactECKey<Private>>) -> Result<T, PushError> {
+    pub async fn make_searchparty_request<T: DeserializeOwned + Default>(
+        &self,
+        dsid: &str,
+        url: &str,
+        body: &impl Serialize,
+        sign_key: Option<CompactECKey<Private>>,
+    ) -> Result<T, PushError> {
         let mut request = self.anisette.lock().await.get_headers().await?.clone();
         request.remove("X-Mme-Client-Info").unwrap();
-        let mut anisette_headers: HeaderMap = request.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+        let mut anisette_headers: HeaderMap = request
+            .into_iter()
+            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
+            .collect();
 
         let body = serde_json::to_string(&body)?;
 
         if let Some(sign_key) = sign_key {
             let mut my_signer = Signer::new(MessageDigest::sha256(), sign_key.get_pkey().as_ref())?;
             let data = my_signer.sign_oneshot_to_vec(body.as_bytes())?;
-            anisette_headers.append("x-apple-share-auth", HeaderValue::from_str(&base64_encode(&data)).unwrap());
+            anisette_headers.append(
+                "x-apple-share-auth",
+                HeaderValue::from_str(&base64_encode(&data)).unwrap(),
+            );
         }
 
-        let token = self.token_provider.get_mme_token("searchPartyToken").await?;
+        let token = self
+            .token_provider
+            .get_mme_token("searchPartyToken")
+            .await?;
 
-        let description = REQWEST.post(url)
+        let description = REQWEST
+            .post(url)
             .basic_auth(&format!("{}", dsid), Some(token))
             .headers(anisette_headers)
-            .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
+            .header(
+                "X-MMe-Client-Info",
+                self.config
+                    .get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"),
+            )
             .header("x-apple-setup-proxy-request", "true")
             .header("accept-version", "4")
             .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
             .header("x-apple-i-device-type", "1")
             .header("Content-Type", "application/json")
             .body(body)
-            .send().await?
-            .bytes().await?;
+            .send()
+            .await?
+            .bytes()
+            .await?;
 
         if description.is_empty() {
-            return Ok(Default::default())
+            return Ok(Default::default());
         }
 
         Ok(serde_json::from_slice(&description)?)
@@ -1141,10 +1484,17 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         let mut bignum = BigNumContext::new()?;
 
         let range = SystemTime::now();
-        let start = range - Duration::from_secs(60 * 60 * 24 * 7) - Duration::from_secs(60 * 60 * 12);
+        let start =
+            range - Duration::from_secs(60 * 60 * 24 * 7) - Duration::from_secs(60 * 60 * 12);
         let end = range + Duration::from_secs(60 * 60 * 12);
-        let start_ts = start.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
-        let end_ts = end.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
+        let start_ts = start
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let end_ts = end
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
         let mut key_map = HashMap::new();
 
@@ -1153,17 +1503,20 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             let keys = device.get_current()?;
             let mut device_keys = vec![];
             for (idx, key) in keys {
-
                 let mut x = BigNum::new()?;
                 let mut y = BigNum::new()?;
-                key.public_key().affine_coordinates_gfp(key.group(), &mut x, &mut y, &mut bignum)?;
+                key.public_key().affine_coordinates_gfp(
+                    key.group(),
+                    &mut x,
+                    &mut y,
+                    &mut bignum,
+                )?;
 
                 let adv = base64_encode(&sha256(&x.to_vec_padded(28)?));
                 key_map.insert(adv.clone(), (id.clone(), key, idx));
                 device_keys.push(adv);
-            
             }
-            
+
             search.push(json!({
                 "secondaryIds": [],
                 "keyType": 1,
@@ -1178,25 +1531,52 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         let mut shared_search = vec![];
         for (id, shared) in &mut state.share_state.shared_beacons {
-            let Some(share_id) = state.share_state.circles_member.values().find(|c| &c.beacon_identifier == id) else { continue };
+            let Some(share_id) = state
+                .share_state
+                .circles_member
+                .values()
+                .find(|c| &c.beacon_identifier == id)
+            else {
+                continue;
+            };
 
             let Some(circle_root_key) = state.share_state.secrets.values().find_map(|v| {
-                if v.sharing_circle_identifier != share_id.sharing_circle_identifier { return None }
+                if v.sharing_circle_identifier != share_id.sharing_circle_identifier {
+                    return None;
+                }
                 v.wild_root_key()
-            }) else { continue };
+            }) else {
+                continue;
+            };
 
-            let Some(join_key) = state.share_state.secrets.iter().filter(|(_, a)| a.sharing_circle_identifier == share_id.sharing_circle_identifier)
-                .find_map(|(_, a)| a.join_token()) else { continue };
-            
-            let Some(start_alignment) = state.share_state.shared_beacons_client.get(&share_id.beacon_identifier) else { continue };
+            let Some(join_key) = state
+                .share_state
+                .secrets
+                .iter()
+                .filter(|(_, a)| a.sharing_circle_identifier == share_id.sharing_circle_identifier)
+                .find_map(|(_, a)| a.join_token())
+            else {
+                continue;
+            };
 
-            let start_time = SystemTime::UNIX_EPOCH + Duration::from_millis(start_alignment.start_date);
-            let Ok(diff) = SystemTime::now().duration_since(start_time) else { continue };
-            
+            let Some(start_alignment) = state
+                .share_state
+                .shared_beacons_client
+                .get(&share_id.beacon_identifier)
+            else {
+                continue;
+            };
+
+            let start_time =
+                SystemTime::UNIX_EPOCH + Duration::from_millis(start_alignment.start_date);
+            let Ok(diff) = SystemTime::now().duration_since(start_time) else {
+                continue;
+            };
+
             // round
             let days_elapsed = (diff.as_secs() + 43200) / 86400;
             // week range, start 6 days ago and one day in front;
-            let range = days_elapsed - 6 .. days_elapsed + 1;
+            let range = days_elapsed - 6..days_elapsed + 1;
 
             shared_search.push(json!({
                 "shareId": &share_id.sharing_circle_identifier,
@@ -1209,7 +1589,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         if search.is_empty() && shared_search.is_empty() {
             info!("Not searching, no item!");
-            return Ok(())
+            return Ok(());
         }
 
         #[derive(Deserialize)]
@@ -1234,14 +1614,21 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             acsn_locations: FetchLocations,
         }
 
-        let data: FetchPositionsResponse = self.make_searchparty_request(&state.dsid, "https://gateway.icloud.com/findmyservice/v2/fetch", &json!({
-            "clientContext": {
-                "clientBundleIdentifier": "com.apple.icloud.searchpartyuseragent",
-                "policy": "foregroundClient",
-            },
-            "sharedFetch": shared_search,
-            "fetch": search,
-        }), None).await?;
+        let data: FetchPositionsResponse = self
+            .make_searchparty_request(
+                &state.dsid,
+                "https://gateway.icloud.com/findmyservice/v2/fetch",
+                &json!({
+                    "clientContext": {
+                        "clientBundleIdentifier": "com.apple.icloud.searchpartyuseragent",
+                        "policy": "foregroundClient",
+                    },
+                    "sharedFetch": shared_search,
+                    "fetch": search,
+                }),
+                None,
+            )
+            .await?;
 
         let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
         let mut context = BigNumContext::new()?;
@@ -1254,11 +1641,13 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 let local_key = payload.loc_decrypt_key.as_ref().expect("No Local key??");
 
                 let Some(circle_root_key) = state.share_state.secrets.values().find_map(|v| {
-                    if &v.sharing_circle_identifier != share_id { return None }
+                    if &v.sharing_circle_identifier != share_id {
+                        return None;
+                    }
                     v.circle_shared_secret()
                 }) else {
                     warn!("Skipping shared payload due to missing circle secret");
-                    continue
+                    continue;
                 };
                 let decrypted_key = circle_root_key.decrypt(&base64_decode(&local_key))?;
                 let (pub_key, priv_key) = decrypted_key.split_at(57);
@@ -1271,38 +1660,55 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 let reports = shared_reports.entry(share_id.clone()).or_default();
                 (reports, priv_key, 0)
             } else {
-                let (device, key, idx) = key_map.remove(&payload.id).expect("Not found in key map!");
+                let (device, key, idx) =
+                    key_map.remove(&payload.id).expect("Not found in key map!");
                 let reports = reports.entry(device).or_default();
                 (reports, key, idx)
             };
             let pkey = PKey::from_ec_key(key)?;
             for location in payload.location_info {
                 let payload = base64_decode(&location);
-                let timestamp = apple_epoch + Duration::from_secs(u32::from_be_bytes(payload[..4].try_into().unwrap()) as u64);
-                let confidence = if payload.len() == 88 { payload[4] } else { payload[5] };
+                let timestamp = apple_epoch
+                    + Duration::from_secs(
+                        u32::from_be_bytes(payload[..4].try_into().unwrap()) as u64
+                    );
+                let confidence = if payload.len() == 88 {
+                    payload[4]
+                } else {
+                    payload[5]
+                };
 
-                let encrypted_data = if payload.len() == 88 { &payload[5..] } else { &payload[6..] };
+                let encrypted_data = if payload.len() == 88 {
+                    &payload[5..]
+                } else {
+                    &payload[6..]
+                };
 
                 let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
                 let public = EcPoint::from_bytes(&group, &encrypted_data[..57], &mut context)?;
                 let public = EcKey::from_public_key(&group, &public)?;
-                
+
                 let pkey_pub = PKey::from_ec_key(public)?;
                 let mut deriver = Deriver::new(&pkey)?;
                 deriver.set_peer(&pkey_pub)?;
                 let secret = deriver.derive_to_vec()?;
-                
-                let symmetric = sha256(&[
-                    &secret[..],
-                    &[0x00, 0x00, 0x00, 0x01],
-                    &encrypted_data[..57]
-                ].concat());
+
+                let symmetric = sha256(
+                    &[
+                        &secret[..],
+                        &[0x00, 0x00, 0x00, 0x01],
+                        &encrypted_data[..57],
+                    ]
+                    .concat(),
+                );
 
                 let cipher = AesGcm::<Aes128, U16>::new_from_slice(&symmetric[..16]).unwrap();
-                let decrypted = cipher.decrypt(Nonce::from_slice(&symmetric[16..]), &encrypted_data[57..]).unwrap();
+                let decrypted = cipher
+                    .decrypt(Nonce::from_slice(&symmetric[16..]), &encrypted_data[57..])
+                    .unwrap();
 
                 let (_, decoded) = EncryptedReport::from_bytes((&decrypted, 0))?;
-                
+
                 reports.push(LocationReport {
                     lat: (decoded.lat as f32) / 10000000f32,
                     long: (decoded.long as f32) / 10000000f32,
@@ -1310,28 +1716,45 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     status: decoded.status,
                     confidence,
                     timestamp,
-                    key_index: idx
+                    key_index: idx,
                 });
             }
         }
 
         let container = self.get_container().await?;
-        let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
-        let key = container.get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE).await?;
-        
+        let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+            container.private_zone("BeaconStore".to_string());
+        let key = container
+            .get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE)
+            .await?;
+
         let mut update_records = vec![];
         for (device, reports) in reports {
-            let newest_report = reports.into_iter().max_by_key(|i| i.timestamp).expect("no device?");
+            let newest_report = reports
+                .into_iter()
+                .max_by_key(|i| i.timestamp)
+                .expect("no device?");
             info!("newest report for {device} {newest_report:?}");
-            let accessory = state.accessories.get_mut(&device).expect("Accessory not found!");
+            let accessory = state
+                .accessories
+                .get_mut(&device)
+                .expect("Accessory not found!");
             accessory.local_alignment.last_index_observed = newest_report.key_index as i64;
             accessory.local_alignment.last_index_observation_date = Some(newest_report.timestamp);
 
-            if newest_report.key_index.saturating_sub(accessory.alignment.last_index_observed as usize) > 96 {
+            if newest_report
+                .key_index
+                .saturating_sub(accessory.alignment.last_index_observed as usize)
+                > 96
+            {
                 accessory.alignment = accessory.local_alignment.clone();
                 info!("We are behind with our stored alignment, let's update it!");
-                let (op, id) = SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &accessory.alignment_id), 
-                    &accessory.local_alignment, &key, accessory.aligment_prot_tag.take());
+                let (op, id) = SaveRecordOperation::new_protected(
+                    record_identifier(beacon_zone.clone(), &accessory.alignment_id),
+                    &accessory.local_alignment,
+                    &key,
+                    accessory.aligment_prot_tag.take(),
+                );
                 accessory.aligment_prot_tag = Some(id);
                 update_records.push(op);
             }
@@ -1339,18 +1762,35 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         }
 
         for (share, reports) in shared_reports {
-            let newest_report = reports.into_iter().max_by_key(|i| i.timestamp).expect("no device?");
+            let newest_report = reports
+                .into_iter()
+                .max_by_key(|i| i.timestamp)
+                .expect("no device?");
 
-            let share_circle = state.share_state.circles_member.get(&share).expect("Shared Accessory not found circle!");
+            let share_circle = state
+                .share_state
+                .circles_member
+                .get(&share)
+                .expect("Shared Accessory not found circle!");
 
-            let accessory = state.share_state.shared_beacons_client.get_mut(&share_circle.beacon_identifier).expect("Shared Accessory not found!");
+            let accessory = state
+                .share_state
+                .shared_beacons_client
+                .get_mut(&share_circle.beacon_identifier)
+                .expect("Shared Accessory not found!");
             info!("newest report for {share} {newest_report:?}");
 
             accessory.last_report = Some(newest_report);
         }
 
         if !update_records.is_empty() {
-            container.perform_operations_checked(&CloudKitSession::new(), &update_records, IsolationLevel::Operation).await?;
+            container
+                .perform_operations_checked(
+                    &CloudKitSession::new(),
+                    &update_records,
+                    IsolationLevel::Operation,
+                )
+                .await?;
         }
 
         self.state.save(&state)?;
@@ -1360,15 +1800,25 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
     pub async fn update_beacon_name(&self, new_name: &BeaconNamingRecord) -> Result<(), PushError> {
         let container = self.get_container().await?;
-        
-        let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
-        let key = container.get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE).await?;
+
+        let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+            container.private_zone("BeaconStore".to_string());
+        let key = container
+            .get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE)
+            .await?;
 
         let mut state = self.state.state.lock().await;
-        let accessory = state.accessories.get_mut(&new_name.associated_beacon).expect("No accessory??");
+        let accessory = state
+            .accessories
+            .get_mut(&new_name.associated_beacon)
+            .expect("No accessory??");
 
-        let (op, id) = SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &accessory.naming_id), 
-            &new_name, &key, accessory.naming_prot_tag.take());
+        let (op, id) = SaveRecordOperation::new_protected(
+            record_identifier(beacon_zone.clone(), &accessory.naming_id),
+            &new_name,
+            &key,
+            accessory.naming_prot_tag.take(),
+        );
         accessory.naming_prot_tag = Some(id);
         accessory.naming = new_name.clone();
 
@@ -1380,61 +1830,105 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
     pub async fn delete_shared_item(&self, id: &str, remove_beacon: bool) -> Result<(), PushError> {
         let container = self.get_container().await?;
-        let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
+        let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+            container.private_zone("BeaconStore".to_string());
 
         let mut state = self.state.state.lock().await;
-        
+
         if remove_beacon {
-            state.share_state.send_circle_message(id, &self.identity, ItemSharingMessage::new(&vec![ShareIdObject {
-                share_identifier: id.to_string(),
-            }], 5 /* leave */)).await?;
+            state
+                .share_state
+                .send_circle_message(
+                    id,
+                    &self.identity,
+                    ItemSharingMessage::new(
+                        &vec![ShareIdObject {
+                            share_identifier: id.to_string(),
+                        }],
+                        5, /* leave */
+                    ),
+                )
+                .await?;
         }
 
         let mut operations = vec![];
-        operations.push(DeleteRecordOperation::new(record_identifier(beacon_zone.clone(), id)));
+        operations.push(DeleteRecordOperation::new(record_identifier(
+            beacon_zone.clone(),
+            id,
+        )));
 
         let state = &mut *state;
         let Some(member_circle) = state.share_state.circles_member.get(id) else {
             warn!("Removing share {id} not found!");
-            return Ok(())
+            return Ok(());
         };
 
-
-
         for member in member_circle.get_members() {
-            operations.push(DeleteRecordOperation::new(record_identifier(beacon_zone.clone(), &member)));
+            operations.push(DeleteRecordOperation::new(record_identifier(
+                beacon_zone.clone(),
+                &member,
+            )));
         }
 
         if remove_beacon {
-            operations.push(DeleteRecordOperation::new(record_identifier(beacon_zone.clone(), &member_circle.beacon_identifier)));
+            operations.push(DeleteRecordOperation::new(record_identifier(
+                beacon_zone.clone(),
+                &member_circle.beacon_identifier,
+            )));
         }
 
         for (inner_id, secret) in &state.share_state.secrets {
-            if &secret.sharing_circle_identifier != id { continue };
-            operations.push(DeleteRecordOperation::new(record_identifier(beacon_zone.clone(), &inner_id)));
+            if &secret.sharing_circle_identifier != id {
+                continue;
+            };
+            operations.push(DeleteRecordOperation::new(record_identifier(
+                beacon_zone.clone(),
+                &inner_id,
+            )));
         }
-        
-        container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Zone).await?;
+
+        container
+            .perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Zone)
+            .await?;
 
         for member in member_circle.get_members() {
             state.share_state.peer_trust_member.remove(&member);
         }
         state.share_state.tags.remove(id);
-        
+
         if remove_beacon {
-            state.share_state.shared_beacons_client.remove(&member_circle.beacon_identifier);
-            state.share_state.shared_beacons.remove(&member_circle.beacon_identifier);
+            state
+                .share_state
+                .shared_beacons_client
+                .remove(&member_circle.beacon_identifier);
+            state
+                .share_state
+                .shared_beacons
+                .remove(&member_circle.beacon_identifier);
         }
         state.share_state.circles_member.remove(id);
-        state.share_state.secrets.retain(|i, v| v.sharing_circle_identifier != id);
+        state
+            .share_state
+            .secrets
+            .retain(|i, v| v.sharing_circle_identifier != id);
 
         self.state.save(&state)?;
 
         Ok(())
     }
 
-    async fn add_shared_item(&self, payload_data: IDSSharedItem, sender: String, correlation_id: String, ns_since_epoch: u64) -> Result<Option<(String, BeaconAttributes)>, PushError> {        
-        let owner = payload_data.trusted_peers.iter().find(|p| &p.display_identifier == "mailto:owner@localhost").expect("no owner??");
+    async fn add_shared_item(
+        &self,
+        payload_data: IDSSharedItem,
+        sender: String,
+        correlation_id: String,
+        ns_since_epoch: u64,
+    ) -> Result<Option<(String, BeaconAttributes)>, PushError> {
+        let owner = payload_data
+            .trusted_peers
+            .iter()
+            .find(|p| &p.display_identifier == "mailto:owner@localhost")
+            .expect("no owner??");
         let owner_shared_secret = CircleSecretKey(owner.shared_secret.key.data.clone().into());
 
         #[derive(Serialize)]
@@ -1455,24 +1949,30 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
                     decoded_token = plist::from_bytes(&key)?;
                     decoded_token.member_uuid = owner.identifier.clone();
-                    
-                    secrets.insert(Uuid::new_v4().to_string().to_uppercase(), SharingCircleSecret {
-                        secret_data: plist_to_bin(&decoded_token)?,
-                        sharing_circle_identifier: payload_data.share_identifier.clone(),
-                        secret_type: "joinToken".to_string(),
-                    });
-                },
+
+                    secrets.insert(
+                        Uuid::new_v4().to_string().to_uppercase(),
+                        SharingCircleSecret {
+                            secret_data: plist_to_bin(&decoded_token)?,
+                            sharing_circle_identifier: payload_data.share_identifier.clone(),
+                            secret_type: "joinToken".to_string(),
+                        },
+                    );
+                }
                 "circleSharedSecret" => {
                     let key = package.keys[0].decrypt(&owner_shared_secret)?;
                     let secret: IDSTrustedPeerSharedSecret = plist::from_bytes(&key)?;
 
                     secret_key = CircleSecretKey(secret.key.data.clone().into());
 
-                    secrets.insert(Uuid::new_v4().to_string().to_uppercase(), SharingCircleSecret {
-                        secret_data: secret.key.data.into(),
-                        sharing_circle_identifier: payload_data.share_identifier.clone(),
-                        secret_type: "circleSharedSecret".to_string(),
-                    });
+                    secrets.insert(
+                        Uuid::new_v4().to_string().to_uppercase(),
+                        SharingCircleSecret {
+                            secret_data: secret.key.data.into(),
+                            sharing_circle_identifier: payload_data.share_identifier.clone(),
+                            secret_type: "circleSharedSecret".to_string(),
+                        },
+                    );
                 }
                 _unk => {
                     warn!("Ignoring unknown secret {_unk}!");
@@ -1480,23 +1980,26 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             }
         }
 
-        
         let container = self.get_container().await?;
         self.sync_items(false).await?;
-        
+
         // are we modifying an existing beacon (circle swapping)
         let mut is_modified = false;
         let mut was_accepted = 0;
         let state = self.state.state.lock().await;
 
-        if let Some(old) = state.share_state.circles_member.values().find(|m| 
-                m.beacon_identifier == payload_data.beacon_identifier && m.sharing_circle_identifier != payload_data.share_identifier) {
+        if let Some(old) = state.share_state.circles_member.values().find(|m| {
+            m.beacon_identifier == payload_data.beacon_identifier
+                && m.sharing_circle_identifier != payload_data.share_identifier
+        }) {
             let id = old.sharing_circle_identifier.clone();
             was_accepted = old.acceptance_state;
             drop(state);
             is_modified = true;
             self.delete_shared_item(&id, false).await?;
-        } else { drop(state); }
+        } else {
+            drop(state);
+        }
 
         let communication_id = plist_to_bin(&CommunicationId {
             ids: CommunicationIdIds {
@@ -1504,8 +2007,8 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 destination: CommunicationIdIdsDestination {
                     r#type: 0,
                     destination: sender.clone(),
-                }
-            }
+                },
+            },
         })?;
 
         let shared_beacon = SharedBeaconRecord {
@@ -1518,7 +2021,9 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             advertised_index: 1,
             system_version: payload_data.system_version.clone(),
             role: payload_data.role,
-            share_date: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ns_since_epoch / 1000000)),
+            share_date: Some(
+                SystemTime::UNIX_EPOCH + Duration::from_millis(ns_since_epoch / 1000000),
+            ),
             model: payload_data.model.clone(),
             vendor_id: payload_data.vendor_id,
             name: plist_to_bin(&SharedBeaconName {
@@ -1527,36 +2032,61 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             })?,
         };
 
-        let peer_entries = payload_data.trusted_peers.iter().map(|a| (a.identifier.clone(), MemberPeerTrust {
-            display_identifier: if &a.display_identifier == "mailto:owner@localhost" {
-                sender.clone().replace("mailto:", "").replace("tel:", "")
-            } else { "".to_string() },
-            communications_identifier: communication_id.clone(),
-            peer_trust_shared_secret: a.shared_secret.key.data.clone().into(),
-            peer_trust_type: 1,
-        })).collect::<HashMap<_, _>>();
+        let peer_entries = payload_data
+            .trusted_peers
+            .iter()
+            .map(|a| {
+                (
+                    a.identifier.clone(),
+                    MemberPeerTrust {
+                        display_identifier: if &a.display_identifier == "mailto:owner@localhost" {
+                            sender.clone().replace("mailto:", "").replace("tel:", "")
+                        } else {
+                            "".to_string()
+                        },
+                        communications_identifier: communication_id.clone(),
+                        peer_trust_shared_secret: a.shared_secret.key.data.clone().into(),
+                        peer_trust_type: 1,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         let member_circle = MemberSharingCircle {
             owner: owner.identifier.clone(),
             sharing_circle_identifier: payload_data.share_identifier.clone(),
             acceptance_state: was_accepted,
             beacon_identifier: payload_data.beacon_identifier.clone(),
-            members: plist_to_bin(&payload_data.trusted_peers.iter().flat_map(|p| {
-                [
-                    Value::String(p.identifier.clone()),
-                    Value::Dictionary(Dictionary::from_iter([
-                        ("acceptanceState", Value::Integer(1.into()))
-                    ]))
-                ]
-            }).collect::<Vec<_>>())?,
+            members: plist_to_bin(
+                &payload_data
+                    .trusted_peers
+                    .iter()
+                    .flat_map(|p| {
+                        [
+                            Value::String(p.identifier.clone()),
+                            Value::Dictionary(Dictionary::from_iter([(
+                                "acceptanceState",
+                                Value::Integer(1.into()),
+                            )])),
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            )?,
         };
 
         let mut state = self.state.state.lock().await;
         // make sure the share still exists before adding it
-        let queried_packages = self.query_share(&state.dsid, &member_circle, &decoded_token).await?;
+        let queried_packages = self
+            .query_share(&state.dsid, &member_circle, &decoded_token)
+            .await?;
 
-        secrets.extend(Self::build_secrets(&payload_data.share_identifier, &secret_key, &queried_packages, &secrets)?);
-        
+        secrets.extend(Self::build_secrets(
+            &payload_data.share_identifier,
+            &secret_key,
+            &queried_packages,
+            &secrets,
+        )?);
+
         let attrs = BeaconAttributes {
             name: payload_data.beacon_name,
             role_id: payload_data.role,
@@ -1566,66 +2096,163 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         };
 
         // always update attributes, since these are client side.
-        state.share_state.shared_beacons_client.entry(payload_data.beacon_identifier.clone()).or_default().attributes = attrs.clone();
-        
-        if !state.share_state.circles_member.contains_key(&payload_data.share_identifier) {
-            let beacon_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("BeaconStore".to_string());
-            let key = container.get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE).await?;
+        state
+            .share_state
+            .shared_beacons_client
+            .entry(payload_data.beacon_identifier.clone())
+            .or_default()
+            .attributes = attrs.clone();
 
-            let (circle, circle_tag) = SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &payload_data.share_identifier), 
-                    &member_circle, &key, None);
+        if !state
+            .share_state
+            .circles_member
+            .contains_key(&payload_data.share_identifier)
+        {
+            let beacon_zone: cloudkit_proto::RecordZoneIdentifier =
+                container.private_zone("BeaconStore".to_string());
+            let key = container
+                .get_zone_encryption_config(&beacon_zone, &self.keychain, &FIND_MY_SERVICE)
+                .await?;
+
+            let (circle, circle_tag) = SaveRecordOperation::new_protected(
+                record_identifier(beacon_zone.clone(), &payload_data.share_identifier),
+                &member_circle,
+                &key,
+                None,
+            );
 
             let operations = [
                 if !is_modified {
-                    vec![SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &payload_data.beacon_identifier), 
-                    &shared_beacon, &key, None).0]
-                } else { vec![] },
+                    vec![
+                        SaveRecordOperation::new_protected(
+                            record_identifier(beacon_zone.clone(), &payload_data.beacon_identifier),
+                            &shared_beacon,
+                            &key,
+                            None,
+                        )
+                        .0,
+                    ]
+                } else {
+                    vec![]
+                },
                 vec![circle],
-                peer_entries.iter().map(|e| SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &e.0), 
-                    &e.1, &key, None).0).collect(),
-                secrets.iter().map(|e| SaveRecordOperation::new_protected(record_identifier(beacon_zone.clone(), &e.0), 
-                    &e.1, &key, None).0).collect(),
-            ].concat();
+                peer_entries
+                    .iter()
+                    .map(|e| {
+                        SaveRecordOperation::new_protected(
+                            record_identifier(beacon_zone.clone(), &e.0),
+                            &e.1,
+                            &key,
+                            None,
+                        )
+                        .0
+                    })
+                    .collect(),
+                secrets
+                    .iter()
+                    .map(|e| {
+                        SaveRecordOperation::new_protected(
+                            record_identifier(beacon_zone.clone(), &e.0),
+                            &e.1,
+                            &key,
+                            None,
+                        )
+                        .0
+                    })
+                    .collect(),
+            ]
+            .concat();
 
-            container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Zone).await?;
+            container
+                .perform_operations_checked(
+                    &CloudKitSession::new(),
+                    &operations,
+                    IsolationLevel::Zone,
+                )
+                .await?;
             state.share_state.secrets.extend(secrets);
             state.share_state.peer_trust_member.extend(peer_entries);
-            state.share_state.circles_member.insert(payload_data.share_identifier.clone(), member_circle);
+            state
+                .share_state
+                .circles_member
+                .insert(payload_data.share_identifier.clone(), member_circle);
             if !is_modified {
-                state.share_state.shared_beacons.insert(payload_data.beacon_identifier.clone(), shared_beacon);
+                state
+                    .share_state
+                    .shared_beacons
+                    .insert(payload_data.beacon_identifier.clone(), shared_beacon);
             }
-            state.share_state.tags.insert(payload_data.beacon_identifier.clone(), circle_tag);
+            state
+                .share_state
+                .tags
+                .insert(payload_data.beacon_identifier.clone(), circle_tag);
 
             self.state.save(&state)?;
         }
 
         if is_modified {
             Ok(None)
-        } else { Ok(Some((payload_data.share_identifier, attrs)))}
+        } else {
+            Ok(Some((payload_data.share_identifier, attrs)))
+        }
     }
 
-    pub async fn handle(&self, msg: APSMessage) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
-        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await? {
+    pub async fn handle(
+        &self,
+        msg: APSMessage,
+    ) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
+        if let Some(IDSRecvMessage {
+            message_unenc: Some(message),
+            topic,
+            token: Some(token),
+            target: Some(target),
+            sender: Some(sender),
+            uuid: Some(uuid),
+            ns_since_epoch: Some(ns_since_epoch),
+            ..
+        }) = self
+            .identity
+            .receive_message(
+                msg,
+                &[
+                    "com.apple.private.alloy.fmf",
+                    "com.apple.private.alloy.fmd",
+                    "com.apple.private.alloy.findmy.itemsharing-crossaccount",
+                ],
+            )
+            .await?
+        {
             let do_app_ack = || async {
-                let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender.clone()], &[MessageTarget::Token(token)])?;
-                self.identity.send_message(topic, IDSSendMessage {
-                    sender: target.clone(),
-                    raw: Raw::None,
-                    send_delivered: false,
-                    command: 244,
-                    no_response: true,
-                    id: Uuid::new_v4().to_string().to_uppercase(),
-                    scheduled_ms: None,
-                    queue_id: None,
-                    relay: None,
-                    extras: Dictionary::from_iter([
-                        // response for
-                        ("rI".to_string(), Value::Data(uuid.to_vec()))
-                    ]),
-                }, targets).await?;
+                let targets = self.identity.cache.lock().await.get_targets(
+                    &topic,
+                    &target,
+                    &[sender.clone()],
+                    &[MessageTarget::Token(token)],
+                )?;
+                self.identity
+                    .send_message(
+                        topic,
+                        IDSSendMessage {
+                            sender: target.clone(),
+                            raw: Raw::None,
+                            send_delivered: false,
+                            command: 244,
+                            no_response: true,
+                            id: Uuid::new_v4().to_string().to_uppercase(),
+                            scheduled_ms: None,
+                            queue_id: None,
+                            relay: None,
+                            extras: Dictionary::from_iter([
+                                // response for
+                                ("rI".to_string(), Value::Data(uuid.to_vec())),
+                            ]),
+                        },
+                        targets,
+                    )
+                    .await?;
                 Ok::<(), PushError>(())
             };
-            
+
             if topic == "com.apple.private.alloy.findmy.itemsharing-crossaccount" {
                 let parsed: ItemSharingMessage = message.plist()?;
 
@@ -1634,49 +2261,69 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
                 match parsed.r#type {
                     2 => {
-                        let Some(correlation_id) = self.identity.cache.lock().await.get_correlation_id(&topic, &target, &sender) else {
+                        let Some(correlation_id) = self
+                            .identity
+                            .cache
+                            .lock()
+                            .await
+                            .get_correlation_id(&topic, &target, &sender)
+                        else {
                             warn!("Failed to get correlation id for sender!");
-                            return Ok(vec![])
+                            return Ok(vec![]);
                         };
-                        
-                        let payload_data: Vec<IDSSharedItem> = plist::from_bytes(parsed.payload.as_ref())?;
+
+                        let payload_data: Vec<IDSSharedItem> =
+                            plist::from_bytes(parsed.payload.as_ref())?;
                         let mut results = vec![];
                         for shared_item in payload_data {
-                            let Some(item) = self.add_shared_item(shared_item, sender.clone(), correlation_id.clone(), ns_since_epoch).await? else { continue };
+                            let Some(item) = self
+                                .add_shared_item(
+                                    shared_item,
+                                    sender.clone(),
+                                    correlation_id.clone(),
+                                    ns_since_epoch,
+                                )
+                                .await?
+                            else {
+                                continue;
+                            };
                             results.push((sender.clone(), item.0, item.1));
                         }
                         do_app_ack().await?;
-                        return Ok(results)
-                    },
+                        return Ok(results);
+                    }
                     7 => {
                         #[derive(Deserialize)]
                         #[serde(rename_all = "camelCase")]
                         struct DeleteItems {
-                            circle_identifiers: Vec<String>
+                            circle_identifiers: Vec<String>,
                         }
 
-                        let payload_data: Vec<DeleteItems> = plist::from_bytes(parsed.payload.as_ref())?;
+                        let payload_data: Vec<DeleteItems> =
+                            plist::from_bytes(parsed.payload.as_ref())?;
                         for payload in payload_data {
                             for circle in payload.circle_identifiers {
                                 self.delete_shared_item(&circle, true).await?;
                             }
                         }
                     }
-                    _ => {
-                        
-                    }
+                    _ => {}
                 }
-                return Ok(vec![])
+                return Ok(vec![]);
             }
             let parsed: FMFPayload = message.plist()?;
             debug!("Find my IDS message came in as {}", encode_hex(&uuid));
             match parsed {
                 FMFPayload::MappingPacket { p } => {
                     do_app_ack().await?;
-                    debug!("Importing find my token {p}!");
+                    debug!("Importing find my mapping token");
 
-                    self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
-                    debug!("Imported find my token {p}!");
+                    self.daemon
+                        .lock()
+                        .await
+                        .import(self.config.as_ref(), &p)
+                        .await?;
+                    debug!("Imported find my mapping token");
                 }
             }
         }
@@ -1706,7 +2353,6 @@ pub struct LocationElement {
     pub id: String,
     pub location: Option<Location>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1826,11 +2472,28 @@ pub struct FindMyPhoneClient<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> FindMyPhoneClient<P> {
-    async fn make_request<T: for<'a> Deserialize<'a>>(&mut self, config: &dyn OSConfig, path: &str) -> Result<T, PushError> {
+    async fn build_request(
+        &mut self,
+        config: &dyn OSConfig,
+        path: &str,
+        data: serde_json::Value,
+    ) -> Result<reqwest::RequestBuilder, PushError> {
         let token = self.token_provider.get_mme_token("mmeFMIPAppToken").await?;
 
-        let request = REQWEST.post(format!("https://p{}-fmipmobile.icloud.com/fmipservice/device/{}/{}", self.server, self.dsid, path))
-            .headers(get_find_my_headers(config, "3.0", &mut *self.anisette.lock().await, "Find%20My/375.20").await?)
+        let request = REQWEST
+            .post(format!(
+                "https://p{}-fmipmobile.icloud.com/fmipservice/device/{}/{}",
+                self.server, self.dsid, path
+            ))
+            .headers(
+                get_find_my_headers(
+                    config,
+                    "3.0",
+                    &mut *self.anisette.lock().await,
+                    "Find%20My/375.20",
+                )
+                .await?,
+            )
             .basic_auth(&self.dsid, Some(&token));
 
         let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
@@ -1853,22 +2516,49 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             "windowVisible": false
         });
 
-        let raw_request: serde_json::Value = request.json(&json!({
+        let mut body = json!({
             "clientContext": client_context,
             "tapContext": [],
             "serverContext": self.server_context,
-        })).send().await?.json().await?;
+        });
+        let serde_json::Value::Object(body) = &mut body else {
+            unreachable!()
+        };
+        let serde_json::Value::Object(data) = data else {
+            unreachable!("Find My request data must be an object")
+        };
+        body.extend(data);
+
+        Ok(request.json(&body))
+    }
+
+    async fn make_state_request(
+        &mut self,
+        config: &dyn OSConfig,
+        path: &str,
+    ) -> Result<(), PushError> {
+        let raw_request: serde_json::Value = self
+            .build_request(config, path, json!({}))
+            .await?
+            .send()
+            .await?
+            .json()
+            .await?;
 
         let request: FindMyPhoneStateUpdate = serde_json::from_value(raw_request.clone())?;
 
         self.server_context = request.server_context;
         self.devices = request.content;
-
-        Ok(serde_json::from_value(raw_request)?)
+        Ok(())
     }
 
-
-    pub async fn new(config: &dyn OSConfig, dsid: String, aps: APSConnection, anisette: ArcAnisetteClient<P>, token_provider: Arc<TokenProvider<P>>) -> Result<FindMyPhoneClient<P>, PushError> {
+    pub async fn new(
+        config: &dyn OSConfig,
+        dsid: String,
+        aps: APSConnection,
+        anisette: ArcAnisetteClient<P>,
+        token_provider: Arc<TokenProvider<P>>,
+    ) -> Result<FindMyPhoneClient<P>, PushError> {
         let mut client = FindMyPhoneClient {
             server_context: None,
             dsid,
@@ -1876,20 +2566,50 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             server: rand::thread_rng().gen_range(101..=182),
             devices: vec![],
             aps,
-            token_provider
+            token_provider,
         };
 
-        let _ = client.make_request::<serde_json::Value>(config, "initClient").await?;
+        client.make_state_request(config, "initClient").await?;
 
         Ok(client)
     }
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, "refreshClient").await?;
+        self.make_state_request(config, "refreshClient").await
+    }
+
+    pub async fn play_sound(
+        &mut self,
+        config: &dyn OSConfig,
+        device_id: &str,
+    ) -> Result<(), PushError> {
+        if device_id.is_empty()
+            || !self
+                .devices
+                .iter()
+                .any(|device| device.id.as_deref() == Some(device_id))
+        {
+            return Err(PushError::DeviceNotFound);
+        }
+
+        let response = self
+            .build_request(
+                config,
+                "playSound",
+                json!({
+                    "device": device_id,
+                    "subject": "Find My Device Alert",
+                }),
+            )
+            .await?
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(PushError::StatusError(response.status()));
+        }
         Ok(())
     }
 }
-
 
 pub struct FindMyFriendsClient<P: AnisetteProvider> {
     data_context: serde_json::Value,
@@ -1907,12 +2627,39 @@ pub struct FindMyFriendsClient<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> FindMyFriendsClient<P> {
-    async fn make_request<T: for<'a> Deserialize<'a>>(&mut self, config: &dyn OSConfig, path: &str, data: serde_json::Value) -> Result<T, PushError> {
+    async fn make_request<T: for<'a> Deserialize<'a>>(
+        &mut self,
+        config: &dyn OSConfig,
+        path: &str,
+        data: serde_json::Value,
+    ) -> Result<T, PushError> {
         let token = self.token_provider.get_mme_token("mmeFMFAppToken").await?;
 
-        let request = REQWEST.post(format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/{}/{}/{}", self.server, 
-                if self.daemon { format!("fmfd/{}", self.dsid) } else { self.dsid.clone() }, config.get_udid().to_uppercase(), path))
-            .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await, if self.daemon { "FMFD/1.0" } else { "Find%20My/375.20" }).await?)
+        let request = REQWEST
+            .post(format!(
+                "https://p{}-fmfmobile.icloud.com/fmipservice/friends/{}/{}/{}",
+                self.server,
+                if self.daemon {
+                    format!("fmfd/{}", self.dsid)
+                } else {
+                    self.dsid.clone()
+                },
+                config.get_udid().to_uppercase(),
+                path
+            ))
+            .headers(
+                get_find_my_headers(
+                    config,
+                    "2.0",
+                    &mut *self.anisette.lock().await,
+                    if self.daemon {
+                        "FMFD/1.0"
+                    } else {
+                        "Find%20My/375.20"
+                    },
+                )
+                .await?,
+            )
             .header("X-FMF-Model-Version", "1")
             .basic_auth(&self.dsid, Some(&token));
 
@@ -1978,8 +2725,12 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             "serverContext": self.server_context,
         });
 
-        let serde_json::Value::Object(obj) = &mut req else { panic!() };
-        let serde_json::Value::Object(data) = data else { panic!() };
+        let serde_json::Value::Object(obj) = &mut req else {
+            panic!()
+        };
+        let serde_json::Value::Object(data) = data else {
+            panic!()
+        };
         obj.extend(data.into_iter());
 
         let response = request.json(&req).send().await?;
@@ -1995,14 +2746,15 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         self.data_context = request.data_context;
         self.server_context = request.server_context;
 
-    
         if let Some(followers) = request.followers {
             self.followers = followers;
         }
 
         if let Some(mut following) = request.following {
             for follow in &mut following {
-                let Some(existing) = self.following.iter_mut().find(|i| i.id == follow.id) else { continue };
+                let Some(existing) = self.following.iter_mut().find(|i| i.id == follow.id) else {
+                    continue;
+                };
                 follow.last_location = existing.last_location.take();
             }
             self.following = following;
@@ -2010,7 +2762,9 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
 
         if let Some(locations) = request.locations {
             for location in locations {
-                let Some(follow) = self.following.iter_mut().find(|f| f.id == location.id) else { continue };
+                let Some(follow) = self.following.iter_mut().find(|f| f.id == location.id) else {
+                    continue;
+                };
                 follow.last_location = location.location;
             }
         }
@@ -2020,7 +2774,9 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
                 item.locate_in_progress = false;
             }
             for location in locate {
-                let Some(follow) = self.following.iter_mut().find(|f| f.id == location.id) else { continue };
+                let Some(follow) = self.following.iter_mut().find(|f| f.id == location.id) else {
+                    continue;
+                };
                 follow.locate_in_progress = true;
             }
         }
@@ -2028,7 +2784,14 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         Ok(serde_json::from_value(raw_request)?)
     }
 
-    pub async fn new(config: &dyn OSConfig, dsid: String, token_provider: Arc<TokenProvider<P>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, daemon: bool) -> Result<FindMyFriendsClient<P>, PushError> {
+    pub async fn new(
+        config: &dyn OSConfig,
+        dsid: String,
+        token_provider: Arc<TokenProvider<P>>,
+        aps: APSConnection,
+        anisette: ArcAnisetteClient<P>,
+        daemon: bool,
+    ) -> Result<FindMyFriendsClient<P>, PushError> {
         let mut client = FindMyFriendsClient {
             data_context: json!({}),
             server_context: json!({}),
@@ -2043,27 +2806,51 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             has_init: false,
             token_provider,
         };
-        
+
         if !daemon {
-            let _ = client.make_request::<serde_json::Value>(config, "first/initClient", json!({})).await?;
+            let _ = client
+                .make_request::<serde_json::Value>(config, "first/initClient", json!({}))
+                .await?;
             client.has_init = true;
         }
 
         Ok(client)
-    }   
+    }
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
         if !self.has_init {
-            let _ = self.make_request::<serde_json::Value>(config, if self.daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
+            let _ = self
+                .make_request::<serde_json::Value>(
+                    config,
+                    if self.daemon {
+                        "initClient"
+                    } else {
+                        "first/initClient"
+                    },
+                    json!({}),
+                )
+                .await?;
             self.has_init = true;
         } else {
-            let _ = self.make_request::<serde_json::Value>(config, if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" }, json!({})).await?;
+            let _ = self
+                .make_request::<serde_json::Value>(
+                    config,
+                    if self.selected_friend.is_some() {
+                        "minCallback/selFriend/refreshClient"
+                    } else {
+                        "minCallback/refreshClient"
+                    },
+                    json!({}),
+                )
+                .await?;
         }
         Ok(())
     }
 
     pub async fn import(&mut self, config: &dyn OSConfig, url: &str) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
+        let _ = self
+            .make_request::<serde_json::Value>(config, "import", json!({"url": url}))
+            .await?;
         Ok(())
     }
 }

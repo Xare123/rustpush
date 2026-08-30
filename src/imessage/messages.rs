@@ -1,33 +1,59 @@
+use std::{
+    collections::HashMap,
+    fmt,
+    io::{Cursor, Read, Write},
+    mem,
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+    vec,
+};
 
-
-use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
-
-use log::{debug, error, info, warn};
-use openssl::{sha::{self, sha256}, symm::{Cipher, Crypter}};
-use plist::{Data, Dictionary, Value};
-use regex::Regex;
-use uuid::Uuid;
-use rand::Rng;
-use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader, EventWriter};
-use async_trait::async_trait;
 use async_recursion::async_recursion;
-use std::io::Seek;
+use async_trait::async_trait;
+use log::{debug, error, info, warn};
+use openssl::{
+    sha::{self, sha256},
+    symm::{Cipher, Crypter},
+};
+use plist::{Data, Dictionary, Value};
+use rand::Rng;
 use rand::RngCore;
+use regex::Regex;
+use std::io::Seek;
+use uuid::Uuid;
+use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader, EventWriter};
 
-use crate::{OSConfig, aps::{get_message, new_aps_id}, ids::{CertifiedContext, IDSRecvMessage, identity_manager::{IDSSendMessage, MessageTarget, Raw}}, mmcs::{self, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer, put_authorize_body}, util::{KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass, base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string}};
+use crate::{
+    aps::{get_message, new_aps_id},
+    ids::{
+        identity_manager::{IDSSendMessage, MessageTarget, Raw},
+        CertifiedContext, IDSRecvMessage,
+    },
+    mmcs::{
+        self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer,
+    },
+    util::{
+        base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch,
+        plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary,
+        NSDictionaryClass,
+    },
+    OSConfig,
+};
 
-use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
-
+use crate::{
+    aps::APSConnectionResource,
+    error::PushError,
+    mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, MMCSConfig, PreparedPut},
+    mmcsp,
+    util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip},
+};
 
 include!("./rawmessages.rs");
 
-
-const ZERO_NONCE: [u8; 16] = [
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-];
+const ZERO_NONCE: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 // conversation data, used to uniquely identify a conversation from a message
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConversationData {
     pub participants: Vec<String>,
     pub cv_name: Option<String>,
@@ -41,7 +67,7 @@ impl ConversationData {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TextFlags {
     pub bold: bool,
     pub italic: bool,
@@ -91,7 +117,7 @@ impl TextFlags {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum TextEffect {
     Big = 5,
     Small = 11,
@@ -116,12 +142,12 @@ impl TryFrom<u32> for TextEffect {
             4 => Self::Ripple,
             6 => Self::Bloom,
             10 => Self::Jitter,
-            _ => return Err(PushError::BadMsg)
+            _ => return Err(PushError::BadMsg),
         })
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum TextFormat {
     Flags(TextFlags),
     Effect(TextEffect),
@@ -132,7 +158,12 @@ impl TextFormat {
         match self {
             Self::Flags(flags) => flags.open_flags(writer),
             Self::Effect(effect) => {
-                writer.write(XmlEvent::start_element("texteffect").attr("type", &(*effect as u32).to_string())).unwrap();
+                writer
+                    .write(
+                        XmlEvent::start_element("texteffect")
+                            .attr("type", &(*effect as u32).to_string()),
+                    )
+                    .unwrap();
             }
         }
     }
@@ -147,7 +178,15 @@ impl TextFormat {
     }
 
     fn is_normal(&self) -> bool {
-        matches!(self, Self::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false }))
+        matches!(
+            self,
+            Self::Flags(TextFlags {
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false
+            })
+        )
     }
 }
 
@@ -158,7 +197,7 @@ impl Default for TextFormat {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum MessagePart {
     Text(String, TextFormat),
     Attachment(Attachment),
@@ -167,7 +206,7 @@ pub enum MessagePart {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IndexedMessagePart {
     pub part: MessagePart,
     pub idx: Option<usize>,
@@ -175,18 +214,22 @@ pub struct IndexedMessagePart {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
     pub fn has_attachments(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)))
+        self.0
+            .iter()
+            .any(|p| matches!(p.part, MessagePart::Attachment(_)))
     }
 
     fn is_multipart(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)) || 
-            matches!(p.part, MessagePart::Mention(_, _)) || 
-            matches!(p.part, MessagePart::Text(_, fmt) if !fmt.is_normal()))
+        self.0.iter().any(|p| {
+            matches!(p.part, MessagePart::Attachment(_))
+                || matches!(p.part, MessagePart::Mention(_, _))
+                || matches!(p.part, MessagePart::Text(_, fmt) if !fmt.is_normal())
+        })
     }
 
     fn from_raw(raw: &str) -> MessageParts {
@@ -200,15 +243,20 @@ impl MessageParts {
     // Convert parts into xml for a RawIMessage
     fn to_xml(&self, mut raw: Option<&mut RawIMessage>) -> String {
         let mut output = vec![];
-        let mut writer_config = EmitterConfig::new()
-            .write_document_declaration(false);
+        let mut writer_config = EmitterConfig::new().write_document_declaration(false);
         writer_config.perform_escaping = false;
         let mut writer = writer_config.create_writer(Cursor::new(&mut output));
         writer.write(XmlEvent::start_element("html")).unwrap();
         writer.write(XmlEvent::start_element("body")).unwrap();
         let mut inline_attachment_num = 0;
         let mut my_part_idx = 0;
+        let mut building_inline = false;
         for part in self.0.iter() {
+            if building_inline && matches!(part.part, MessagePart::Attachment(_)) {
+                // kick us out of inline mode
+                my_part_idx += 1;
+                building_inline = false;
+            }
             let part_idx = part.idx.unwrap_or(my_part_idx).to_string();
             match &part.part {
                 MessagePart::Attachment(attachment) => {
@@ -223,7 +271,11 @@ impl MessageParts {
                         .attr("uti-type", &attachment.uti_type)
                         .attr("file-size", &filesize)
                         .attr("message-part", &part_idx);
-                    let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                    let ext = part
+                        .ext
+                        .as_ref()
+                        .map(|e| e.to_dict())
+                        .unwrap_or_else(|| HashMap::new());
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
                     }
@@ -242,30 +294,42 @@ impl MessageParts {
                             } else {
                                 continue;
                             };
-                            writer.write(
-                                element
-                                    .attr("inline-attachment", num)
-                            ).unwrap();
+                            writer
+                                .write(element.attr("inline-attachment", num))
+                                .unwrap();
 
                             inline_attachment_num += 1;
                         }
                         AttachmentType::MMCS(mmcs) => {
-                            writer.write(
-                                element
-                                    .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
-                                    .attr("mmcs-url", &mmcs.url)
-                                    .attr("mmcs-owner", &mmcs.object)
-                                    .attr("decryption-key", &encode_hex(&[
-                                        vec![0x00],
-                                        mmcs.key.clone()
-                                    ].concat()))
-                            ).unwrap();
+                            writer
+                                .write(
+                                    element
+                                        .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
+                                        .attr("mmcs-url", &mmcs.url)
+                                        .attr("mmcs-owner", &mmcs.object)
+                                        .attr(
+                                            "decryption-key",
+                                            &encode_hex(&[vec![0x00], mmcs.key.clone()].concat()),
+                                        ),
+                                )
+                                .unwrap();
                         }
                     }
-                },
+                }
                 MessagePart::Text(text, format) => {
+<<<<<<< HEAD
+                    let mut element =
+                        XmlEvent::start_element("span").attr("message-part", &part_idx);
+                    let ext = part
+                        .ext
+                        .as_ref()
+                        .map(|e| e.to_dict())
+                        .unwrap_or_else(|| HashMap::new());
+=======
+                    building_inline = true;
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+>>>>>>> origin/master
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
                     }
@@ -277,23 +341,50 @@ impl MessageParts {
                             writer.write(XmlEvent::start_element("br")).unwrap();
                             writer.write(XmlEvent::end_element()).unwrap();
                         }
-                        writer.write(XmlEvent::Characters(html_escape::encode_text(line).as_ref())).unwrap();
+                        writer
+                            .write(XmlEvent::Characters(
+                                html_escape::encode_text(line).as_ref(),
+                            ))
+                            .unwrap();
                     }
                     format.close_flags(&mut writer);
-                },
+                }
                 MessagePart::Mention(uri, text) => {
+<<<<<<< HEAD
+                    let mut element =
+                        XmlEvent::start_element("span").attr("message-part", &part_idx);
+                    let ext = part
+                        .ext
+                        .as_ref()
+                        .map(|e| e.to_dict())
+                        .unwrap_or_else(|| HashMap::new());
+=======
+                    building_inline = true;
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+>>>>>>> origin/master
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
                     }
                     writer.write(element).unwrap();
-                    writer.write(XmlEvent::start_element("mention").attr("uri", uri)).unwrap();
-                    writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
+                    writer
+                        .write(XmlEvent::start_element("mention").attr("uri", uri))
+                        .unwrap();
+                    writer
+                        .write(XmlEvent::Characters(
+                            html_escape::encode_text(&text).as_ref(),
+                        ))
+                        .unwrap();
                     writer.write(XmlEvent::end_element()).unwrap();
-                },
+                }
                 MessagePart::Object(breadcrumb) => {
+<<<<<<< HEAD
+                    let element = XmlEvent::start_element("object")
+                        .attr("breadcrumbText", &breadcrumb)
+=======
+                    building_inline = true;
                     let element = XmlEvent::start_element("object").attr("breadcrumbText", &breadcrumb)
+>>>>>>> origin/master
                         .attr("breadcrumbOptions", "0");
                     writer.write(element).unwrap();
                 }
@@ -312,11 +403,18 @@ impl MessageParts {
         let mut out = vec![];
         if !mms {
             parts.push("(null)(0)".to_string());
-            let data = self.0.iter().map(|p| {
-                if let MessagePart::Text(text, _fmt) = &p.part {
-                    text.to_string()
-                } else { panic!("bad type!") }
-            }).collect::<Vec<String>>().join("|");
+            let data = self
+                .0
+                .iter()
+                .map(|p| {
+                    if let MessagePart::Text(text, _fmt) = &p.part {
+                        text.to_string()
+                    } else {
+                        panic!("bad type!")
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join("|");
             out.push(RawSmsIncomingMessageData {
                 mime_type: "text/plain".to_string(),
                 data: data.as_bytes().to_vec().into(),
@@ -335,21 +433,27 @@ impl MessageParts {
                             content_id: Some(format!("<{}>", content_id)),
                             content_location: Some(format!("{content_id}.txt")),
                         }
-                    },
+                    }
                     MessagePart::Attachment(attachment) => {
                         let content_id = format!("file{:0>6}", idx + 1);
-                        parts.push(format!("{}({})", content_id, attachment.get_size() / 1000000));
-                        let AttachmentType::Inline(amount) = &attachment.a_type else { panic!("bad attachment type for mms!") };
+                        parts.push(format!(
+                            "{}({})",
+                            content_id,
+                            attachment.get_size() / 1000000
+                        ));
+                        let AttachmentType::Inline(amount) = &attachment.a_type else {
+                            panic!("bad attachment type for mms!")
+                        };
                         RawSmsIncomingMessageData {
                             mime_type: attachment.mime.clone(),
                             data: amount.clone().into(),
                             content_id: Some(format!("<{}>", content_id)),
                             content_location: Some(format!("{content_id}")),
                         }
-                    },
+                    }
                     MessagePart::Mention(_uri, _text) => {
                         panic!("SMS doesn't support mentions!")
-                    },
+                    }
                     MessagePart::Object(_) => {
                         panic!("SMS doesn't support balloons!")
                     }
@@ -362,36 +466,73 @@ impl MessageParts {
     fn parse_sms(raw: &RawSmsIncomingMessage) -> MessageParts {
         fn parse_data(idx: usize, corresponding: &RawSmsIncomingMessageData) -> IndexedMessagePart {
             let typ = if corresponding.mime_type == "text/plain" {
-                MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap(), Default::default())
+                MessagePart::Text(
+                    String::from_utf8(corresponding.data.clone().into()).unwrap(),
+                    Default::default(),
+                )
             } else {
                 MessagePart::Attachment(Attachment {
                     a_type: AttachmentType::Inline(corresponding.data.clone().into()),
                     part: idx as u64,
                     uti_type: "".to_string(),
                     mime: corresponding.mime_type.clone(),
-                    name: corresponding.content_location.clone().unwrap_or("file".to_string()),
+                    name: corresponding
+                        .content_location
+                        .clone()
+                        .unwrap_or("file".to_string()),
                     iris: false, // imagine not having an iPhone
                 })
             };
             IndexedMessagePart {
                 part: typ,
                 idx: None,
-                ext: None
+                ext: None,
             }
         }
 
         if raw.format.starts_with("s:") {
+<<<<<<< HEAD
+            MessageParts(
+                raw.format
+                    .split("|")
+                    .skip(1)
+                    .enumerate()
+                    .map(|(idx, part)| {
+                        let corresponding = if part.starts_with("(null)") {
+                            raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
+                        } else {
+                            let filename = part.split("(").next().unwrap();
+                            raw.content
+                                .iter()
+                                .find(|i| {
+                                    i.content_location.as_ref().map(|i| i.as_str())
+                                        == Some(filename)
+                                })
+                                .unwrap()
+                        };
+                        parse_data(idx, corresponding)
+                    })
+                    .collect(),
+            )
+=======
             MessageParts(raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
                 let corresponding = if part.starts_with("(null)") {
                     raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
                 } else {
-                    let filename = part.split("(").next().unwrap();
-                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
+                    let filename = part.split("(").next().unwrap().to_lowercase();
+                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.to_lowercase()).as_ref() == Some(&filename)).unwrap()
                 };
                 parse_data(idx, corresponding)
             }).collect())
+>>>>>>> origin/master
         } else {
-            MessageParts(raw.content.iter().enumerate().map(|(idx, part)| parse_data(idx, part)).collect())
+            MessageParts(
+                raw.content
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, part)| parse_data(idx, part))
+                    .collect(),
+            )
         }
     }
 
@@ -409,7 +550,7 @@ impl MessageParts {
             fn complete(self, buf: String, format: TextFormat) -> MessagePart {
                 match self {
                     Self::Mention(user) => MessagePart::Mention(user, buf),
-                    Self::Text => MessagePart::Text(buf, format)
+                    Self::Text => MessagePart::Text(buf, format),
                 }
             }
         }
@@ -420,18 +561,39 @@ impl MessageParts {
         let mut staging_format = TextFormat::default();
         for e in reader {
             match e {
-                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
+                Ok(reader::XmlEvent::StartElement {
+                    name,
+                    attributes,
+                    namespace: _,
+                }) => {
                     let get_attr = |name: &str, def: Option<&str>| {
-                        attributes.iter().find(|attr| attr.name.to_string() == name)
-                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                        attributes
+                            .iter()
+                            .find(|attr| attr.name.to_string() == name)
+                            .map_or_else(
+                                || {
+                                    def.expect(&format!("attribute {} doesn't exist!", name))
+                                        .to_string()
+                                },
+                                |data| data.value.to_string(),
+                            )
                     };
-                    let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
-                    let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
+                    let part_idx = attributes
+                        .iter()
+                        .find(|attr| attr.name.to_string() == "message-part")
+                        .map(|opt| opt.value.parse().unwrap());
+                    let all_items: HashMap<String, String> = attributes
+                        .iter()
+                        .map(|a| (a.name.to_string(), a.value.clone()))
+                        .collect();
                     match name.local_name.as_str() {
                         "FILE" => {
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    part: staging_item.take().unwrap().complete(
+                                        std::mem::take(&mut string_buf),
+                                        mem::take(&mut staging_format),
+                                    ),
                                     idx: text_part_idx,
                                     ext: text_meta.take(),
                                 });
@@ -440,53 +602,72 @@ impl MessageParts {
                             }
                             data.push(IndexedMessagePart {
                                 part: MessagePart::Attachment(Attachment {
-                                    a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                    a_type: if let Some(inline) = attributes
+                                        .iter()
+                                        .find(|attr| attr.name.to_string() == "inline-attachment")
+                                    {
                                         AttachmentType::Inline(if inline.value == "ia-0" {
-                                            raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
+                                            raw.map_or(vec![], |raw| {
+                                                raw.inline0.clone().unwrap().into()
+                                            })
                                         } else if inline.value == "ia-1" {
-                                            raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                            raw.map_or(vec![], |raw| {
+                                                raw.inline1.clone().unwrap().into()
+                                            })
                                         } else {
-                                            continue
+                                            continue;
                                         })
                                     } else {
-                                        let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                        let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                        let sig = decode_hex(&get_attr("mmcs-signature-hex", None))
+                                            .unwrap();
+                                        let key =
+                                            decode_hex(&get_attr("decryption-key", None)).unwrap();
                                         AttachmentType::MMCS(MMCSFile {
                                             signature: sig.clone(), // chop off first byte because it's not actually the signature
                                             object: get_attr("mmcs-owner", None),
                                             url: get_attr("mmcs-url", None),
                                             key: key[1..].to_vec(),
-                                            size: get_attr("file-size", None).parse().unwrap()
+                                            size: get_attr("file-size", None).parse().unwrap(),
                                         })
                                     },
-                                    part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                                    part: attributes
+                                        .iter()
+                                        .find(|attr| attr.name.to_string() == "message-part")
+                                        .map(|item| item.value.parse().unwrap())
+                                        .unwrap_or(0),
                                     uti_type: get_attr("uti-type", Some("public.data")),
                                     mime: get_attr("mime-type", Some("application/octet-stream")),
                                     name: get_attr("name", None),
-                                    iris: get_attr("iris", Some("no")) == "yes"
+                                    iris: get_attr("iris", Some("no")) == "yes",
                                 }),
                                 idx: part_idx,
                                 ext: PartExtension::from_dict(all_items),
                             })
-                        },
+                        }
                         "span" => {
                             text_part_idx = part_idx;
                             text_meta = PartExtension::from_dict(all_items);
-                        },
+                        }
                         "mention" => {
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    part: staging_item.take().unwrap().complete(
+                                        std::mem::take(&mut string_buf),
+                                        mem::take(&mut staging_format),
+                                    ),
                                     idx: text_part_idx,
                                     ext: text_meta.take(),
                                 });
                             }
                             staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
-                        },
+                        }
                         "object" => {
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    part: staging_item.take().unwrap().complete(
+                                        std::mem::take(&mut string_buf),
+                                        mem::take(&mut staging_format),
+                                    ),
                                     idx: text_part_idx,
                                     ext: text_meta.take(),
                                 });
@@ -498,18 +679,21 @@ impl MessageParts {
                                 idx: part_idx,
                                 ext: None,
                             })
-                        },
+                        }
                         "br" => {
                             if staging_item.is_none() {
                                 staging_item = Some(StagingElement::Text)
                             }
                             string_buf += "\n";
-                        },
+                        }
                         "b" | "s" | "i" | "u" => {
                             // if we have something in the buffer
                             if string_buf.trim().len() > 0 {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), staging_format), 
+                                    part: staging_item
+                                        .take()
+                                        .unwrap()
+                                        .complete(std::mem::take(&mut string_buf), staging_format),
                                     idx: text_part_idx,
                                     ext: text_meta.clone(),
                                 });
@@ -517,27 +701,36 @@ impl MessageParts {
                             if let TextFormat::Flags(flags) = &mut staging_format {
                                 flags.apply_tag(&name.local_name, true);
                             }
-                        },
+                        }
                         "texteffect" => {
                             if string_buf.trim().len() > 0 {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    part: staging_item.take().unwrap().complete(
+                                        std::mem::take(&mut string_buf),
+                                        mem::take(&mut staging_format),
+                                    ),
                                     idx: text_part_idx,
                                     ext: text_meta.take(),
                                 });
                             }
-                            let t: u32 = get_attr("type", None).parse().expect("Effect type not a number!");
-                            staging_format = TextFormat::Effect(t.try_into().expect("Effect # not valid!"));
+                            let t: u32 = get_attr("type", None)
+                                .parse()
+                                .expect("Effect type not a number!");
+                            staging_format =
+                                TextFormat::Effect(t.try_into().expect("Effect # not valid!"));
                         }
-                        _ => {},
+                        _ => {}
                     }
-                },
+                }
                 Ok(reader::XmlEvent::EndElement { name }) => {
                     if staging_item.is_some() {
                         match name.local_name.as_str() {
                             "mention" => {
                                 data.push(IndexedMessagePart {
-                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), Default::default()), 
+                                    part: staging_item.take().unwrap().complete(
+                                        std::mem::take(&mut string_buf),
+                                        Default::default(),
+                                    ),
                                     idx: text_part_idx,
                                     ext: text_meta.take(),
                                 });
@@ -546,7 +739,10 @@ impl MessageParts {
                                 // if we have something in the buffer
                                 if string_buf.trim().len() > 0 {
                                     data.push(IndexedMessagePart {
-                                        part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), staging_format), 
+                                        part: staging_item.take().unwrap().complete(
+                                            std::mem::take(&mut string_buf),
+                                            staging_format,
+                                        ),
                                         idx: text_part_idx,
                                         ext: text_meta.clone(),
                                     });
@@ -554,18 +750,21 @@ impl MessageParts {
                                 if let TextFormat::Flags(flags) = &mut staging_format {
                                     flags.apply_tag(&name.local_name, false);
                                 }
-                            },
+                            }
                             "texteffect" => {
                                 let format = mem::take(&mut staging_format);
                                 if string_buf.trim().len() > 0 {
                                     data.push(IndexedMessagePart {
-                                        part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), format), 
+                                        part: staging_item
+                                            .take()
+                                            .unwrap()
+                                            .complete(std::mem::take(&mut string_buf), format),
                                         idx: text_part_idx,
                                         ext: text_meta.take(),
                                     });
                                 }
                             }
-                            _ => {},
+                            _ => {}
                         }
                     }
                 }
@@ -580,7 +779,10 @@ impl MessageParts {
         }
         if staging_item.is_some() {
             data.push(IndexedMessagePart {
-                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)),
+                part: staging_item.take().unwrap().complete(
+                    std::mem::take(&mut string_buf),
+                    mem::take(&mut staging_format),
+                ),
                 idx: text_part_idx,
                 ext: None,
             });
@@ -589,31 +791,40 @@ impl MessageParts {
     }
 
     pub fn raw_text(&self) -> String {
-        self.0.iter().filter_map(|m| match &m.part {
-            MessagePart::Text(text, _) => Some(text.clone()),
-            MessagePart::Attachment(_) => Some("\u{fffc}".to_string()),
-            MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
-            MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()) // two object replacements
-        }).collect::<Vec<String>>().join("")
+        self.0
+            .iter()
+            .filter_map(|m| match &m.part {
+                MessagePart::Text(text, _) => Some(text.clone()),
+                MessagePart::Attachment(_) => Some("\u{fffc}".to_string()),
+                MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
+                MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()), // two object replacements
+            })
+            .collect::<Vec<String>>()
+            .join("")
     }
 }
 
 #[repr(C)]
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Serialize, Deserialize)]
 pub enum MessageType {
     IMessage,
     SMS {
         is_phone: bool,
         using_number: String, // prefixed with tel:
+<<<<<<< HEAD
         from_handle: Option<String>,
+    },
+=======
+        from_handle: Option<String>, // also prefixed with tel:
     }
+>>>>>>> origin/master
 }
 
 // defined in rawmessages.rs
 impl ExtensionApp {
     fn from_ati(ati: &[u8], bp: Option<&[u8]>) -> Result<ExtensionApp, PushError> {
         let expanded = KeyedArchive::expand_root(&ungzip(&ati)?)?;
-        debug!("ati: {:?}", plist_to_string(&expanded));
+        debug!("Expanded extension-app archive");
         let raw_ext: NSArray<NSDictionary<ExtensionApp>> = plist::from_value(&expanded)?;
         let mut ext = raw_ext.objects.into_iter().next().unwrap().item;
 
@@ -631,22 +842,24 @@ impl ExtensionApp {
             name: raw.app_name.clone(),
             app_id: raw.appid.clone(),
             bundle_id: bid.to_string(),
-            balloon: Some(Balloon::from_raw(raw)?)
+            balloon: Some(Balloon::from_raw(raw)?),
         })
     }
 
-    pub fn to_raw(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
+    pub fn to_raw(&self, is_backup: bool) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
         let arr = NSArray {
             objects: vec![NSDictionary {
                 class: NSDictionaryClass::NSDictionary,
-                item: self
+                item: self,
             }],
             class: NSArrayClass::NSMutableArray,
         };
-        let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?)?;
+        let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(
+            plist::to_value(&arr)?,
+        )?)?)?;
         let mut balloon = None;
         if let Some(balloon_obj) = &self.balloon {
-            balloon = Some(balloon_obj.to_raw(self)?);
+            balloon = Some(balloon_obj.to_raw(self, is_backup)?);
         }
 
         Ok((collapse, balloon))
@@ -655,7 +868,11 @@ impl ExtensionApp {
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all_fields = "kebab-case", tag = "layoutClass", content = "userInfo")]
+#[serde(
+    rename_all_fields = "kebab-case",
+    tag = "layoutClass",
+    content = "userInfo"
+)]
 pub enum BalloonLayout {
     #[serde(rename = "MSMessageTemplateLayout")]
     TemplateLayout {
@@ -667,7 +884,7 @@ pub enum BalloonLayout {
         subcaption: String,
         #[serde(rename = "$class")]
         class: NSDictionaryClass,
-    }
+    },
 }
 
 #[repr(C)]
@@ -688,8 +905,12 @@ impl Balloon {
     }
 
     fn unpack_raw(bp: &[u8]) -> Result<RawBalloonData, PushError> {
-        let unpacked: NSDictionary<RawBalloonData> = plist::from_value(&KeyedArchive::expand_root(&ungzip(&bp)?)?)?;
-        let NSDictionary { class: _, item: unpacked } = unpacked;
+        let unpacked: NSDictionary<RawBalloonData> =
+            plist::from_value(&KeyedArchive::expand_root(&ungzip(&bp)?)?)?;
+        let NSDictionary {
+            class: _,
+            item: unpacked,
+        } = unpacked;
         Ok(unpacked)
     }
 
@@ -701,41 +922,57 @@ impl Balloon {
             layout: unpacked.layout,
             ld_text: unpacked.ldtext,
             is_live: unpacked.live_layout_info.is_some(),
-            icon: unpacked.app_icon.map(|a| ungzip(&a).unwrap()),
+            icon: unpacked.app_icon.map(|a| a.decompress().into_bytes()),
         })
     }
 
-    fn to_raw(&self, app: &ExtensionApp) -> Result<Vec<u8>, PushError> {
+    fn to_raw(&self, app: &ExtensionApp, is_backup: bool) -> Result<Vec<u8>, PushError> {
         let raw = NSDictionary {
             item: RawBalloonData {
                 ldtext: self.ld_text.clone(),
                 layout: self.layout.clone(),
+<<<<<<< HEAD
                 app_icon: self.icon.as_ref().map(|icon| NSData {
                     data: gzip(&icon).unwrap().into(),
-                    class: NSDataClass::NSMutableData
+                    class: NSDataClass::NSMutableData,
                 }),
+=======
+                app_icon: self.icon.as_ref().map(|icon| BalloonRawData::new(icon.clone(), is_backup).compress()),
+>>>>>>> origin/master
                 app_name: app.name.clone(),
-                session_identifier: self.session.as_ref().map(|session| Uuid::from_str(&session).unwrap().into()),
+                session_identifier: self
+                    .session
+                    .as_ref()
+                    .map(|session| Uuid::from_str(&session).unwrap().into()),
                 live_layout_info: if self.is_live {
+<<<<<<< HEAD
                     Some(NSData {
                         data: include_bytes!("livelayout.bplist").to_vec().into(),
-                        class: NSDataClass::NSMutableData
+                        class: NSDataClass::NSMutableData,
                     })
+                } else {
+                    None
+                },
+=======
+                    Some(BalloonRawData::new(include_bytes!("livelayout.bplist").to_vec(), is_backup))
                 } else { None },
+>>>>>>> origin/master
                 url: NSURL {
                     base: "$null".to_string(),
-                    relative: self.url.clone()
+                    relative: self.url.clone(),
                 },
                 appid: app.app_id.clone(),
             },
-            class: NSDictionaryClass::NSMutableDictionary
+            class: NSDictionaryClass::NSMutableDictionary,
         };
 
-        Ok(gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&raw)?)?)?)?)
+        Ok(gzip(&plist_to_bin(&KeyedArchive::archive_item(
+            plist::to_value(&raw)?,
+        )?)?)?)
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScheduleMode {
     pub ms: u64,
     pub schedule: bool,
@@ -743,7 +980,7 @@ pub struct ScheduleMode {
 
 // a "normal" imessage, containing multiple parts and text
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NormalMessage {
     pub parts: MessageParts,
     pub effect: Option<String>,
@@ -759,7 +996,7 @@ pub struct NormalMessage {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LinkMeta {
     pub data: LPLinkMetadata,
     pub attachments: Vec<Vec<u8>>,
@@ -788,20 +1025,20 @@ impl NormalMessage {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RenameMessage {
-    pub new_name: String
+    pub new_name: String,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChangeParticipantMessage {
     pub new_participants: Vec<String>,
-    pub group_version: u64
+    pub group_version: u64,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Reaction {
     Heart,
     Like,
@@ -813,8 +1050,8 @@ pub enum Reaction {
     // send not supported
     Sticker {
         spec: Option<ExtensionApp>,
-        body: MessageParts
-    }
+        body: MessageParts,
+    },
 }
 
 impl Reaction {
@@ -834,7 +1071,7 @@ impl Reaction {
     fn get_emoji(&self) -> Option<String> {
         match self {
             Self::Emoji(e) => Some(e.clone()),
-            _ => None
+            _ => None,
         }
     }
 }
@@ -867,21 +1104,29 @@ pub enum PartExtension {
         effect_type: i64,
         #[serde(rename = "sid")]
         sticker_id: String,
-    }
+    },
 }
 
 impl PartExtension {
     fn to_dict(&self) -> HashMap<String, String> {
-        plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
+        plist::to_value(self)
+            .unwrap()
+            .into_dictionary()
+            .unwrap()
+            .into_iter()
             .map(|(i, value)| {
-                (i, match value {
-                    Value::Boolean(v) => v.to_string(),
-                    Value::Real(r) => r.to_string(),
-                    Value::Integer(i) => i.to_string(),
-                    Value::String(s) => s,
-                    _ => panic!("unsupported in html value!")
-                })
-            }).collect()
+                (
+                    i,
+                    match value {
+                        Value::Boolean(v) => v.to_string(),
+                        Value::Real(r) => r.to_string(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::String(s) => s,
+                        _ => panic!("unsupported in html value!"),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn from_dict(mut data: HashMap<String, String>) -> Option<Self> {
@@ -904,7 +1149,7 @@ impl PartExtension {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ReactMessageType {
     React {
         reaction: Reaction,
@@ -922,7 +1167,8 @@ impl ReactMessageType {
         match self {
             Self::React { reaction, enable } => {
                 if *enable {
-                    format!("{} “{}”",
+                    format!(
+                        "{} “{}”",
                         match reaction {
                             Reaction::Heart => "Loved".to_string(),
                             Reaction::Like => "Liked".to_string(),
@@ -931,12 +1177,14 @@ impl ReactMessageType {
                             Reaction::Emphasize => "Emphasized".to_string(),
                             Reaction::Question => "Questioned".to_string(),
                             Reaction::Emoji(e) => format!("Reacted {} to ", e),
-                            Reaction::Sticker { spec: _, body: _ } => "Reacted with a sticker to ".to_string(),
+                            Reaction::Sticker { spec: _, body: _ } =>
+                                "Reacted with a sticker to ".to_string(),
                         },
                         to_text
                     )
                 } else {
-                    format!("Removed a{} from “{}”",
+                    format!(
+                        "Removed a{} from “{}”",
                         match reaction {
                             Reaction::Heart => " heart".to_string(),
                             Reaction::Like => " like".to_string(),
@@ -950,12 +1198,19 @@ impl ReactMessageType {
                         to_text
                     )
                 }
-            },
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body, .. } => {
-                body.raw_text()
             }
-            ,
-            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body, .. } => {
+            Self::Extension {
+                spec: ExtensionApp { balloon: None, .. },
+                body,
+                ..
+            } => body.raw_text(),
+            Self::Extension {
+                spec: ExtensionApp {
+                    balloon: Some(_), ..
+                },
+                body,
+                ..
+            } => {
                 "\u{fffd}".to_string() // replacement character
             }
         }
@@ -963,19 +1218,43 @@ impl ReactMessageType {
 
     fn get_cmd(&self) -> u64 {
         match self {
-            Self::React { reaction, enable } => if *enable {
-                reaction.get_idx() + 2000
-            } else {
-                reaction.get_idx() + 3000
-            },
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _, .. } => 1000,
-            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, is_meta: false } => 2,
-            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, is_meta: true } => 4000,
+            Self::React { reaction, enable } => {
+                if *enable {
+                    reaction.get_idx() + 2000
+                } else {
+                    reaction.get_idx() + 3000
+                }
+            }
+            Self::Extension {
+                spec: ExtensionApp { balloon: None, .. },
+                body: _,
+                ..
+            } => 1000,
+            Self::Extension {
+                spec: ExtensionApp {
+                    balloon: Some(_), ..
+                },
+                body: _,
+                is_meta: false,
+            } => 2,
+            Self::Extension {
+                spec: ExtensionApp {
+                    balloon: Some(_), ..
+                },
+                body: _,
+                is_meta: true,
+            } => 4000,
         }
     }
 
     fn get_emoji(&self) -> Option<String> {
-        let Self::React { reaction, enable: _ } = self else { return None };
+        let Self::React {
+            reaction,
+            enable: _,
+        } = self
+        else {
+            return None;
+        };
         reaction.get_emoji()
     }
 
@@ -988,27 +1267,42 @@ impl ReactMessageType {
 
     fn prid(&self) -> Option<String> {
         match self {
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _, .. } => Some("3cN".to_string()),
+            Self::Extension {
+                spec: ExtensionApp { balloon: None, .. },
+                body: _,
+                ..
+            } => Some("3cN".to_string()),
             _ => None,
         }
     }
 
     fn get_xml(&self) -> Option<String> {
         match self {
-            Self::React { reaction: _, enable: _ } => None,
-            Self::Extension { spec: _, body, .. } => {
-                Some(body.to_xml(None))
-            },
+            Self::React {
+                reaction: _,
+                enable: _,
+            } => None,
+            Self::Extension { spec: _, body, .. } => Some(body.to_xml(None)),
         }
     }
 
     fn is_balloon(&self) -> bool {
-        matches!(self, Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, .. })
+        matches!(
+            self,
+            Self::Extension {
+                spec: ExtensionApp {
+                    balloon: Some(_),
+                    ..
+                },
+                body: _,
+                ..
+            }
+        )
     }
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ReactMessage {
     pub to_uuid: String,
     pub to_part: Option<u64>,
@@ -1018,7 +1312,7 @@ pub struct ReactMessage {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ErrorMessage {
     pub for_uuid: String,
     pub status: u64,
@@ -1039,50 +1333,56 @@ impl ReactMessage {
             (4, None) => Reaction::Emphasize,
             (5, None) => Reaction::Question,
             (6, Some(em)) => Reaction::Emoji(em),
-            _ => return None
+            _ => return None,
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UnsendMessage {
     pub tuuid: String,
     pub edit_part: u64,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
-    pub new_parts: MessageParts
+    pub new_parts: MessageParts,
 }
 
 pub struct IMessageContainer<T> {
     crypter: Crypter,
     inner: T,
     cacher: DataCacher,
-    finalized: bool
+    finalized: bool,
 }
 
 impl<T: Send + Sync> IMessageContainer<T> {
     fn new(key: &[u8], inner: T, is_writer: bool) -> Self {
         Self {
-            crypter: Crypter::new(Cipher::aes_256_ctr(), if is_writer {
-                openssl::symm::Mode::Decrypt
-            } else {
-                openssl::symm::Mode::Encrypt
-            }, key, Some(&ZERO_NONCE)).unwrap(),
+            crypter: Crypter::new(
+                Cipher::aes_256_ctr(),
+                if is_writer {
+                    openssl::symm::Mode::Decrypt
+                } else {
+                    openssl::symm::Mode::Encrypt
+                },
+                key,
+                Some(&ZERO_NONCE),
+            )
+            .unwrap(),
             inner,
             cacher: DataCacher::new(),
-            finalized: false
+            finalized: false,
         }
     }
 
     fn finish(&mut self) -> Vec<u8> {
         if self.finalized {
-            return vec![]
+            return vec![];
         }
         self.finalized = true;
         let block_size = Cipher::aes_256_ctr().block_size();
@@ -1106,8 +1406,11 @@ impl<T: Read + Send + Sync> ReadContainer for IMessageContainer<T> {
             if read == 0 {
                 let ciphertext = self.finish();
                 self.cacher.data_avail(&ciphertext);
-                recieved = self.cacher.read_exact(len).or_else(|| Some(self.cacher.read_all()));
-                break
+                recieved = self
+                    .cacher
+                    .read_exact(len)
+                    .or_else(|| Some(self.cacher.read_all()));
+                break;
             } else {
                 data.resize(read, 0);
                 let block_size = Cipher::aes_256_ctr().block_size();
@@ -1118,7 +1421,7 @@ impl<T: Read + Send + Sync> ReadContainer for IMessageContainer<T> {
             }
             recieved = self.cacher.read_exact(len);
         }
-        
+
         Ok(recieved.unwrap_or(vec![]))
     }
 
@@ -1151,7 +1454,6 @@ pub struct AttachmentPreparedPut {
     key: [u8; 32],
 }
 
-
 #[derive(Serialize, Deserialize)]
 struct RequestMMCSUpload {
     #[serde(rename = "mL")]
@@ -1177,7 +1479,7 @@ struct MMCSUploadResponse {
     #[serde(rename = "mR")]
     domain: String,
     #[serde(rename = "mU")]
-    object: String
+    object: String,
 }
 
 #[repr(C)]
@@ -1189,7 +1491,7 @@ pub struct MMCSFile {
     pub url: String,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub key: Vec<u8>,
-    pub size: usize
+    pub size: usize,
 }
 
 impl From<MMCSTransferData> for MMCSFile {
@@ -1199,7 +1501,7 @@ impl From<MMCSTransferData> for MMCSFile {
             object: value.mmcs_owner,
             url: value.mmcs_url,
             key: decode_hex(&value.decryption_key).unwrap()[1..].to_vec(),
-            size: value.file_size.parse().unwrap()
+            size: value.file_size.parse().unwrap(),
         }
     }
 }
@@ -1210,31 +1512,36 @@ impl Into<MMCSTransferData> for MMCSFile {
             mmcs_signature_hex: encode_hex(&self.signature).to_uppercase(),
             mmcs_owner: self.object,
             mmcs_url: self.url,
-            decryption_key: encode_hex(&[
-                vec![0x0],
-                self.key
-            ].concat()),
-            file_size: self.size.to_string()
+            decryption_key: encode_hex(&[vec![0x0], self.key].concat()),
+            file_size: self.size.to_string(),
         }
     }
 }
 
-
 impl MMCSFile {
-    pub async fn prepare_put(reader: impl Read + Send + Sync) -> Result<AttachmentPreparedPut, PushError> {
+    pub async fn prepare_put(
+        reader: impl Read + Send + Sync,
+    ) -> Result<AttachmentPreparedPut, PushError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let send_container = IMessageContainer::new(&key, reader, false);
         let prepared = prepare_put(send_container, false, 0x81).await?;
         Ok(AttachmentPreparedPut {
             mmcs: prepared,
-            key
+            key,
         })
     }
 
     // create and upload a new attachment to MMCS
-    pub async fn new(apns: &APSConnectionResource, prepared: &AttachmentPreparedPut, reader: impl Read + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<MMCSFile, PushError> {
+    pub async fn new(
+        apns: &APSConnectionResource,
+        prepared: &AttachmentPreparedPut,
+        reader: impl Read + Send + Sync,
+        progress: impl FnMut(usize, usize) + Send + Sync,
+    ) -> Result<MMCSFile, PushError> {
         let mmcs_config = MMCSConfig {
-            mme_client_info: apns.os_config.get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)"),
+            mme_client_info: apns
+                .os_config
+                .get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)"),
             user_agent: apns.os_config.get_normal_ua("IMTransferAgent/1000"),
             dataclass: "com.apple.Dataclass.Messenger",
             mini_ua: apns.os_config.get_version_ua(),
@@ -1258,23 +1565,43 @@ impl MMCSFile {
             length: prepared.mmcs.total_len,
             signature: prepared.mmcs.total_sig.clone().into(),
             cv: 2,
-            headers: format!("{}\n", headers.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("\n")),
-            body: body.into()
+            headers: format!(
+                "{}\n",
+                headers
+                    .into_iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            body: body.into(),
         };
         let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", complete, Some(msg_id)).await?;
+        apns.send_message("com.apple.madrid", complete, Some(msg_id))
+            .await?;
 
-        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return None
-            };
-            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-                return None
-            };
-            if c.as_unsigned_integer().unwrap() == 150 && i.as_signed_integer().unwrap() as i32 == msg_id {
-                Some(loaded)
-            } else { None }
-        }, &["com.apple.madrid"])).await?;
+        let reader = apns
+            .wait_for_timeout(
+                recv,
+                get_message(
+                    |loaded| {
+                        let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                            return None;
+                        };
+                        let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+                            return None;
+                        };
+                        if c.as_unsigned_integer().unwrap() == 150
+                            && i.as_signed_integer().unwrap() as i32 == msg_id
+                        {
+                            Some(loaded)
+                        } else {
+                            None
+                        }
+                    },
+                    &["com.apple.madrid"],
+                ),
+            )
+            .await?;
         let apns_response: MMCSUploadResponse = plist::from_value(&reader)?;
 
         let confirm_url = format!("{}/{}", apns_response.domain, apns_response.object);
@@ -1289,18 +1616,22 @@ impl MMCSFile {
 
         let result = put_mmcs(&mmcs_config, inputs, authorization, progress).await?;
 
-
         Ok(MMCSFile {
             signature: prepared.mmcs.total_sig.to_vec(),
             object: result.1.expect("No unique ID??"),
             url: result.0,
             key: prepared.key.to_vec(),
-            size: prepared.mmcs.total_len
+            size: prepared.mmcs.total_len,
         })
     }
 
     // request to get and download attachment from MMCS
-    pub async fn get_attachment(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+    pub async fn get_attachment(
+        &self,
+        apns: &APSConnectionResource,
+        writer: impl Write + Send + Sync,
+        progress: impl FnMut(usize, usize) + Send + Sync,
+    ) -> Result<(), PushError> {
         #[derive(Serialize, Deserialize)]
         struct RequestMMCSDownload {
             #[serde(rename = "mO")]
@@ -1324,10 +1655,12 @@ impl MMCSFile {
             #[serde(rename = "cB")]
             response: Data,
             #[serde(rename = "mU")]
-            object: String
+            object: String,
         }
         let mmcs_config = MMCSConfig {
-            mme_client_info: apns.os_config.get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)"),
+            mme_client_info: apns
+                .os_config
+                .get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)"),
             user_agent: apns.os_config.get_normal_ua("IMTransferAgent/1000"),
             dataclass: "com.apple.Dataclass.Messenger",
             mini_ua: apns.os_config.get_version_ua(),
@@ -1351,31 +1684,49 @@ impl MMCSFile {
                 "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
                 "x-apple-mmcs-plist-version:v1.0",
                 &header,
-                ""
-            ].join("\n"),
+                "",
+            ]
+            .join("\n"),
             v: 8,
             domain,
             cv: 2,
             i: msg_id,
-            signature: self.signature.to_vec().into()
+            signature: self.signature.to_vec().into(),
         };
 
-        info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
-        
-        let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", request_download, Some(msg_id)).await?;
+        info!(
+            "mmcs obj {} sig {}",
+            self.object,
+            encode_hex(&self.signature)
+        );
 
-        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return None
-            };
-            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-                return None
-            };
-            if c.as_unsigned_integer().unwrap() == 151 && i.as_signed_integer().unwrap() as i32 == msg_id {
-                Some(loaded)
-            } else { None }
-        }, &["com.apple.madrid"])).await?;
+        let recv = apns.subscribe().await;
+        apns.send_message("com.apple.madrid", request_download, Some(msg_id))
+            .await?;
+
+        let reader = apns
+            .wait_for_timeout(
+                recv,
+                get_message(
+                    |loaded| {
+                        let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                            return None;
+                        };
+                        let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+                            return None;
+                        };
+                        if c.as_unsigned_integer().unwrap() == 151
+                            && i.as_signed_integer().unwrap() as i32 == msg_id
+                        {
+                            Some(loaded)
+                        } else {
+                            None
+                        }
+                    },
+                    &["com.apple.madrid"],
+                ),
+            )
+            .await?;
         let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
 
         let authorized = AuthorizedOperation {
@@ -1384,7 +1735,19 @@ impl MMCSFile {
             dsid: apns_response.object,
         };
 
-        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container, None)], progress, false).await?;
+        get_mmcs(
+            &mmcs_config,
+            authorized,
+            vec![(
+                self.signature.clone(),
+                &self.object,
+                recieve_container,
+                None,
+            )],
+            progress,
+            false,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1393,8 +1756,20 @@ impl MMCSFile {
 #[repr(C)]
 #[derive(Clone, Serialize, Deserialize)]
 pub enum AttachmentType {
-    Inline(#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>),
-    MMCS(MMCSFile)
+    Inline(
+        #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>,
+    ),
+    MMCS(MMCSFile),
+}
+
+fn normalize_sms_handle(handle: &str) -> String {
+    if handle.starts_with('+') {
+        format!("tel:{handle}")
+    } else if handle.len() >= 8 && handle.bytes().all(|b| b.is_ascii_digit()) {
+        format!("tel:+{handle}")
+    } else {
+        format!("tel:{handle}") // short code or alphanumeric sender -- leave alone
+    }
 }
 
 #[repr(C)]
@@ -1405,12 +1780,19 @@ pub struct Attachment {
     pub uti_type: String,
     pub mime: String,
     pub name: String,
-    pub iris: bool // or live photo
+    pub iris: bool, // or live photo
 }
 
 impl Attachment {
-
-    pub async fn new_mmcs(apns: &APSConnectionResource, prepared: &AttachmentPreparedPut, reader: impl Read + Send + Sync, mime: &str, uti: &str, name: &str, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<Attachment, PushError> {
+    pub async fn new_mmcs(
+        apns: &APSConnectionResource,
+        prepared: &AttachmentPreparedPut,
+        reader: impl Read + Send + Sync,
+        mime: &str,
+        uti: &str,
+        name: &str,
+        progress: impl FnMut(usize, usize) + Send + Sync,
+    ) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
@@ -1418,65 +1800,72 @@ impl Attachment {
             uti_type: uti.to_string(),
             mime: mime.to_string(),
             name: name.to_string(),
-            iris: false
+            iris: false,
         })
     }
 
     pub fn get_size(&self) -> usize {
         match &self.a_type {
             AttachmentType::Inline(data) => data.len(),
-            AttachmentType::MMCS(mmcs) => mmcs.size
+            AttachmentType::MMCS(mmcs) => mmcs.size,
         }
     }
 
-    pub async fn get_attachment(&self, apns: &APSConnectionResource, mut writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+    pub async fn get_attachment(
+        &self,
+        apns: &APSConnectionResource,
+        mut writer: impl Write + Send + Sync,
+        progress: impl FnMut(usize, usize) + Send + Sync,
+    ) -> Result<(), PushError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 writer.write_all(&data.clone())?;
                 Ok(())
-            },
-            AttachmentType::MMCS(mmcs) => {
-                mmcs.get_attachment(apns, writer, progress).await
             }
+            AttachmentType::MMCS(mmcs) => mmcs.get_attachment(apns, writer, progress).await,
         }
     }
 }
 
 // file should be 570x570 png
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IconChangeMessage {
     pub file: Option<MMCSFile>,
     pub group_version: u64,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UpdateExtensionMessage {
     pub for_uuid: String,
     pub ext: PartExtension,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DeleteTarget {
     Chat(OperatedChat),
-    Messages(Vec<String>)
+    Messages(Vec<String>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MoveToRecycleBinMessage {
     pub target: DeleteTarget,
     pub recoverable_delete_date: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PermanentDeleteMessage {
     pub target: DeleteTarget,
     pub is_scheduled: bool,
 }
 
-
+<<<<<<< HEAD
 #[derive(Clone)]
+=======
+
+#[derive(Clone, Serialize, Deserialize)]
+>>>>>>> origin/master
 pub struct UpdateProfileMessage {
     pub profile: Option<ShareProfileMessage>,
     pub share_contacts: bool,
@@ -1489,7 +1878,7 @@ pub struct SharedPoster {
     #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
     pub wallpaper_tag: Vec<u8>,
     #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
-    pub message_tag: Vec<u8>, 
+    pub message_tag: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1531,7 +1920,7 @@ pub enum SetTranscriptBackgroundMessage {
         bid: u64, // sequence number
         #[serde(rename = "cid")]
         chat_id: Option<String>,
-        
+
         #[serde(rename = "traboid")]
         object_id: String,
         #[serde(rename = "trabapv")]
@@ -1546,55 +1935,62 @@ pub enum SetTranscriptBackgroundMessage {
         key: String,
         #[serde(rename = "trabafs")]
         file_size: usize,
-    }
+    },
 }
 
 impl SetTranscriptBackgroundMessage {
     pub fn to_mmcs(&self) -> Option<MMCSFile> {
         match self {
             Self::Remove { .. } => None,
-            Self::Set { object_id, url, signature, key, file_size, .. } => Some(MMCSFile { 
-                signature: base64_decode(&signature), 
-                object: object_id.to_string(), 
-                url: url.to_string(), 
-                key: base64_decode(&key)[1..].to_vec(), 
+            Self::Set {
+                object_id,
+                url,
+                signature,
+                key,
+                file_size,
+                ..
+            } => Some(MMCSFile {
+                signature: base64_decode(&signature),
+                object: object_id.to_string(),
+                url: url.to_string(),
+                key: base64_decode(&key)[1..].to_vec(),
                 size: *file_size, // not used?? better hope not
-            })
+            }),
         }
     }
 
     pub fn from_mmcs(file: Option<MMCSFile>, version: u64, chat_id: Option<String>) -> Self {
         match file {
             None => Self::Remove {
-                aid: 1, 
-                bid: version, 
-                chat_id, 
+                aid: 1,
+                bid: version,
+                chat_id,
                 remove: true,
             },
-            Some(file) => Self::Set { 
-                aid: 1, 
-                bid: version, 
-                chat_id, 
-                object_id: file.object, 
-                payload_version: 1, 
-                background_id: Uuid::new_v4().to_string().to_uppercase(), 
-                url: file.url, 
-                signature: base64_encode(&file.signature), 
-                key: base64_encode(&[vec![0x00], file.key].concat()), 
+            Some(file) => Self::Set {
+                aid: 1,
+                bid: version,
+                chat_id,
+                object_id: file.object,
+                payload_version: 1,
+                background_id: Uuid::new_v4().to_string().to_uppercase(),
+                url: file.url,
+                signature: base64_encode(&file.signature),
+                key: base64_encode(&[vec![0x00], file.key].concat()),
                 file_size: file.size,
-            }
+            },
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TypingApp {
     pub bundle_id: String,
     pub icon: Vec<u8>,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Message {
     Message(NormalMessage),
     RenameMessage(RenameMessage),
@@ -1610,7 +2006,7 @@ pub enum Message {
     MessageReadOnDevice,
     SmsConfirmSent(bool /* status */),
     MarkUnread, // send for last message from other participant
-    PeerCacheInvalidate,
+    PeerCacheInvalidate, // also should re-emit profile photo, if any.
     UpdateExtension(UpdateExtensionMessage),
     Error(ErrorMessage),
     MoveToRecycleBin(MoveToRecycleBinMessage),
@@ -1622,8 +2018,8 @@ pub enum Message {
     ShareProfile(ShareProfileMessage),
     NotifyAnyways,
     SetTranscriptBackground(SetTranscriptBackgroundMessage),
+    RecoverProfile,
 }
-
 
 impl Message {
     // also add new C values to client.rs raw_inbound
@@ -1632,7 +2028,11 @@ impl Message {
             Self::Message(msg) => {
                 match &msg.service {
                     MessageType::IMessage => 100,
-                    MessageType::SMS { is_phone: _, using_number: _, from_handle } => {
+                    MessageType::SMS {
+                        is_phone: _,
+                        using_number: _,
+                        from_handle,
+                    } => {
                         if let Some(_) = from_handle {
                             // forwarded message
                             if msg.parts.has_attachments() {
@@ -1650,7 +2050,7 @@ impl Message {
                         }
                     }
                 }
-            },
+            }
             Self::React(_) => 100,
             Self::RenameMessage(_) => 190,
             Self::ChangeParticipants(_) => 190,
@@ -1662,7 +2062,13 @@ impl Message {
             Self::IconChange(_) => 190,
             Self::EnableSmsActivation(_) => 145,
             Self::MessageReadOnDevice => 147,
-            Self::SmsConfirmSent(status) => if *status { 146 } else { 149 },
+            Self::SmsConfirmSent(status) => {
+                if *status {
+                    146
+                } else {
+                    149
+                }
+            }
             Self::MarkUnread => 111,
             Self::PeerCacheInvalidate => 130,
             Self::UpdateExtension(_) => 122,
@@ -1676,36 +2082,56 @@ impl Message {
             Self::ShareProfile(_) => 131,
             Self::NotifyAnyways => 113,
             Self::SetTranscriptBackground(_) => 138,
+            Self::RecoverProfile => 180,
         }
     }
 
     pub fn should_send_delivered(&self, conversation: &ConversationData) -> bool {
         match &self {
-            Message::Message(message) => matches!(message.service, MessageType::IMessage) && !conversation.is_group(),
+            Message::Message(message) => {
+                matches!(message.service, MessageType::IMessage) && !conversation.is_group()
+            }
             Message::React(_) => conversation.is_group(),
             Message::UpdateProfile(_) => true,
-            _ => false
+            _ => false,
         }
     }
 
     pub fn is_sms(&self) -> bool {
         match &self {
-            Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _, from_handle: _ }),
+            Message::Message(message) => matches!(
+                message.service,
+                MessageType::SMS {
+                    is_phone: _,
+                    using_number: _,
+                    from_handle: _
+                }
+            ),
             Message::SmsConfirmSent(_) => true,
-            _ => false
+            _ => false,
         }
     }
 
     pub fn ids_scheduled_ms(&self) -> Option<u64> {
         match &self {
-            Message::Message(NormalMessage { scheduled: Some(ScheduleMode { ms, schedule: true }), .. }) => Some(*ms),
+            Message::Message(NormalMessage {
+                scheduled: Some(ScheduleMode { ms, schedule: true }),
+                ..
+            }) => Some(*ms),
             _ => None,
         }
     }
 
     pub fn should_schedule(&self) -> bool {
         match &self {
-            Message::Message(NormalMessage { scheduled: Some(ScheduleMode { ms: _, schedule: false }), .. }) => false,
+            Message::Message(NormalMessage {
+                scheduled:
+                    Some(ScheduleMode {
+                        ms: _,
+                        schedule: false,
+                    }),
+                ..
+            }) => false,
             _ => true,
         }
     }
@@ -1714,24 +2140,26 @@ impl Message {
         match &self {
             Message::UpdateProfile(_) => Dictionary::from_iter([
                 ("pID", Value::Dictionary(Dictionary::new())),
-                ("Dc", Value::Dictionary(Dictionary::from_iter([
-                    ("c", Value::Integer(70000.into()))
-                ]))),
+                (
+                    "Dc",
+                    Value::Dictionary(Dictionary::from_iter([("c", Value::Integer(70000.into()))])),
+                ),
             ]),
-            Message::UpdateProfileSharing(_) => Dictionary::from_iter([
+            Message::UpdateProfileSharing(_) | Message::RecoverProfile => Dictionary::from_iter([
                 ("gC", Value::Integer(70000.into())),
                 ("pID", Value::Dictionary(Dictionary::new())),
             ]),
-            Message::Message(NormalMessage { service: MessageType::SMS { .. }, .. }) => Dictionary::from_iter([
-                ("htu", Value::Boolean(true)),
-            ]),
+            Message::Message(NormalMessage {
+                service: MessageType::SMS { .. },
+                ..
+            }) => Dictionary::from_iter([("htu", Value::Boolean(true))]),
             _ => Default::default(),
         }
     }
-    
+
     pub fn get_nr(&self) -> Option<bool> {
         if self.is_sms() {
-            return Some(true)
+            return Some(true);
         }
         match self {
             Self::Typing(_, _) => Some(true),
@@ -1750,7 +2178,12 @@ impl Message {
             Self::UpdateProfileSharing(_) => Some(true),
             Self::NotifyAnyways => Some(true),
             Self::SetTranscriptBackground(_) => Some(true),
+<<<<<<< HEAD
+            _ => None,
+=======
+            Self::RecoverProfile => Some(true),
             _ => None
+>>>>>>> origin/master
         }
     }
 }
@@ -1760,100 +2193,124 @@ impl fmt::Display for Message {
         match self {
             Message::Message(msg) => {
                 write!(f, "{}", msg.parts.raw_text())
-            },
+            }
             Message::RenameMessage(msg) => {
                 write!(f, "renamed the chat to {}", msg.new_name)
-            },
+            }
             Message::ChangeParticipants(msg) => {
                 write!(f, "changed participants {:?}", msg.new_participants)
-            },
+            }
             Message::React(msg) => {
                 write!(f, "{}", msg.get_text())
-            },
+            }
             Message::Read => {
                 write!(f, "read")
-            },
+            }
             Message::Delivered => {
                 write!(f, "delivered")
-            },
+            }
             Message::Typing(typing, _) => {
                 write!(f, "{}", if *typing { "typing" } else { "stopped typing" })
-            },
+            }
             Message::Edit(e) => {
                 write!(f, "Edited {}", e.new_parts.raw_text())
-            },
+            }
             Message::Unsend(_e) => {
                 write!(f, "unsent a message")
-            },
+            }
             Message::IconChange(_e) => {
                 write!(f, "changed the group icon")
-            },
+            }
             Message::EnableSmsActivation(enabled) => {
-                write!(f, "{} sms activation", if *enabled { "enabled" } else { "disabled" })
-            },
+                write!(
+                    f,
+                    "{} sms activation",
+                    if *enabled { "enabled" } else { "disabled" }
+                )
+            }
             Message::MessageReadOnDevice => {
                 write!(f, "confirmed sms activation")
-            },
+            }
             Message::SmsConfirmSent(status) => {
-                write!(f, "confirmed sms send as {}", if *status { "success" } else { "failure" })
-            },
+                write!(
+                    f,
+                    "confirmed sms send as {}",
+                    if *status { "success" } else { "failure" }
+                )
+            }
             Message::MarkUnread => {
                 write!(f, "marked unread")
-            },
+            }
             Message::PeerCacheInvalidate => {
                 write!(f, "logged in on a new device")
-            },
+            }
             Message::UpdateExtension(_) => {
                 write!(f, "updated an extension")
-            },
+            }
             Message::Error(_) => {
                 write!(f, "failed to receive our message")
-            },
+            }
             Message::MoveToRecycleBin(_) => {
                 write!(f, "Moved a message to the recycle bin")
-            },
+            }
             Message::RecoverChat(_) => {
                 write!(f, "Recovered from the recycle bin")
-            },
+            }
             Message::PermanentDelete(_) => {
                 write!(f, "Permanent delete chat")
-            },
+            }
             Message::Unschedule => {
                 write!(f, "Unscheduled a message")
-            },
+            }
             Message::UpdateProfile(i) => {
-                write!(f, "{}", if i.profile.is_some() { "Updated their profile" } else { "Deleted their profile" })
-            },
+                write!(
+                    f,
+                    "{}",
+                    if i.profile.is_some() {
+                        "Updated their profile"
+                    } else {
+                        "Deleted their profile"
+                    }
+                )
+            }
             Message::ShareProfile(_) => {
                 write!(f, "Shared their profile")
-            },
+            }
             Message::UpdateProfileSharing(_) => {
                 write!(f, "Shared to someone else")
-            },
+            }
             Message::NotifyAnyways => {
                 write!(f, "Notify anyways")
-            },
+            }
             Message::SetTranscriptBackground(_) => {
                 write!(f, "Changed the transcript background")
+            },
+            Message::RecoverProfile => {
+                write!(f, "Recovered a profile")
             }
         }
     }
 }
 
-
 fn remove_prefix(participants: &[String]) -> Vec<String> {
-    participants.iter().map(|p| 
-        p.replace("mailto:", "").replace("tel:", "")).collect()
+    participants
+        .iter()
+        .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+        .collect()
 }
 
 pub fn add_prefix(participants: &[String]) -> Vec<String> {
-    participants.iter().map(|p| if p.contains("@") {
-        format!("mailto:{}", p)
-    } else {
-        format!("tel:{}", p)
-    }).collect()
+    participants
+        .iter()
+        .map(|p| {
+            if p.contains("@") {
+                format!("mailto:{}", p)
+            } else {
+                format!("tel:{}", p)
+            }
+        })
+        .collect()
 }
-
 
 // defined in rawmessages
 impl BaseBalloonBody {
@@ -1903,7 +2360,7 @@ impl From<MMCSFile> for RawMMCSBalloon {
 
 // a message that can be sent to other iMessage users
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MessageInst {
     pub id: String,
     pub sender: Option<String>,
@@ -1917,7 +2374,6 @@ pub struct MessageInst {
 }
 
 impl MessageInst {
-
     pub fn new(conversation: ConversationData, sender: &str, message: Message) -> MessageInst {
         MessageInst {
             sender: Some(sender.to_string()),
@@ -1936,19 +2392,25 @@ impl MessageInst {
         match &self.message {
             Message::Read => false,
             Message::Delivered => false,
-            Message::Typing(typing, app) => self.conversation.as_ref().is_some_and(|a| a.participants.len() > 2) || app.is_some() || !*typing,
+            Message::Typing(typing, app) => {
+                self.conversation
+                    .as_ref()
+                    .is_some_and(|a| a.participants.len() > 2)
+                    || app.is_some()
+                    || !*typing
+            }
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
             Message::Unschedule => false,
             Message::NotifyAnyways => false,
-            _ => true
+            _ => true,
         }
     }
 
     pub fn get_ex(&self) -> Option<u32> {
         match &self.message {
             Message::Typing(_, _) => Some(0),
-            _ => None
+            _ => None,
         }
     }
 
@@ -1957,8 +2419,13 @@ impl MessageInst {
         if conversation.sender_guid.is_none() {
             conversation.sender_guid = Some(Uuid::new_v4().to_string());
         }
-        if !conversation.participants.contains(self.sender.as_ref().unwrap()) {
-            conversation.participants.push(self.sender.as_ref().unwrap().clone());
+        if !conversation
+            .participants
+            .contains(self.sender.as_ref().unwrap())
+        {
+            conversation
+                .participants
+                .push(self.sender.as_ref().unwrap().clone());
         }
 
         self.sent_timestamp = duration_since_epoch().as_millis() as u64;
@@ -1970,14 +2437,12 @@ impl MessageInst {
         let mut target_participants = self.conversation.as_ref().unwrap().participants.clone();
         if let Message::Delivered | Message::Typing(_, _) = self.message {
             // do not send delivery reciepts to other devices on same acct
-            target_participants.retain(|p| {
-                !my_handles.contains(p)
-            });
+            target_participants.retain(|p| !my_handles.contains(p));
         }
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }
-        
+
         if let Message::ChangeParticipants(change) = &self.message {
             // notify the all participants that they were added
             for participant in &change.new_participants {
@@ -1992,7 +2457,12 @@ impl MessageInst {
 
     // if *schedule* is false, returns the local [user devices] representation of the message
     #[async_recursion]
-    pub async fn get_ids(&self, my_handles: &[String], apns: &APSConnectionResource, schedule: bool) -> Result<IDSSendMessage, PushError> {
+    pub async fn get_ids(
+        &self,
+        my_handles: &[String],
+        apns: &APSConnectionResource,
+        schedule: bool,
+    ) -> Result<IDSSendMessage, PushError> {
         if !schedule {
             if let Message::Unschedule = &self.message {
                 let message = MessageInst {
@@ -2000,7 +2470,12 @@ impl MessageInst {
                     id: Uuid::new_v4().to_string().to_uppercase(),
                     sent_timestamp: 0,
                     send_delivered: false,
-                    conversation: Some(ConversationData { participants: vec![], cv_name: None, sender_guid: None, after_guid: None, }),
+                    conversation: Some(ConversationData {
+                        participants: vec![],
+                        cv_name: None,
+                        sender_guid: None,
+                        after_guid: None,
+                    }),
                     message: Message::PermanentDelete(PermanentDeleteMessage {
                         is_scheduled: true,
                         target: DeleteTarget::Messages(vec![self.id.clone()]),
@@ -2022,20 +2497,38 @@ impl MessageInst {
 
         Ok(IDSSendMessage {
             sender: self.sender.as_ref().unwrap().to_string(),
-            raw: if self.has_payload() { Raw::Body(self.to_raw(&my_handles, apns, schedule).await?) } else { Raw::None },
+            raw: if self.has_payload() {
+                Raw::Body(self.to_raw(&my_handles, apns, schedule).await?)
+            } else {
+                Raw::None
+            },
             send_delivered: self.send_delivered,
             command: self.message.get_c(),
             no_response: self.message.get_nr() == Some(true),
             id: self.id.clone(),
-            scheduled_ms: if schedule { self.message.ids_scheduled_ms() } else { None },
-            queue_id: if schedule && self.is_queued() { Some(self.queue_id()) } else { None },
+            scheduled_ms: if schedule {
+                self.message.ids_scheduled_ms()
+            } else {
+                None
+            },
+            queue_id: if schedule && self.is_queued() {
+                Some(self.queue_id())
+            } else {
+                None
+            },
             relay: None,
             extras: extras,
         })
     }
 
     pub fn is_queued(&self) -> bool {
-        matches!(self.message, Message::Message(NormalMessage { scheduled: Some(_), .. }) | Message::Unschedule)
+        matches!(
+            self.message,
+            Message::Message(NormalMessage {
+                scheduled: Some(_),
+                ..
+            }) | Message::Unschedule
+        )
     }
 
     pub fn queue_id(&self) -> String {
@@ -2043,7 +2536,12 @@ impl MessageInst {
         base64_encode(&sha256(data.as_bytes()))
     }
 
-    pub async fn to_raw(&self, my_handles: &[String], apns: &APSConnectionResource, scheduled: bool) -> Result<Vec<u8>, PushError> {
+    pub async fn to_raw(
+        &self,
+        my_handles: &[String],
+        apns: &APSConnectionResource,
+        scheduled: bool,
+    ) -> Result<Vec<u8>, PushError> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -2055,13 +2553,11 @@ impl MessageInst {
                     new_name: msg.new_name.clone(),
                     old_name: conversation.cv_name.clone(),
                     name: Some(msg.new_name.clone()),
-                    msg_type: "n".to_string()
+                    msg_type: "n".to_string(),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
-            Message::SetTranscriptBackground(back) => {
-                plist_to_bin(&back).unwrap()
             }
+            Message::SetTranscriptBackground(back) => plist_to_bin(&back).unwrap(),
             Message::UpdateExtension(ext) => {
                 let raw = RawUpdateExtensionMessage {
                     version: "1".to_string(),
@@ -2069,44 +2565,70 @@ impl MessageInst {
                     new_info: plist::to_value(&ext.ext)?,
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::EnableSmsActivation(enabled) => {
                 if *enabled {
                     let raw = RawSmsActivateMessage {
                         wc: false,
-                        ar: true
+                        ar: true,
                     };
                     plist_to_bin(&raw).unwrap()
                 } else {
-                    let raw = RawSmsDeactivateMessage {
-                        ue: true
-                    };
+                    let raw = RawSmsDeactivateMessage { ue: true };
                     plist_to_bin(&raw).unwrap()
                 }
-            },
+            }
             Message::SmsConfirmSent(_success /* handled as c */) => {
                 let raw = RawSmsConfirmSent {
-                    msg_id: self.id.clone()
+                    msg_id: self.id.clone(),
                 };
                 plist_to_bin(&raw).unwrap()
+<<<<<<< HEAD
+            }
+=======
             },
-            Message::UpdateProfile(update) => {
-                let raw = RawProfileUpdateMessage {
-                    profile: RawProfileUpdate {
-                        share_automatically: if update.share_contacts { 1 } else { 2 },
-                        key: update.profile.as_ref().map(|a| a.cloud_kit_decryption_record_key.clone().into()),
-                        enabled: update.profile.is_some(),
-                        record_id: update.profile.as_ref().map(|a| a.cloud_kit_record_key.clone()),
-                        unk2: true,
-                        unk3: Some(true),
-                        wallpaper_data_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.wallpaper_tag.clone().into())),
-                        low_res_wallpaper_data_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.low_res_wallpaper_tag.clone().into())),
-                        wallpaper_meta_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.message_tag.clone().into())),
+            Message::RecoverProfile => {
+                let raw = RawProfileRecoveryMessage {
+                    profile: RawProfileRecovery {
+                        recover: true,
                     },
                     unk1: 70000,
                 };
                 plist_to_bin(&raw).unwrap()
             },
+>>>>>>> origin/master
+            Message::UpdateProfile(update) => {
+                let raw = RawProfileUpdateMessage {
+                    profile: RawProfileUpdate {
+                        share_automatically: if update.share_contacts { 1 } else { 2 },
+                        key: update
+                            .profile
+                            .as_ref()
+                            .map(|a| a.cloud_kit_decryption_record_key.clone().into()),
+                        enabled: update.profile.is_some(),
+                        record_id: update
+                            .profile
+                            .as_ref()
+                            .map(|a| a.cloud_kit_record_key.clone()),
+                        unk2: true,
+                        unk3: Some(true),
+                        wallpaper_data_key: update.profile.as_ref().and_then(|a| {
+                            a.poster.as_ref().map(|a| a.wallpaper_tag.clone().into())
+                        }),
+                        low_res_wallpaper_data_key: update.profile.as_ref().and_then(|a| {
+                            a.poster
+                                .as_ref()
+                                .map(|a| a.low_res_wallpaper_tag.clone().into())
+                        }),
+                        wallpaper_meta_key: update
+                            .profile
+                            .as_ref()
+                            .and_then(|a| a.poster.as_ref().map(|a| a.message_tag.clone().into())),
+                    },
+                    unk1: 70000,
+                };
+                plist_to_bin(&raw).unwrap()
+            }
             Message::UpdateProfileSharing(update) => {
                 let raw = RawProfileSharingUpdateMessage {
                     profile: update.clone(),
@@ -2114,38 +2636,62 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             }
-            Message::ShareProfile(share) => {
-                plist_to_bin(&RawShareProfileMessage {
-                    cloud_kit_decryption_record_key: share.cloud_kit_decryption_record_key.clone().into(),
-                    cloud_kit_record_key: share.cloud_kit_record_key.clone(),
-                    wallpaper_message_tag: share.poster.as_ref().map(|p| p.message_tag.clone().into()),
-                    wallpaper_tag: share.poster.as_ref().map(|p| p.wallpaper_tag.clone().into()),
-                    low_res_wallpaper_tag: share.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into()),
-                    wallpaper_update_key: if share.poster.is_some() { Some("YES".to_string()) } else { None },
-                    update_info_included: if share.poster.is_some() { Some(15) } else { None },
-                }).unwrap()
-            }
+            Message::ShareProfile(share) => plist_to_bin(&RawShareProfileMessage {
+                cloud_kit_decryption_record_key: share
+                    .cloud_kit_decryption_record_key
+                    .clone()
+                    .into(),
+                cloud_kit_record_key: share.cloud_kit_record_key.clone(),
+                wallpaper_message_tag: share.poster.as_ref().map(|p| p.message_tag.clone().into()),
+                wallpaper_tag: share
+                    .poster
+                    .as_ref()
+                    .map(|p| p.wallpaper_tag.clone().into()),
+                low_res_wallpaper_tag: share
+                    .poster
+                    .as_ref()
+                    .map(|p| p.low_res_wallpaper_tag.clone().into()),
+                wallpaper_update_key: if share.poster.is_some() {
+                    Some("YES".to_string())
+                } else {
+                    None
+                },
+                update_info_included: if share.poster.is_some() {
+                    Some(15)
+                } else {
+                    None
+                },
+            })
+            .unwrap(),
             Message::MarkUnread => {
                 let raw = RawMarkUnread {
-                    msg_id: self.id.clone()
+                    msg_id: self.id.clone(),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::Typing(typing, app) => {
                 let raw = RawEncryptedTyping {
                     participants: Some(conversation.participants.clone()),
                     sender_guid: conversation.sender_guid.clone(),
                     pv: 0,
                     gv: "8".to_string(),
-                    v: if !*typing { Some("1".to_string()) } else { None },
+                    v: if !*typing {
+                        Some("1".to_string())
+                    } else {
+                        None
+                    },
                     cv_name: conversation.cv_name.clone(),
-                    gt: if conversation.participants.len() > 2 { Some(true) } else { None },
+                    gt: if conversation.participants.len() > 2 {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     u: if *typing { Some(true) } else { None },
                     bundle_id: app.as_ref().map(|a| a.bundle_id.clone()),
                     icon: app.as_ref().map(|a| gzip(&a.icon).unwrap().into()),
                     ..Default::default()
                 };
-        
+
                 plist_to_bin(&raw).unwrap()
             }
             Message::ChangeParticipants(msg) => {
@@ -2157,10 +2703,10 @@ impl MessageInst {
                     new_name: conversation.cv_name.clone(),
                     name: conversation.cv_name.clone(),
                     msg_type: "p".to_string(),
-                    group_version: msg.group_version
+                    group_version: msg.group_version,
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::React(react) => {
                 let text = react.get_text();
 
@@ -2168,9 +2714,24 @@ impl MessageInst {
                 let mut balloon_name: Option<String> = None;
                 let mut balloon_part: Option<Vec<u8>> = None;
                 let mut app_info: Option<Data> = None;
-                if let ReactMessageType::Extension { spec: app_obj, body: _, .. } = &react.reaction {
+<<<<<<< HEAD
+                if let ReactMessageType::Extension {
+                    spec: app_obj,
+                    body: _,
+                    ..
+                } = &react.reaction
+                {
                     let (app, balloon) = app_obj.to_raw()?;
+                    app_info = if balloon.is_none() {
+                        Some(app.into())
+                    } else {
+                        None
+                    };
+=======
+                if let ReactMessageType::Extension { spec: app_obj, body: _, .. } = &react.reaction {
+                    let (app, balloon) = app_obj.to_raw(false)?;
                     app_info = if balloon.is_none() { Some(app.into()) } else { None };
+>>>>>>> origin/master
                     balloon_part = balloon;
                     balloon_id = Some(app_obj.bundle_id.clone());
                     balloon_name = Some(app_obj.name.clone());
@@ -2184,7 +2745,11 @@ impl MessageInst {
 
                 let raw = RawReactMessage {
                     text: text,
-                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
+                    amrln: if react.to_part.is_none() {
+                        u64::MAX
+                    } else {
+                        react.to_text.len() as u64
+                    },
                     amrlc: 0,
                     amt: react.reaction.get_cmd(),
                     participants: conversation.participants.clone(),
@@ -2195,30 +2760,109 @@ impl MessageInst {
                     gv: "8".to_string(),
                     v: "1".to_string(),
                     cv_name: conversation.cv_name.clone(),
-                    notification: if react.reaction.notification() { Some(plist_to_bin(&NotificationData {
-                        ams: react.to_text.clone(),
-                        amc: if balloon_name.is_some() { 9 } else { 1 },
-                        amd: balloon_name,
-                        amb: balloon_id.clone(),
-                    }).unwrap().into()) } else { None },
-                    amk: if let Some(part) = react.to_part { format!("p:{}/{}", part, react.to_uuid) } else { react.to_uuid.clone() },
+                    notification: if react.reaction.notification() {
+                        Some(
+                            plist_to_bin(&NotificationData {
+                                ams: react.to_text.clone(),
+                                amc: if balloon_name.is_some() { 9 } else { 1 },
+                                amd: balloon_name,
+                                amb: balloon_id.clone(),
+                            })
+                            .unwrap()
+                            .into(),
+                        )
+                    } else {
+                        None
+                    },
+                    amk: if let Some(part) = react.to_part {
+                        format!("p:{}/{}", part, react.to_uuid)
+                    } else {
+                        react.to_uuid.clone()
+                    },
                     type_spec: app_info,
                     xml: react.reaction.get_xml(),
                     prid: react.reaction.prid(),
                     balloon_id,
                     balloon_part,
                     balloon_part_mmcs,
-                    are: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
-                    arc: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
-                    cloud_kit_decryption_record_key: react.embedded_profile.as_ref().map(|p| p.cloud_kit_decryption_record_key.clone().into()),
-                    cloud_kit_record_key: react.embedded_profile.as_ref().map(|p| p.cloud_kit_record_key.clone()),
-                    wallpaper_message_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
-                    wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.wallpaper_tag.clone().into())),
-                    low_res_wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into())),
-                    wallpaper_update_key: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
-                    update_info_included: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
+                    are: if react.reaction.is_balloon() {
+                        Some("".to_string())
+                    } else {
+                        None
+                    },
+                    arc: if react.reaction.is_balloon() {
+                        Some("".to_string())
+                    } else {
+                        None
+                    },
+                    cloud_kit_decryption_record_key: react
+                        .embedded_profile
+                        .as_ref()
+                        .map(|p| p.cloud_kit_decryption_record_key.clone().into()),
+                    cloud_kit_record_key: react
+                        .embedded_profile
+                        .as_ref()
+                        .map(|p| p.cloud_kit_record_key.clone()),
+                    wallpaper_message_tag: react
+                        .embedded_profile
+                        .as_ref()
+                        .and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
+                    wallpaper_tag: react
+                        .embedded_profile
+                        .as_ref()
+                        .and_then(|p| p.poster.as_ref().map(|p| p.wallpaper_tag.clone().into())),
+                    low_res_wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| {
+                        p.poster
+                            .as_ref()
+                            .map(|p| p.low_res_wallpaper_tag.clone().into())
+                    }),
+                    wallpaper_update_key: react.embedded_profile.as_ref().and_then(|p| {
+                        if p.poster.is_some() {
+                            Some("YES".to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                    update_info_included: react.embedded_profile.as_ref().and_then(|p| {
+                        if p.poster.is_some() {
+                            Some(15)
+                        } else {
+                            None
+                        }
+                    }),
                 };
                 plist_to_bin(&raw).unwrap()
+<<<<<<< HEAD
+            }
+            Message::Message(normal) => match &normal.service {
+                MessageType::IMessage => {
+                    let mut balloon_id: Option<String> = None;
+                    let mut balloon_part: Option<Vec<u8>> = None;
+                    let mut app_info: Option<Data> = None;
+                    if let Some(app_obj) = &normal.app {
+                        let (app, balloon) = app_obj.to_raw()?;
+                        app_info = Some(app.into());
+                        balloon_part = balloon;
+                        balloon_id = Some(app_obj.bundle_id.clone());
+                    }
+                    if let Some(link_meta) = &normal.link_meta {
+                        balloon_id = Some("com.apple.messages.URLBalloonProvider".to_string());
+                        balloon_part = Some(gzip(
+                            &BaseBalloonBody {
+                                attachments: link_meta
+                                    .attachments
+                                    .clone()
+                                    .into_iter()
+                                    .map(|i| i.into())
+                                    .collect(),
+                                payload: plist_to_bin(&KeyedArchive::archive_item(
+                                    plist::to_value(&RichLink {
+                                        rich_link_is_placeholder: true,
+                                        rich_link_metadata: link_meta.data.clone(),
+                                    })?,
+                                )?)?
+                                .into(),
+=======
             },
             Message::Message (normal) => {
                 match &normal.service {
@@ -2227,7 +2871,7 @@ impl MessageInst {
                         let mut balloon_part: Option<Vec<u8>> = None;
                         let mut app_info: Option<Data> = None;
                         if let Some(app_obj) = &normal.app {
-                            let (app, balloon) = app_obj.to_raw()?;
+                            let (app, balloon) = app_obj.to_raw(false)?;
                             app_info = Some(app.into());
                             balloon_part = balloon;
                             balloon_id = Some(app_obj.bundle_id.clone());
@@ -2338,40 +2982,208 @@ impl MessageInst {
                                 plist_to_bin(&message).unwrap()
                             } else {
                                 payload
+>>>>>>> origin/master
                             }
+                            .to_bin()?,
+                        )?);
+                    }
+                    let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part
+                    {
+                        Self::put_balloon(balloon_part, apns).await?
+                    } else {
+                        (None, None)
+                    };
+                    let mut raw = RawIMessage {
+                        text: Some(normal.parts.raw_text()),
+                        xml: None,
+                        participants: conversation.participants.clone(),
+                        after_guid: conversation.after_guid.clone(),
+                        sender_guid: conversation.sender_guid.clone(),
+                        pv: 0,
+                        gv: "8".to_string(),
+                        v: "1".to_string(),
+                        effect: normal.effect.clone(),
+                        cv_name: conversation.cv_name.clone(),
+                        reply: normal.reply_guid.as_ref().map(|guid| {
+                            format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)
+                        }),
+                        inline0: None,
+                        inline1: None,
+                        live_xml: None,
+                        subject: normal.subject.clone(),
+                        app_info,
+                        balloon_id,
+                        balloon_part,
+                        balloon_part_mmcs,
+                        voice_audio: if normal.voice { Some(true) } else { None },
+                        voice_e: if normal.voice { Some(true) } else { None },
+                        schedule_date: if !scheduled {
+                            normal.scheduled.clone().map(|i| {
+                                (SystemTime::UNIX_EPOCH + Duration::from_millis(i.ms)).into()
+                            })
                         } else {
-                            let other_participants: Vec<_> = conversation.participants.iter().filter(|i| !my_handles.contains(*i)).collect();
-                            let raw = RawSmsOutgoingMessage {
-                                participants: other_participants.iter().map(|i| RawSmsParticipant {
+                            None
+                        },
+                        schedule_type: if normal.scheduled.is_some() && !scheduled {
+                            Some(2)
+                        } else {
+                            None
+                        },
+                        cloud_kit_decryption_record_key: normal
+                            .embedded_profile
+                            .as_ref()
+                            .map(|p| p.cloud_kit_decryption_record_key.clone().into()),
+                        cloud_kit_record_key: normal
+                            .embedded_profile
+                            .as_ref()
+                            .map(|p| p.cloud_kit_record_key.clone()),
+                        wallpaper_message_tag: normal
+                            .embedded_profile
+                            .as_ref()
+                            .and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
+                        wallpaper_tag: normal.embedded_profile.as_ref().and_then(|p| {
+                            p.poster.as_ref().map(|p| p.wallpaper_tag.clone().into())
+                        }),
+                        low_res_wallpaper_tag: normal.embedded_profile.as_ref().and_then(|p| {
+                            p.poster
+                                .as_ref()
+                                .map(|p| p.low_res_wallpaper_tag.clone().into())
+                        }),
+                        wallpaper_update_key: normal.embedded_profile.as_ref().and_then(|p| {
+                            if p.poster.is_some() {
+                                Some("YES".to_string())
+                            } else {
+                                None
+                            }
+                        }),
+                        update_info_included: normal.embedded_profile.as_ref().and_then(|p| {
+                            if p.poster.is_some() {
+                                Some(15)
+                            } else {
+                                None
+                            }
+                        }),
+                    };
+
+                    if normal.parts.is_multipart() {
+                        raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
+                    }
+
+                    should_gzip = !raw.xml.is_some();
+
+                    plist_to_bin(&raw).unwrap()
+                }
+                MessageType::SMS {
+                    is_phone,
+                    using_number,
+                    from_handle,
+                } => {
+                    if let Some(from_handle) = from_handle {
+                        let my_participants: Vec<_> = conversation
+                            .participants
+                            .iter()
+                            .filter(|p| *p != self.sender.as_ref().unwrap() && *p != from_handle)
+                            .map(|p| p.replace("tel:", ""))
+                            .collect();
+                        let is_mms = my_participants.len() > 1 || normal.parts.has_attachments();
+                        let (format, content) = normal.parts.to_sms(&from_handle, is_mms);
+                        let raw = RawSmsIncomingMessage {
+                            participants: if is_mms { my_participants } else { vec![] },
+                            sender: from_handle.replace("tel:", ""),
+                            fco: 1,
+                            recieved_date: (UNIX_EPOCH
+                                + Duration::from_millis(self.sent_timestamp))
+                            .into(),
+                            recieved_number: using_number.replace("tel:", ""),
+                            format,
+                            mime_type: None,
+                            constant_uuid: Uuid::new_v4().to_string().to_uppercase(),
+                            r: true,
+                            content,
+                            ssc: 0,
+                            l: 0,
+                            version: "1".to_string(),
+                            sc: Some(0),
+                            mode: if is_mms {
+                                "mms".to_string()
+                            } else {
+                                "sms".to_string()
+                            },
+                            ic: 1,
+                            n: Some("310".to_string()),
+                            guid: self.id.clone(),
+                        };
+
+                        let payload = plist_to_bin(&raw).unwrap();
+
+                        if normal.parts.has_attachments() {
+                            info!("uploading MMS to MMCS!");
+                            let mut file = Cursor::new(payload);
+                            let prepared = MMCSFile::prepare_put(&mut file).await?;
+                            file.rewind()?;
+                            let attachment =
+                                MMCSFile::new(apns, &prepared, file, |_prog, _total| {}).await?;
+                            let message = RawMmsIncomingMessage {
+                                signature: attachment.signature.into(),
+                                key: [vec![0x0], attachment.key].concat().into(),
+                                download_url: attachment.url,
+                                object_id: attachment.object,
+                                ofs: 0,
+                            };
+                            info!("finished!");
+                            plist_to_bin(&message).unwrap()
+                        } else {
+                            payload
+                        }
+                    } else {
+                        let other_participants: Vec<_> = conversation
+                            .participants
+                            .iter()
+                            .filter(|i| !my_handles.contains(*i))
+                            .collect();
+                        let raw = RawSmsOutgoingMessage {
+                            participants: other_participants
+                                .iter()
+                                .map(|i| RawSmsParticipant {
                                     phone_number: i.replace("tel:", ""),
                                     user_phone_number: None,
                                     country: None,
-                                }).collect(),
-                                ic: if *is_phone { 1 } else { 0 },
-                                already_sent: if *is_phone { Some(true) } else { None },
-                                chat_style: if other_participants.len() == 1 { "im".to_string() } else { "chat".to_string() },
-                                ro: if other_participants.len() == 1 { None } else { Some(true) },
-                                message: RawSmsOutgoingInnerMessage {
-                                    handle: if other_participants.len() == 1 {
-                                        Some(other_participants.first().unwrap().replace("tel:", ""))
-                                    } else { None },
-                                    service: "SMS".to_string(),
-                                    version: "1".to_string(),
-                                    guid: self.id.to_uppercase(),
-                                    reply_to_guid: conversation.after_guid.clone(),
-                                    plain_body: normal.parts.raw_text(),
-                                    xhtml: if normal.parts.has_attachments() {
-                                        Some(normal.parts.to_xml(None))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            
-                            should_gzip = true;
-                    
-                            plist_to_bin(&raw).unwrap()
-                        }
+                                })
+                                .collect(),
+                            ic: if *is_phone { 1 } else { 0 },
+                            already_sent: if *is_phone { Some(true) } else { None },
+                            chat_style: if other_participants.len() == 1 {
+                                "im".to_string()
+                            } else {
+                                "chat".to_string()
+                            },
+                            ro: if other_participants.len() == 1 {
+                                None
+                            } else {
+                                Some(true)
+                            },
+                            message: RawSmsOutgoingInnerMessage {
+                                handle: if other_participants.len() == 1 {
+                                    Some(other_participants.first().unwrap().replace("tel:", ""))
+                                } else {
+                                    None
+                                },
+                                service: "SMS".to_string(),
+                                version: "1".to_string(),
+                                guid: self.id.to_uppercase(),
+                                reply_to_guid: conversation.after_guid.clone(),
+                                plain_body: normal.parts.raw_text(),
+                                xhtml: if normal.parts.has_attachments() {
+                                    Some(normal.parts.to_xml(None))
+                                } else {
+                                    None
+                                },
+                            },
+                        };
+
+                        should_gzip = true;
+
+                        plist_to_bin(&raw).unwrap()
                     }
                 }
             },
@@ -2380,7 +3192,9 @@ impl MessageInst {
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),
-            Message::NotifyAnyways => { panic!("No Message body!") }
+            Message::NotifyAnyways => {
+                panic!("No Message body!")
+            }
             Message::Unschedule => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {
@@ -2391,7 +3205,7 @@ impl MessageInst {
                     v: "1".to_string(),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::Edit(msg) => {
                 let raw = RawEditMessage {
                     new_html_body: msg.new_parts.to_xml(None),
@@ -2402,7 +3216,7 @@ impl MessageInst {
                 };
 
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::IconChange(msg) => {
                 let since_the_epoch = duration_since_epoch();
                 let random_guid = Uuid::new_v4().to_string().to_uppercase();
@@ -2413,42 +3227,72 @@ impl MessageInst {
                         filename_key: "GroupPhotoImage".to_string(),
                         local_user_info: file.clone().into(),
                         transfer_guid: format!("at_0_{}", random_guid),
-                        message_guid: random_guid.clone()
+                        message_guid: random_guid.clone(),
                     }),
                     sender_guid: conversation.sender_guid.clone(),
-                    meta: if msg.file.is_none() { Some("ngp".to_string()) } else { None },
+                    meta: if msg.file.is_none() {
+                        Some("ngp".to_string())
+                    } else {
+                        None
+                    },
                     msg_type: "v".to_string(),
                     participants: remove_prefix(&conversation.participants),
                     gv: "8".to_string(),
-                    cv_name: conversation.cv_name.clone()
+                    cv_name: conversation.cv_name.clone(),
                 };
 
-                warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
+                warn!(
+                    "sent {:?}",
+                    plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap()))
+                );
 
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::MoveToRecycleBin(msg) => {
                 let raw = RawMoveToTrash {
-                    chat: if let DeleteTarget::Chat(chat) = &msg.target { vec![chat.clone()] } else { vec![] },
-                    message: if let DeleteTarget::Messages(messages) = &msg.target { messages.clone() } else { vec![] },
+                    chat: if let DeleteTarget::Chat(chat) = &msg.target {
+                        vec![chat.clone()]
+                    } else {
+                        vec![]
+                    },
+                    message: if let DeleteTarget::Messages(messages) = &msg.target {
+                        messages.clone()
+                    } else {
+                        vec![]
+                    },
                     permanent_delete_chat_metadata_array: vec![],
-                    recoverable_delete_date: Some((SystemTime::UNIX_EPOCH + Duration::from_millis(msg.recoverable_delete_date)).clone().into()),
+                    recoverable_delete_date: Some(
+                        (SystemTime::UNIX_EPOCH
+                            + Duration::from_millis(msg.recoverable_delete_date))
+                        .clone()
+                        .into(),
+                    ),
                     is_permanent_delete: false,
                     is_scheduled_message: None,
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::PermanentDelete(msg) => {
                 let raw = RawMoveToTrash {
                     chat: vec![],
-                    message: if let DeleteTarget::Messages(messages) = &msg.target { messages.clone() } else { vec![] },
-                    permanent_delete_chat_metadata_array: if let DeleteTarget::Chat(chat) = &msg.target { vec![chat.clone()] } else { vec![] },
+                    message: if let DeleteTarget::Messages(messages) = &msg.target {
+                        messages.clone()
+                    } else {
+                        vec![]
+                    },
+                    permanent_delete_chat_metadata_array: if let DeleteTarget::Chat(chat) =
+                        &msg.target
+                    {
+                        vec![chat.clone()]
+                    } else {
+                        vec![]
+                    },
                     recoverable_delete_date: None,
                     is_permanent_delete: true,
-                    is_scheduled_message: if msg.is_scheduled { Some(true) } else { None }
+                    is_scheduled_message: if msg.is_scheduled { Some(true) } else { None },
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::RecoverChat(msg) => {
                 let raw = RecoverChatMetadataArray {
                     recover_chat_metadata_array: vec![msg.clone()],
@@ -2456,8 +3300,11 @@ impl MessageInst {
                 plist_to_bin(&raw).unwrap()
             }
         };
-        debug!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
-        
+        debug!(
+            "sending: {:?}",
+            plist::Value::from_reader(Cursor::new(&binary))
+        );
+
         // do not gzip xml
         let final_msg = if !should_gzip {
             binary
@@ -2468,7 +3315,11 @@ impl MessageInst {
         Ok(final_msg)
     }
 
-    async fn get_balloon(part: Option<Data>, mmcs: Option<RawMMCSBalloon>, apns: &APSConnectionResource) -> Option<Vec<u8>> {
+    async fn get_balloon(
+        part: Option<Data>,
+        mmcs: Option<RawMMCSBalloon>,
+        apns: &APSConnectionResource,
+    ) -> Option<Vec<u8>> {
         match (part, mmcs) {
             (Some(part), None) => Some(part.into()),
             (None, Some(mmcs)) => {
@@ -2476,12 +3327,12 @@ impl MessageInst {
 
                 let mut output: Vec<u8> = vec![];
                 let mut cursor = Cursor::new(&mut output);
-                if let Err(e) = mmcs.get_attachment(apns, &mut cursor, |_,_| {}).await {
+                if let Err(e) = mmcs.get_attachment(apns, &mut cursor, |_, _| {}).await {
                     error!("failed to mmcs balloon {e}");
-                    return None
+                    return None;
                 }
                 Some(output)
-            },
+            }
             (None, None) => None,
             _ => {
                 error!("bad combo!");
@@ -2490,14 +3341,17 @@ impl MessageInst {
         }
     }
 
-    async fn put_balloon(balloon: Vec<u8>, apns: &APSConnectionResource) -> Result<(Option<Data>, Option<RawMMCSBalloon>), PushError> {
+    async fn put_balloon(
+        balloon: Vec<u8>,
+        apns: &APSConnectionResource,
+    ) -> Result<(Option<Data>, Option<RawMMCSBalloon>), PushError> {
         debug!("balloon size {:?}", balloon.len());
         // larger balloon sizes can cause issues (see: messages not sending)
         if balloon.len() > 1024 {
             let mut cursor = Cursor::new(&balloon);
             let prepared = MMCSFile::prepare_put(&mut cursor).await?;
             cursor.rewind()?;
-            let mmcs = MMCSFile::new(apns, &prepared, cursor, |_,_| {}).await?;
+            let mmcs = MMCSFile::new(apns, &prepared, cursor, |_, _| {}).await?;
             Ok((None, Some(mmcs.into())))
         } else {
             Ok((Some(balloon.into()), None))
@@ -2505,8 +3359,12 @@ impl MessageInst {
     }
 
     #[async_recursion]
-    pub async fn from_raw(value: Value, wrapper: &IDSRecvMessage, apns: &APSConnectionResource) -> Result<MessageInst, PushError> {
-        debug!("xml: {:?}",value);
+    pub async fn from_raw(
+        value: Value,
+        wrapper: &IDSRecvMessage,
+        apns: &APSConnectionResource,
+    ) -> Result<MessageInst, PushError> {
+        debug!("xml: {:?}", value);
         if let Ok(loaded) = plist::from_value::<RawSmsActivateMessage>(&value) {
             if !loaded.wc && loaded.ar {
                 return wrapper.to_message(None, Message::EnableSmsActivation(true));
@@ -2515,15 +3373,28 @@ impl MessageInst {
         if wrapper.is_typing == Some(0) {
             if let Ok(loaded) = plist::from_value::<RawEncryptedTyping>(&value) {
                 debug!("Got typing");
-                return wrapper.to_message(Some(ConversationData { 
-                    participants: loaded.participants.clone().unwrap_or(vec![wrapper.sender.clone().expect("No sender?"), wrapper.target.clone().expect("No target?")]),
-                    cv_name: loaded.cv_name.clone(),
-                    sender_guid: loaded.sender_guid.clone(),
-                    after_guid: None,
-                }), Message::Typing(loaded.u == Some(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp { 
-                    bundle_id: bid.clone(), 
-                    icon: ungzip(icon.as_ref())?, 
-                }) } else { None }));
+                return wrapper.to_message(
+                    Some(ConversationData {
+                        participants: loaded.participants.clone().unwrap_or(vec![
+                            wrapper.sender.clone().expect("No sender?"),
+                            wrapper.target.clone().expect("No target?"),
+                        ]),
+                        cv_name: loaded.cv_name.clone(),
+                        sender_guid: loaded.sender_guid.clone(),
+                        after_guid: None,
+                    }),
+                    Message::Typing(
+                        loaded.u == Some(true),
+                        if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) {
+                            Some(TypingApp {
+                                bundle_id: bid.clone(),
+                                icon: ungzip(icon.as_ref())?,
+                            })
+                        } else {
+                            None
+                        },
+                    ),
+                );
             }
         }
         if let Ok(loaded) = plist::from_value::<RawSmsDeactivateMessage>(&value) {
@@ -2541,87 +3412,172 @@ impl MessageInst {
                 return wrapper.to_message(None, Message::MarkUnread);
             }
         }
-        let shared_profile = if let Ok(loaded) = plist::from_value::<RawShareProfileMessage>(&value) {
+        let shared_profile = if let Ok(loaded) = plist::from_value::<RawShareProfileMessage>(&value)
+        {
             let shared_profile = ShareProfileMessage {
-                cloud_kit_decryption_record_key: loaded.cloud_kit_decryption_record_key.clone().into(),
+                cloud_kit_decryption_record_key: loaded
+                    .cloud_kit_decryption_record_key
+                    .clone()
+                    .into(),
                 cloud_kit_record_key: loaded.cloud_kit_record_key.clone(),
-                poster: if let (Some(w), Some(lrw), Some(m)) = (loaded.wallpaper_tag, loaded.low_res_wallpaper_tag, loaded.wallpaper_message_tag) {
+                poster: if let (Some(w), Some(lrw), Some(m)) = (
+                    loaded.wallpaper_tag,
+                    loaded.low_res_wallpaper_tag,
+                    loaded.wallpaper_message_tag,
+                ) {
                     Some(SharedPoster {
                         low_res_wallpaper_tag: lrw.into(),
                         wallpaper_tag: w.into(),
                         message_tag: m.into(),
                     })
-                } else { None }
+                } else {
+                    None
+                },
             };
             if wrapper.command == 131 {
-                return wrapper.to_message(None, Message::ShareProfile(shared_profile))
+                info!(
+                    "Parsed standalone shared profile command=131 poster={}",
+                    shared_profile.poster.is_some()
+                );
+                return wrapper.to_message(None, Message::ShareProfile(shared_profile));
             }
             if wrapper.command != 100 {
-                warn!("New profile embed??");
+                warn!(
+                    "Parsed shared profile metadata on unexpected command={} poster={}",
+                    wrapper.command,
+                    shared_profile.poster.is_some()
+                );
+            } else {
+                debug!(
+                    "Parsed embedded shared profile command=100 poster={}",
+                    shared_profile.poster.is_some()
+                );
             }
             Some(shared_profile)
-        } else { None };
+        } else {
+            None
+        };
         if let Ok(loaded) = plist::from_value::<RawMoveToTrash>(&value) {
             return match loaded {
-                RawMoveToTrash { chat, message, recoverable_delete_date: Some(recoverable_delete_date), is_permanent_delete: false, .. } => {
+                RawMoveToTrash {
+                    chat,
+                    message,
+                    recoverable_delete_date: Some(recoverable_delete_date),
+                    is_permanent_delete: false,
+                    ..
+                } => {
                     let system_time: SystemTime = recoverable_delete_date.into();
-                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage { 
-                        target: if message.len() > 0 { DeleteTarget::Messages(message) } else { DeleteTarget::Chat(chat.into_iter().next().unwrap()) }, 
-                        recoverable_delete_date: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
-                    }))
-                },
-                RawMoveToTrash { permanent_delete_chat_metadata_array, message, is_permanent_delete: true, is_scheduled_message, .. } => {
-                    wrapper.to_message(None, Message::PermanentDelete(PermanentDeleteMessage {
+                    wrapper.to_message(
+                        None,
+                        Message::MoveToRecycleBin(MoveToRecycleBinMessage {
+                            target: if message.len() > 0 {
+                                DeleteTarget::Messages(message)
+                            } else {
+                                DeleteTarget::Chat(chat.into_iter().next().unwrap())
+                            },
+                            recoverable_delete_date: system_time
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis()
+                                as u64,
+                        }),
+                    )
+                }
+                RawMoveToTrash {
+                    permanent_delete_chat_metadata_array,
+                    message,
+                    is_permanent_delete: true,
+                    is_scheduled_message,
+                    ..
+                } => wrapper.to_message(
+                    None,
+                    Message::PermanentDelete(PermanentDeleteMessage {
                         target: if permanent_delete_chat_metadata_array.len() > 0 {
-                            DeleteTarget::Chat(permanent_delete_chat_metadata_array.into_iter().next().unwrap())
+                            DeleteTarget::Chat(
+                                permanent_delete_chat_metadata_array
+                                    .into_iter()
+                                    .next()
+                                    .unwrap(),
+                            )
                         } else {
                             DeleteTarget::Messages(message)
                         },
                         is_scheduled: is_scheduled_message == Some(true),
-                    }))
-                },
-                _ => {
-                    return Err(PushError::BadMsg)
-                }
-            }
+                    }),
+                ),
+                _ => return Err(PushError::BadMsg),
+            };
         }
         if let Ok(loaded) = plist::from_value::<SetTranscriptBackgroundMessage>(&value) {
-            return wrapper.to_message(None, Message::SetTranscriptBackground(loaded))
+            return wrapper.to_message(None, Message::SetTranscriptBackground(loaded));
         }
         if let Ok(loaded) = plist::from_value::<RecoverChatMetadataArray>(&value) {
-            return wrapper.to_message(None, Message::RecoverChat(loaded.recover_chat_metadata_array.into_iter().next().unwrap()))
+            return wrapper.to_message(
+                None,
+                Message::RecoverChat(
+                    loaded
+                        .recover_chat_metadata_array
+                        .into_iter()
+                        .next()
+                        .unwrap(),
+                ),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawUnsendMessage>(&value) {
-            return wrapper.to_message(None, Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }));
+            return wrapper.to_message(
+                None,
+                Message::Unsend(UnsendMessage {
+                    tuuid: loaded.message,
+                    edit_part: loaded.part_index,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawUpdateExtensionMessage>(&value) {
-            return wrapper.to_message(None, Message::UpdateExtension(UpdateExtensionMessage { for_uuid: loaded.target_id, ext: plist::from_value(&loaded.new_info)? }));
+            return wrapper.to_message(
+                None,
+                Message::UpdateExtension(UpdateExtensionMessage {
+                    for_uuid: loaded.target_id,
+                    ext: plist::from_value(&loaded.new_info)?,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawEditMessage>(&value) {
-            return wrapper.to_message(None, Message::Edit(EditMessage {
-                tuuid: loaded.message,
-                edit_part: loaded.part_index,
-                new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
-            }))
+            return wrapper.to_message(
+                None,
+                Message::Edit(EditMessage {
+                    tuuid: loaded.message,
+                    edit_part: loaded.part_index,
+                    new_parts: MessageParts::parse_parts(&loaded.new_html_body, None),
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawChangeMessage>(&value) {
-            return wrapper.to_message(Some(ConversationData {
-                participants: add_prefix(&loaded.source_participants),
-                cv_name: loaded.name,
-                sender_guid: loaded.sender_guid.clone(),
-                after_guid: None,
-            }), Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }))
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: add_prefix(&loaded.source_participants),
+                    cv_name: loaded.name,
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: None,
+                }),
+                Message::ChangeParticipants(ChangeParticipantMessage {
+                    new_participants: add_prefix(&loaded.target_participants),
+                    group_version: loaded.group_version,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawIconChangeMessage>(&value) {
-            return wrapper.to_message(Some(ConversationData {
-                participants: add_prefix(&loaded.participants),
-                cv_name: loaded.cv_name.clone(),
-                sender_guid: loaded.sender_guid.clone(),
-                after_guid: None,
-            }), Message::IconChange(IconChangeMessage {
-                file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
-                group_version: loaded.group_version
-            }))
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: add_prefix(&loaded.participants),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: None,
+                }),
+                Message::IconChange(IconChangeMessage {
+                    file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
+                    group_version: loaded.group_version,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawProfileUpdateMessage>(&value) {
             return wrapper.to_message(None, Message::UpdateProfile(UpdateProfileMessage {
@@ -2639,45 +3595,67 @@ impl MessageInst {
                     })
                 } else { None },
                 share_contacts: loaded.profile.share_automatically == 1
-            }))
+            }));
         }
         if let Ok(loaded) = plist::from_value::<RawProfileSharingUpdateMessage>(&value) {
-            return wrapper.to_message(None, Message::UpdateProfileSharing(loaded.profile))
+            return wrapper.to_message(None, Message::UpdateProfileSharing(loaded.profile));
+        }
+        if let Ok(loaded) = plist::from_value::<RawProfileRecoveryMessage>(&value) {
+            if loaded.profile.recover {
+                return wrapper.to_message(None, Message::RecoverProfile)
+            }
         }
         if let Ok(loaded) = plist::from_value::<RawRenameMessage>(&value) {
-            return wrapper.to_message(Some(ConversationData {
-                participants: add_prefix(&loaded.participants),
-                cv_name: loaded.old_name.clone(),
-                sender_guid: loaded.sender_guid.clone(),
-                after_guid: None,
-            }), Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }));
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: add_prefix(&loaded.participants),
+                    cv_name: loaded.old_name.clone(),
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: None,
+                }),
+                Message::RenameMessage(RenameMessage {
+                    new_name: loaded.new_name.clone(),
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawReactMessage>(&value) {
             let (to_uuid, to_part) = if loaded.amt == 2 || loaded.amt == 4000 {
                 (loaded.amk, None)
             } else {
-                let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
-                    .captures(&loaded.amk).ok_or(PushError::BadMsg)?;
-                (target_msg_data.get(2).unwrap().as_str().to_string(), Some(target_msg_data.get(1).unwrap().as_str().parse().unwrap()))
+                let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)")
+                    .unwrap()
+                    .captures(&loaded.amk)
+                    .ok_or(PushError::BadMsg)?;
+                (
+                    target_msg_data.get(2).unwrap().as_str().to_string(),
+                    Some(target_msg_data.get(1).unwrap().as_str().parse().unwrap()),
+                )
             };
-            
+
             let msg = match loaded.amt {
                 2 | 4000 => {
-                    let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
-                    let (Some(balloon), Some(balloon_id)) = (&balloon_part, &loaded.balloon_id) else {
-                        return Err(PushError::BadMsg)
+                    let balloon_part =
+                        Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns)
+                            .await;
+                    let (Some(balloon), Some(balloon_id)) = (&balloon_part, &loaded.balloon_id)
+                    else {
+                        return Err(PushError::BadMsg);
                     };
-                    
+
                     let data = ExtensionApp::from_bp(balloon, balloon_id)?;
                     ReactMessageType::Extension {
                         spec: data,
-                        body: loaded.xml.as_ref().map(|xml| MessageParts::parse_parts(xml, None)).unwrap_or(MessageParts(vec![])),
+                        body: loaded
+                            .xml
+                            .as_ref()
+                            .map(|xml| MessageParts::parse_parts(xml, None))
+                            .unwrap_or(MessageParts(vec![])),
                         is_meta: loaded.amt == 4000,
                     }
-                },
+                }
                 1000 => {
                     let (Some(xml), Some(spec)) = (&loaded.xml, &loaded.type_spec) else {
-                        return Err(PushError::BadMsg)
+                        return Err(PushError::BadMsg);
                     };
                     let data = ExtensionApp::from_ati(spec.as_ref(), None)?;
                     ReactMessageType::Extension {
@@ -2685,39 +3663,50 @@ impl MessageInst {
                         body: MessageParts::parse_parts(xml, None),
                         is_meta: false,
                     }
-                },
+                }
                 2007 | 3007 => {
                     let Some(xml) = &loaded.xml else {
-                        return Err(PushError::BadMsg)
+                        return Err(PushError::BadMsg);
                     };
-                    let data = loaded.type_spec.as_ref().and_then(|e| ExtensionApp::from_ati(e.as_ref(), None).ok());
+                    let data = loaded
+                        .type_spec
+                        .as_ref()
+                        .and_then(|e| ExtensionApp::from_ati(e.as_ref(), None).ok());
                     ReactMessageType::React {
-                        reaction: Reaction::Sticker { spec: data, body:  MessageParts::parse_parts(xml, None) },
-                        enable: loaded.amt == 2007
+                        reaction: Reaction::Sticker {
+                            spec: data,
+                            body: MessageParts::parse_parts(xml, None),
+                        },
+                        enable: loaded.amt == 2007,
                     }
-                },
+                }
                 2000..=2999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 2000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
-                    enable: true
+                    reaction: ReactMessage::from_idx(loaded.amt - 2000, loaded.react_emoji.clone())
+                        .ok_or(PushError::BadMsg)?,
+                    enable: true,
                 },
                 3000..=3999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 3000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
-                    enable: false
+                    reaction: ReactMessage::from_idx(loaded.amt - 3000, loaded.react_emoji.clone())
+                        .ok_or(PushError::BadMsg)?,
+                    enable: false,
                 },
-                _ => return Err(PushError::BadMsg)
+                _ => return Err(PushError::BadMsg),
             };
-            return wrapper.to_message(Some(ConversationData {
-                participants: loaded.participants.clone(),
-                cv_name: loaded.cv_name.clone(),
-                sender_guid: loaded.sender_guid.clone(),
-                after_guid: loaded.after_guid.clone(),
-            }), Message::React(ReactMessage {
-                to_uuid,
-                to_part,
-                to_text: "".to_string(),
-                reaction: msg,
-                embedded_profile: shared_profile,
-            }))
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: loaded.participants.clone(),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: loaded.after_guid.clone(),
+                }),
+                Message::React(ReactMessage {
+                    to_uuid,
+                    to_part,
+                    to_text: "".to_string(),
+                    reaction: msg,
+                    embedded_profile: shared_profile,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawMmsIncomingMessage>(&value) {
             let data: Vec<u8> = loaded.key.into();
@@ -2726,31 +3715,39 @@ impl MessageInst {
                 object: loaded.object_id,
                 url: loaded.download_url,
                 key: data[1..].to_vec(),
-                size: 0
+                size: 0,
             };
             let mut output: Vec<u8> = vec![];
             let mut cursor = Cursor::new(&mut output);
-            file.get_attachment(apns, &mut cursor, |_,_| {}).await?;
+            file.get_attachment(apns, &mut cursor, |_, _| {}).await?;
 
             let ungzipped = ungzip(&output).unwrap_or_else(|_| output);
             let parsed: Value = plist::from_bytes(&ungzipped)?;
 
-            return Self::from_raw(parsed, wrapper, apns).await
+            return Self::from_raw(parsed, wrapper, apns).await;
         }
         if let Ok(loaded) = plist::from_value::<RawSmsIncomingMessage>(&value) {
             let system_recv: SystemTime = loaded.recieved_date.clone().into();
             let parts = MessageParts::parse_sms(&loaded);
+            let normalized_sender = normalize_sms_handle(&loaded.sender);
             let mut msg = wrapper.to_message(
                 Some(ConversationData {
                     participants: if loaded.participants.len() > 0 {
-                        let mut participants = loaded.participants.clone();
+                        let mut participants: Vec<String> = loaded.participants.iter().map(|p| normalize_sms_handle(p)).collect();
                         // duplicates cause chat matching in dart to fail (it is duplicate for RCS)
-                        if !participants.contains(&loaded.sender) {
-                            participants.push(loaded.sender.clone());
+                        if !participants.contains(&normalized_sender) {
+                            participants.push(normalized_sender.clone());
                         }
-                        participants.iter().map(|p| format!("tel:{p}")).collect()
+                        participants
                     } else {
-                        vec![format!("tel:{}", loaded.sender), format!("tel:{}", loaded.recieved_number)]
+<<<<<<< HEAD
+                        vec![
+                            format!("tel:{}", loaded.sender),
+                            format!("tel:{}", loaded.recieved_number),
+                        ]
+=======
+                        vec![normalized_sender.clone(), normalize_sms_handle(&loaded.recieved_number)]
+>>>>>>> origin/master
                     },
                     cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
                     sender_guid: None,
@@ -2758,13 +3755,14 @@ impl MessageInst {
                 }),
                 Message::Message(NormalMessage {
                     parts,
-                    effect: None, // losers
+                    effect: None,     // losers
                     reply_guid: None, // losers
                     reply_part: None, // losers
-                    service: MessageType::SMS { // shame
+                    service: MessageType::SMS {
+                        // shame
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
-                        using_number: format!("tel:{}", loaded.recieved_number),
-                        from_handle: Some(loaded.sender.clone()),
+                        using_number: normalize_sms_handle(&loaded.recieved_number),
+                        from_handle: Some(normalized_sender),
                     },
                     subject: None,
                     app: None,
@@ -2772,39 +3770,47 @@ impl MessageInst {
                     voice: false,
                     scheduled: None,
                     embedded_profile: None,
-                })
+                }),
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
             return Ok(msg);
         }
         if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {
-            let parts = loaded.message.xhtml.as_ref().map_or_else(|| {
-                MessageParts::from_raw(&loaded.message.plain_body)
-            }, |xml| {
-                MessageParts::parse_parts(xml, None)
-            });
-            return wrapper.to_message(Some(ConversationData {
-                participants: loaded.participants.iter().map(|p| format!("tel:{}", p.phone_number)).chain(std::iter::once(wrapper.sender.clone().unwrap())).collect(),
-                cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
-                sender_guid: None,
-                after_guid: loaded.message.reply_to_guid,
-            }), Message::Message(NormalMessage {
-                parts,
-                effect: None, // losers
-                reply_guid: None, // losers
-                reply_part: None, // losers
-                service: MessageType::SMS { // shame
-                    is_phone: false, // if we are recieving a outgoing message, we must not be the phone
-                    using_number: wrapper.sender.clone().unwrap(),
-                    from_handle: None,
-                },
-                subject: None,
-                app: None,
-                link_meta: None,
-                voice: false,
-                scheduled: None,
-                embedded_profile: None,
-            }))
+            let parts = loaded.message.xhtml.as_ref().map_or_else(
+                || MessageParts::from_raw(&loaded.message.plain_body),
+                |xml| MessageParts::parse_parts(xml, None),
+            );
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: loaded
+                        .participants
+                        .iter()
+                        .map(|p| format!("tel:{}", p.phone_number))
+                        .chain(std::iter::once(wrapper.sender.clone().unwrap()))
+                        .collect(),
+                    cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
+                    sender_guid: None,
+                    after_guid: loaded.message.reply_to_guid,
+                }),
+                Message::Message(NormalMessage {
+                    parts,
+                    effect: None,     // losers
+                    reply_guid: None, // losers
+                    reply_part: None, // losers
+                    service: MessageType::SMS {
+                        // shame
+                        is_phone: false, // if we are recieving a outgoing message, we must not be the phone
+                        using_number: wrapper.sender.clone().unwrap(),
+                        from_handle: None,
+                    },
+                    subject: None,
+                    app: None,
+                    link_meta: None,
+                    voice: false,
+                    scheduled: None,
+                    embedded_profile: None,
+                }),
+            );
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
             let replies = loaded.reply.as_ref().map(|to| {
@@ -2815,17 +3821,29 @@ impl MessageInst {
                 parts.remove(guididx);
                 (guid, parts.join(":"))
             });
-            let parts = loaded.live_xml.as_ref().or(loaded.xml.as_ref()).map_or_else(|| {
-                loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
-            }, |xml| {
-                MessageParts::parse_parts(xml, Some(&loaded))
-            });
-            
-            let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
+            let parts = loaded
+                .live_xml
+                .as_ref()
+                .or(loaded.xml.as_ref())
+                .map_or_else(
+                    || {
+                        loaded
+                            .text
+                            .as_ref()
+                            .map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
+                    },
+                    |xml| MessageParts::parse_parts(xml, Some(&loaded)),
+                );
+
+            let balloon_part =
+                Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
             let mut app = None;
             if let Some(app_info) = &loaded.app_info {
                 // parsing failures for com.apple.Stickers.UserGenerated.MessagesExtension
-                app = match ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref())) {
+                app = match ExtensionApp::from_ati(
+                    app_info.as_ref(),
+                    balloon_part.as_ref().map(|i| i.as_ref()),
+                ) {
                     Ok(i) => Some(i),
                     Err(e) => {
                         warn!("Error parsing balloon {e}");
@@ -2846,14 +3864,17 @@ impl MessageInst {
                         None
                     }
                 };
-            } 
+            }
             let mut link_meta = None;
-            if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (loaded.balloon_id.as_deref(), balloon_part) {
+            if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) =
+                (loaded.balloon_id.as_deref(), balloon_part)
+            {
                 match (|| {
                     debug!("a");
                     let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
                     debug!("b");
-                    let payload: RichLink = plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
+                    let payload: RichLink =
+                        plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
                     debug!("c");
                     Ok::<_, PushError>((unpacked, payload))
                 })() {
@@ -2861,37 +3882,50 @@ impl MessageInst {
                         debug!("d");
                         link_meta = Some(LinkMeta {
                             data: payload.rich_link_metadata,
-                            attachments: unpacked.attachments.into_iter().map(|i| i.into()).collect(),
+                            attachments: unpacked
+                                .attachments
+                                .into_iter()
+                                .map(|i| i.into())
+                                .collect(),
                         });
-                    },
+                    }
                     Err(e) => {
                         error!("Error parsing url preview! {e}");
                     }
                 }
             }
             debug!("e");
-            return wrapper.to_message(Some(ConversationData {
-                participants: loaded.participants.clone(),
-                cv_name: loaded.cv_name.clone(),
-                sender_guid: loaded.sender_guid.clone(),
-                after_guid: loaded.after_guid.clone(),
-            }), Message::Message(NormalMessage {
-                parts,
-                effect: loaded.effect.clone(),
-                reply_guid: replies.as_ref().map(|r| r.0.clone()),
-                reply_part: replies.as_ref().map(|r| r.1.clone()),
-                service: MessageType::IMessage,
-                subject: loaded.subject.clone(),
-                app,
-                link_meta,
-                voice: loaded.voice_audio == Some(true),
-                scheduled: loaded.schedule_date.clone().map(|i| {
-                    let system_time: SystemTime = i.into();
-                    // we have no way of knowing if it is actually scheduled or not
-                    ScheduleMode { ms: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64, schedule: true }
+            return wrapper.to_message(
+                Some(ConversationData {
+                    participants: loaded.participants.clone(),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: loaded.after_guid.clone(),
                 }),
-                embedded_profile: shared_profile,
-            }))
+                Message::Message(NormalMessage {
+                    parts,
+                    effect: loaded.effect.clone(),
+                    reply_guid: replies.as_ref().map(|r| r.0.clone()),
+                    reply_part: replies.as_ref().map(|r| r.1.clone()),
+                    service: MessageType::IMessage,
+                    subject: loaded.subject.clone(),
+                    app,
+                    link_meta,
+                    voice: loaded.voice_audio == Some(true),
+                    scheduled: loaded.schedule_date.clone().map(|i| {
+                        let system_time: SystemTime = i.into();
+                        // we have no way of knowing if it is actually scheduled or not
+                        ScheduleMode {
+                            ms: system_time
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                            schedule: true,
+                        }
+                    }),
+                    embedded_profile: shared_profile,
+                }),
+            );
         }
         Err(PushError::BadMsg)
     }
@@ -2899,6 +3933,11 @@ impl MessageInst {
 
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+        write!(
+            f,
+            "[{}] '{}'",
+            self.sender.clone().unwrap_or("unknown".to_string()),
+            self.message
+        )
     }
 }

@@ -1,29 +1,81 @@
-use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    marker::PhantomData,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use aes::{cipher::consts::U16, Aes128};
-use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
+use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit, Nonce};
+use cloudkit_proto::{
+    octagon_pairing_message::{self, Step5},
+    CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo,
+};
+use deku::{DekuContainerWrite, DekuUpdate};
 use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, CircleSendMessage, GenerateVerificationTokenRequest, LoginState};
-use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
+use keystore::{
+    KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey,
+    RsaKey,
+};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
-use openssl::{ec::EcKey, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
+use openssl::{
+    ec::EcKey,
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    rsa::{Padding, Rsa},
+    sha::sha1,
+    sign::Signer,
+    x509::{X509Name, X509Req},
+};
 use plist::{Data, Dictionary, Value};
+use rand::Rng;
 use rasn::{AsnType, Decode, Encode};
-use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client, Method, Request, RequestBuilder, Response, Url};
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue},
+    Client, Method, Request, RequestBuilder, Response, Url,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
-use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_3072, server::SrpServer};
-use tokio::sync::{watch};
+use srp::{
+    client::{SrpClient, SrpClientVerifier},
+    groups::G_3072,
+    server::SrpServer,
+};
+use tokio::sync::watch;
 use uuid::Uuid;
-use rand::Rng;
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
-use deku::{DekuContainerWrite, DekuUpdate};
-use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
-use xml::{EventReader, reader::{self, ParserConfig2}};
+use x509_cert::{
+    attr::AttributeTypeAndValue,
+    der::{
+        asn1::{BitString, Null, SetOfVec, Utf8StringRef},
+        pem::LineEnding,
+        EncodePem,
+    },
+    name::{Name, RdnSequence, RelativeDistinguishedName},
+    request::{CertReq, CertReqInfo},
+    spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo},
+};
+use xml::{
+    reader::{self, ParserConfig2},
+    EventReader,
+};
 
-use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
+use crate::{
+    aps::{get_message, APSInterestToken},
+    ids::user::{IDSUser, IDSUserIdentity, IDSUserType},
+    keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity},
+    util::{
+        base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip,
+        gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip, DebugMutex, KeyPair,
+        KeyPairNew, PhoneNumberResponse, IDS_BAG, REQWEST,
+    },
+    APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,7 +83,7 @@ struct AuthRequest {
     apple_id: String,
     client_id: String,
     delegates: Value,
-    password: String
+    password: String,
 }
 
 #[derive(Serialize)]
@@ -59,14 +111,13 @@ pub enum LoginDelegate {
 impl LoginDelegate {
     fn delegate(&self) -> (&'static str, Value) {
         match self {
-            Self::IDS => {
-                ("com.apple.private.ids", Value::Dictionary(Dictionary::from_iter([
-                    ("protocol-version", Value::String("4".to_string()))
-                ].into_iter())))
-            },
-            Self::MobileMe => {
-                ("com.apple.mobileme", Value::Dictionary(Dictionary::new()))
-            }
+            Self::IDS => (
+                "com.apple.private.ids",
+                Value::Dictionary(Dictionary::from_iter(
+                    [("protocol-version", Value::String("4".to_string()))].into_iter(),
+                )),
+            ),
+            Self::MobileMe => ("com.apple.mobileme", Value::Dictionary(Dictionary::new())),
         }
     }
 }
@@ -121,7 +172,10 @@ pub struct QuotaData {
 }
 
 impl<T: AnisetteProvider> TokenProvider<T> {
-    pub fn new(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
+    pub fn new(
+        account: Arc<DebugMutex<AppleAccount<T>>>,
+        os_config: Arc<dyn OSConfig>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             account,
             os_config,
@@ -133,36 +187,87 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
         let token = self.get_mme_token("mmeAuthToken").await?;
 
-        let quota_url = self.mme_delegate.lock().await.as_ref().expect("no MMe?")
-            .config.get("com.apple.Dataclass.Quota").expect("No Quota?").as_dictionary().unwrap()
-            .get("storageInfoURL").expect("no storage info url?").as_string().unwrap().to_string();
-        
+        let quota_url = self
+            .mme_delegate
+            .lock()
+            .await
+            .as_ref()
+            .expect("no MMe?")
+            .config
+            .get("com.apple.Dataclass.Quota")
+            .expect("No Quota?")
+            .as_dictionary()
+            .unwrap()
+            .get("storageInfoURL")
+            .expect("no storage info url?")
+            .as_string()
+            .unwrap()
+            .to_string();
+
         let account = self.account.lock().await;
-        let dsid = account.spd.as_ref().unwrap().get("DsPrsId").expect("no dsid???s").as_unsigned_integer().unwrap().to_string();
-        let adsid = account.spd.as_ref().unwrap().get("adsid").expect("No adsid!").as_string().unwrap().to_string();
+        let dsid = account
+            .spd
+            .as_ref()
+            .unwrap()
+            .get("DsPrsId")
+            .expect("no dsid???s")
+            .as_unsigned_integer()
+            .unwrap()
+            .to_string();
+        let adsid = account
+            .spd
+            .as_ref()
+            .unwrap()
+            .get("adsid")
+            .expect("No adsid!")
+            .as_string()
+            .unwrap()
+            .to_string();
 
         let anisette = account.anisette.clone();
         drop(account);
 
-        let anisette_headers: HeaderMap = anisette.lock().await.get_headers().await?.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+        let anisette_headers: HeaderMap = anisette
+            .lock()
+            .await
+            .get_headers()
+            .await?
+            .into_iter()
+            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
+            .collect();
 
-        let data = REQWEST.get(quota_url)
+        let data = REQWEST
+            .get(quota_url)
             .basic_auth(&format!("{}", dsid), Some(token))
             .header("X-Client-UDID", self.os_config.get_udid().to_lowercase())
             .header("X-MMe-Country", "US")
-            .header("X-MMe-Client-Info", self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"))
+            .header(
+                "X-MMe-Client-Info",
+                self.os_config.get_mme_clientinfo(
+                    "com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)",
+                ),
+            )
             .header("X-MMe-Language", "en")
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers)
-            .send().await?
-            .bytes().await?;
-        
+            .send()
+            .await?
+            .bytes()
+            .await?;
 
         Ok(plist::from_bytes(&data)?)
     }
 
-    pub async fn generate_verification_token(&self, request: GenerateVerificationTokenRequest) -> Result<String, PushError> {
-        Ok(self.account.lock().await.generate_verification_token(request).await?)
+    pub async fn generate_verification_token(
+        &self,
+        request: GenerateVerificationTokenRequest,
+    ) -> Result<String, PushError> {
+        Ok(self
+            .account
+            .lock()
+            .await
+            .generate_verification_token(request)
+            .await?)
     }
 
     pub async fn get_gsa_token(&self, token: &str) -> Option<String> {
@@ -176,8 +281,16 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
 
-        self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
-        let delegates = login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+        self.get_gsa_token("com.apple.gs.idms.pet")
+            .await
+            .ok_or(PushError::TokenMissing)?;
+        let delegates = login_apple_delegates(
+            &mut *self.account.lock().await,
+            None,
+            &*self.os_config,
+            &[LoginDelegate::MobileMe],
+        )
+        .await?;
 
         *mme = delegates.mobileme;
         *self.mme_refreshed.lock().await = SystemTime::now();
@@ -187,11 +300,23 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
         // refresh every week
-        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
-            > Duration::from_secs(60 * 60 * 24 * 7) {
+        if self.mme_delegate.lock().await.is_none()
+            || SystemTime::now()
+                .duration_since(*self.mme_refreshed.lock().await)
+                .unwrap()
+                > Duration::from_secs(60 * 60 * 24 * 7)
+        {
             self.refresh_mme().await?;
         }
-        self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
+        self.mme_delegate
+            .lock()
+            .await
+            .as_ref()
+            .expect("no MME?")
+            .tokens
+            .get(token)
+            .ok_or(PushError::TokenMissing)
+            .cloned()
     }
 }
 
@@ -216,30 +341,36 @@ pub struct DelegateResponses {
 
 pub enum UpdateAccountFinish {
     MacOS,
-    IOS {
-        url: String,
-    }
+    IOS { url: String },
 }
 
 impl UpdateAccountFinish {
-    pub async fn accept_terms<T: AnisetteProvider>(&self, delegates: &[LoginDelegate], account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<DelegateResponses, PushError> {
+    pub async fn accept_terms<T: AnisetteProvider>(
+        &self,
+        delegates: &[LoginDelegate],
+        account: &AppleAccount<T>,
+        os_config: &dyn OSConfig,
+    ) -> Result<DelegateResponses, PushError> {
         match self {
             Self::MacOS => {
-                login_apple_delegates(account, Some("termsAccepted=true"), os_config, delegates).await
-            },
+                login_apple_delegates(account, Some("termsAccepted=true"), os_config, delegates)
+                    .await
+            }
             Self::IOS { url } => {
                 let header_map = build_setup_headers(account, os_config).await?;
 
-                let text = REQWEST.post(url)
+                let text = REQWEST
+                    .post(url)
                     .header("Accept", "*/*")
                     .header("Accept-Encoding", "gzip, deflate, br")
                     .header("Accept-Language", "en-US,en")
                     .header("Content-Type", "application/xml")
                     .headers(header_map)
-                    .send().await?;
+                    .send()
+                    .await?;
 
                 if !text.status().is_success() {
-                    return Err(PushError::FailedToAcceptTOS(text.text().await?))
+                    return Err(PushError::FailedToAcceptTOS(text.text().await?));
                 }
 
                 text.bytes().await?;
@@ -250,24 +381,57 @@ impl UpdateAccountFinish {
     }
 }
 
-async fn build_setup_headers<T: AnisetteProvider>(account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<HeaderMap, PushError> {
+async fn build_setup_headers<T: AnisetteProvider>(
+    account: &AppleAccount<T>,
+    os_config: &dyn OSConfig,
+) -> Result<HeaderMap, PushError> {
     let mut map = HashMap::new();
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
     map.extend(base_headers);
 
-    map.extend([
-        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_pet().expect("No pet b?"))))),
-        ("User-Agent", format!("iOS iPhone {} iPhone Setup Assistant", os_config.get_register_meta().software_version)),
-        ("Cookie", "repairSteps=".to_string()),
-        ("X-MMe-Country", "US".to_string()),
-        ("X-MMe-Language", "en,en-US".to_string()),
-        ("X-MMe-Client-Info", os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)")),
-    ].into_iter().map(|(a, b)| (a.to_string(), b)));
+    map.extend(
+        [
+            (
+                "Authorization",
+                format!(
+                    "Basic {}",
+                    base64::encode(format!(
+                        "{}:{}",
+                        account.username.as_ref().unwrap().trim(),
+                        account.get_pet().expect("No pet b?")
+                    ))
+                ),
+            ),
+            (
+                "User-Agent",
+                format!(
+                    "iOS iPhone {} iPhone Setup Assistant",
+                    os_config.get_register_meta().software_version
+                ),
+            ),
+            ("Cookie", "repairSteps=".to_string()),
+            ("X-MMe-Country", "US".to_string()),
+            ("X-MMe-Language", "en,en-US".to_string()),
+            (
+                "X-MMe-Client-Info",
+                os_config.get_mme_clientinfo(
+                    "com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)",
+                ),
+            ),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b)),
+    );
 
-    Ok(HeaderMap::from_iter(map.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))))
+    Ok(HeaderMap::from_iter(map.into_iter().map(|(a, b)| {
+        (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())
+    })))
 }
 
-pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<(String, UpdateAccountFinish), PushError> {
+pub async fn request_update_account<T: AnisetteProvider>(
+    account: &AppleAccount<T>,
+    os_config: &dyn OSConfig,
+) -> Result<(String, UpdateAccountFinish), PushError> {
     let data = os_config.get_version_ua();
     if data.contains("macOS") {
         let result = account.request_update_account().await?;
@@ -288,12 +452,11 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
 
         let buffer = plist_to_string(&TermsUIRequest {
             format: "plist/buddyml",
-            terms: vec![RequestedTerms {
-                name: "iCloud",
-            }]
+            terms: vec![RequestedTerms { name: "iCloud" }],
         })?;
 
-        let text = REQWEST.post("https://setup.icloud.com/setup/iosbuddy/ui/genericTermsUI")
+        let text = REQWEST
+            .post("https://setup.icloud.com/setup/iosbuddy/ui/genericTermsUI")
             .header("Accept", "application/x-buddyml")
             .header("Accept-Encoding", "gzip, deflate, br")
             .header("Accept-Language", "en-US,en")
@@ -301,47 +464,59 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
             .header("X-Apple-I-Appearance", "1")
             .headers(header_map)
             .body(buffer)
-            .send().await?
-            .bytes().await?;
+            .send()
+            .await?
+            .bytes()
+            .await?;
 
-        let reader: EventReader<Cursor<_>> = EventReader::new_with_config(Cursor::new(&text), 
-            ParserConfig2::new().cdata_to_characters(true));
+        let reader: EventReader<Cursor<_>> = EventReader::new_with_config(
+            Cursor::new(&text),
+            ParserConfig2::new().cdata_to_characters(true),
+        );
         let mut agree_url: Option<String> = None;
         let mut current_page: Option<String> = None;
         let mut current_page_html: Option<String> = None;
 
         let mut pages: HashMap<String, String> = HashMap::new();
-        
+
         for e in reader {
             match e {
-                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
+                Ok(reader::XmlEvent::StartElement {
+                    name,
+                    attributes,
+                    namespace: _,
+                }) => {
                     let get_attr = |name: &str, def: Option<&str>| {
-                        attributes.iter().find(|attr| attr.name.to_string() == name)
-                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                        attributes
+                            .iter()
+                            .find(|attr| attr.name.to_string() == name)
+                            .map_or_else(
+                                || {
+                                    def.expect(&format!("attribute {} doesn't exist!", name))
+                                        .to_string()
+                                },
+                                |data| data.value.to_string(),
+                            )
                     };
                     match name.local_name.as_str() {
                         "clientInfo" => {
                             agree_url = Some(get_attr("agreeUrl", None));
-                        },
-                        "page" => {
-                            current_page = Some(get_attr("id", Some("default")))
-                        },
+                        }
+                        "page" => current_page = Some(get_attr("id", Some("default"))),
                         "html" => {
                             current_page_html = current_page.clone();
-                        },
+                        }
                         _ => {}
                     }
-                },
-                Ok(reader::XmlEvent::EndElement { name }) => {
-                    match name.local_name.as_str() {
-                        "page" => {
-                            current_page = None;
-                        },
-                        "html" => {
-                            current_page_html = None;
-                        },
-                        _ => {}
+                }
+                Ok(reader::XmlEvent::EndElement { name }) => match name.local_name.as_str() {
+                    "page" => {
+                        current_page = None;
                     }
+                    "html" => {
+                        current_page_html = None;
+                    }
+                    _ => {}
                 },
                 Ok(reader::XmlEvent::Characters(data)) => {
                     if let Some(page) = &current_page_html {
@@ -352,20 +527,37 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
             }
         }
 
-        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url: agree_url.expect("No agree url???") }))
+        Ok((
+            pages.remove("iCloud").unwrap_or_default(),
+            UpdateAccountFinish::IOS {
+                url: agree_url.expect("No agree url???"),
+            },
+        ))
     }
 }
 
+pub async fn login_apple_delegates<T: AnisetteProvider>(
+    account: &AppleAccount<T>,
+    cookie: Option<&str>,
+    os_config: &dyn OSConfig,
+    delegates: &[LoginDelegate],
+) -> Result<DelegateResponses, PushError> {
+    let Some(pet) = account.get_pet() else {
+        panic!("No pet!")
+    };
+    let Some(spd) = &account.spd else {
+        panic!("No spd!")
+    };
 
-pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
-    let Some(pet) = account.get_pet() else { panic!("No pet!") };
-    let Some(spd) = &account.spd else { panic!("No spd!") };
-
-    debug!("Got spd {:?}", spd);
+    debug!(
+        "Parsed SPD metadata (keys={}, has_adsid={})",
+        spd.len(),
+        spd.contains_key("adsid")
+    );
     let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
 
     let username = account.username.as_ref().unwrap();
-    
+
     // let request = AuthRequest {
     //     apple_id: username.to_string(),
     //     client_id: Uuid::new_v4().to_string(),
@@ -374,35 +566,47 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     // };
 
     let request = V2AuthRequest {
-        delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
+        delegates: Value::Dictionary(Dictionary::from_iter(
+            delegates.iter().map(|d| d.delegate()),
+        )),
         protocol_version: "1.0".to_string(),
         user_info: V2AuthUserInfo {
             client_id: Uuid::new_v4().to_string().to_uppercase(),
             language: "en-US".to_string(),
             timezone: "America/New_York".to_string(),
-        }
+        },
     };
 
     let validation_data = os_config.generate_validation_data().await?;
 
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
-    let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+    let mut anisette_headers: HeaderMap = base_headers
+        .into_iter()
+        .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
+        .collect();
 
     if let Some(cookie) = cookie {
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
-    let resp = REQWEST.post(os_config.get_login_url())
-            .header("Accept-Encoding", "gzip")
-            .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
-            .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
-            .header("X-Apple-ADSID", adsid)
-            .headers(anisette_headers.clone())
-            .basic_auth(username, Some(pet))
-            .body(plist_to_string(&request)?)
-            .send()
-            .await?;
+    let resp = REQWEST
+        .post(os_config.get_login_url())
+        .header("Accept-Encoding", "gzip")
+        .header(
+            "User-Agent",
+            os_config.get_normal_ua("com.apple.iCloudHelper/282"),
+        )
+        .header(
+            "X-Mme-Client-Info",
+            os_config.get_mme_clientinfo(&os_config.get_aoskit_version()),
+        )
+        .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
+        .header("X-Apple-ADSID", adsid)
+        .headers(anisette_headers.clone())
+        .basic_auth(username, Some(pet))
+        .body(plist_to_string(&request)?)
+        .send()
+        .await?;
     let text = resp.text().await?;
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
@@ -413,15 +617,31 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         if error == "UNAUTHORIZED" {
             return Err(PushError::UnauthorizedAccountError);
         }
-        return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
+        return Err(PushError::MobileMeError(
+            error.to_string(),
+            parsed_dict
+                .get("description")
+                .and_then(|d| d.as_string().map(|s| s.to_string())),
+        ));
     }
 
-    if parsed_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
+    if parsed_dict
+        .get("status")
+        .unwrap()
+        .as_unsigned_integer()
+        .unwrap()
+        != 0
+    {
         return Err(PushError::AuthError(parsed.clone()));
     }
 
-    fn get_delegate<T: DeserializeOwned>(delegates: &Dictionary, delegate: &str) -> Result<Option<T>, PushError> {
-        let Some(value) = delegates.get(delegate) else { return Ok(None) };
+    fn get_delegate<T: DeserializeOwned>(
+        delegates: &Dictionary,
+        delegate: &str,
+    ) -> Result<Option<T>, PushError> {
+        let Some(value) = delegates.get(delegate) else {
+            return Ok(None);
+        };
 
         #[derive(Deserialize)]
         #[serde(rename_all = "kebab-case")]
@@ -433,12 +653,19 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
         let response: DelegateResponse = plist::from_value(&value)?;
 
-        let data = response.service_data.ok_or(
-                PushError::DelegateLoginFailed(delegate.to_string(), response.status, response.status_message.unwrap_or("No msg".to_string())))?;
+        let data = response.service_data.ok_or(PushError::DelegateLoginFailed(
+            delegate.to_string(),
+            response.status,
+            response.status_message.unwrap_or("No msg".to_string()),
+        ))?;
         Ok(Some(plist::from_value(&data)?))
     }
 
-    let delegates = parsed_dict.get("delegates").unwrap().as_dictionary().unwrap();
+    let delegates = parsed_dict
+        .get("delegates")
+        .unwrap()
+        .as_dictionary()
+        .unwrap();
 
     let mut mme: Option<MobileMeDelegateResponse> = get_delegate(delegates, "com.apple.mobileme")?;
 
@@ -457,7 +684,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 struct AuthCertRequest {
     authentication_data: Value,
     csr: Data,
-    realm_user_id: String
+    realm_user_id: String,
 }
 
 #[derive(Deserialize)]
@@ -468,25 +695,28 @@ struct AuthCertResponse {
 
 fn generate_auth_csr(user_id: &str) -> Result<(RsaKey, Vec<u8>), PushError> {
     use x509_cert::der::{Decode as X509Decode, Encode as X509Encode};
-    let key = RsaKey::overwrite(&format!("ids:{user_id}"), 2048, KeystoreAccessRules {
-        signature_padding: vec![KeystorePadding::PKCS1],
-        digests: vec![KeystoreDigest::Sha1],
-        can_sign: true,
-        ..Default::default()
-    })?;
+    let key = RsaKey::overwrite(
+        &format!("ids:{user_id}"),
+        2048,
+        KeystoreAccessRules {
+            signature_padding: vec![KeystorePadding::PKCS1],
+            digests: vec![KeystoreDigest::Sha1],
+            can_sign: true,
+            ..Default::default()
+        },
+    )?;
 
     let public_key = SubjectPublicKeyInfo::from_der(&key.get_public_key()?).unwrap();
     let common_name = encode_hex(&sha1(user_id.as_bytes())).to_uppercase();
     let request = CertReqInfo {
         version: x509_cert::request::Version::V1,
-        subject: RdnSequence(vec![
-            RelativeDistinguishedName(SetOfVec::from_iter([
-                AttributeTypeAndValue {
-                    oid: ObjectIdentifier::new("2.5.4.3").unwrap(), // commonname
-                    value: Utf8StringRef::new(&common_name).unwrap().into(),
-                }
-            ]).unwrap())
-        ]),
+        subject: RdnSequence(vec![RelativeDistinguishedName(
+            SetOfVec::from_iter([AttributeTypeAndValue {
+                oid: ObjectIdentifier::new("2.5.4.3").unwrap(), // commonname
+                value: Utf8StringRef::new(&common_name).unwrap().into(),
+            }])
+            .unwrap(),
+        )]),
         public_key,
         attributes: SetOfVec::new(),
     };
@@ -507,7 +737,12 @@ fn generate_auth_csr(user_id: &str) -> Result<(RsaKey, Vec<u8>), PushError> {
     Ok((key, result.to_der().unwrap()))
 }
 
-async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, user_type: IDSUserType) -> Result<IDSUser, PushError> {
+async fn authenticate(
+    os_config: &dyn OSConfig,
+    user_id: &str,
+    request: Value,
+    user_type: IDSUserType,
+) -> Result<IDSUser, PushError> {
     let (key, csr) = generate_auth_csr(user_id)?;
 
     let auth_cert = AuthCertRequest {
@@ -516,23 +751,38 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
         realm_user_id: user_id.to_string(),
     };
 
-    let url = get_bag(IDS_BAG, user_type.auth_endpoint()).await?.into_string().unwrap();
+    let url = get_bag(IDS_BAG, user_type.auth_endpoint())
+        .await?
+        .into_string()
+        .unwrap();
 
-    let resp = REQWEST.post(url)
-        .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
+    let resp = REQWEST
+        .post(url)
+        .header(
+            "user-agent",
+            format!(
+                "com.apple.invitation-registration {}",
+                os_config.get_version_ua()
+            ),
+        )
         .header("x-protocol-version", os_config.get_protocol_version())
         .header("content-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&auth_cert)?)?)
-        .send().await?
-        .bytes().await?;
+        .send()
+        .await?
+        .bytes()
+        .await?;
 
     let parsed: AuthCertResponse = plist::from_bytes(&resp)?;
     if parsed.status != 0 {
-        return Err(PushError::CertError(plist::from_bytes(&resp)?))
+        return Err(PushError::CertError(plist::from_bytes(&resp)?));
     }
 
-    let keypair = KeyPairNew { cert: parsed.cert.into(), private: key };
-    
+    let keypair = KeyPairNew {
+        cert: parsed.cert.into(),
+        private: key,
+    };
+
     Ok(IDSUser {
         auth_keypair: keypair,
         user_id: user_id.to_string(),
@@ -545,26 +795,51 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct AuthApple {
-    auth_token: String
+    auth_token: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AuthPhone {
     pub push_token: Data,
-    pub sigs: Vec<Data>
+    pub sigs: Vec<Data>,
 }
 
-pub async fn authenticate_apple(ids_delegate: IDSDelegateResponse, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
-    authenticate(os_config, &ids_delegate.profile_id, plist::to_value(&AuthApple { auth_token: ids_delegate.auth_token })?, IDSUserType::Apple).await
+pub async fn authenticate_apple(
+    ids_delegate: IDSDelegateResponse,
+    os_config: &dyn OSConfig,
+) -> Result<IDSUser, PushError> {
+    authenticate(
+        os_config,
+        &ids_delegate.profile_id,
+        plist::to_value(&AuthApple {
+            auth_token: ids_delegate.auth_token,
+        })?,
+        IDSUserType::Apple,
+    )
+    .await
 }
 
-pub async fn authenticate_phone(number: &str, phone: AuthPhone, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
-    authenticate(os_config, &format!("P:{number}"), plist::to_value(&phone)?, IDSUserType::Phone).await
+pub async fn authenticate_phone(
+    number: &str,
+    phone: AuthPhone,
+    os_config: &dyn OSConfig,
+) -> Result<IDSUser, PushError> {
+    authenticate(
+        os_config,
+        &format!("P:{number}"),
+        plist::to_value(&phone)?,
+        IDSUserType::Phone,
+    )
+    .await
 }
 
-pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_config: &dyn OSConfig, aps: &APSConnection) -> Result<IDSUser, PushError> {
-
+pub async fn authenticate_smsless(
+    auth: &PhoneNumberResponse,
+    host: &str,
+    os_config: &dyn OSConfig,
+    aps: &APSConnection,
+) -> Result<IDSUser, PushError> {
     #[derive(DekuWrite, Clone, Debug)]
     #[deku(endian = "big")]
     struct SMSLessSig {
@@ -575,7 +850,11 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
         carrier: Vec<u8>,
     }
 
-    let stripped_host =  Url::parse(host).expect("Failed to parse host").domain().expect("No domain name?").to_string();
+    let stripped_host = Url::parse(host)
+        .expect("Failed to parse host")
+        .domain()
+        .expect("No domain name?")
+        .to_string();
     let sig_data = base64_decode(&auth.signature);
     let sig = SMSLessSig {
         header: 0x0200,
@@ -584,7 +863,6 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
         carrier_len: sig_data.len() as u16,
         carrier: sig_data,
     };
-    
 
     let user_id = format!("P:{}", auth.phone_number);
 
@@ -615,18 +893,30 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
 
     let users = AuthMultipleUsers {
         push_token: aps.get_token().await.to_vec().into(),
-        authentication_requests: vec![request]
+        authentication_requests: vec![request],
     };
 
-    let url = get_bag(IDS_BAG, "id-authenticate-multiple-users").await?.into_string().unwrap();
+    let url = get_bag(IDS_BAG, "id-authenticate-multiple-users")
+        .await?
+        .into_string()
+        .unwrap();
 
-    let resp = REQWEST.post(url)
-        .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
+    let resp = REQWEST
+        .post(url)
+        .header(
+            "user-agent",
+            format!(
+                "com.apple.invitation-registration {}",
+                os_config.get_version_ua()
+            ),
+        )
         .header("x-protocol-version", os_config.get_protocol_version())
         .header("content-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&users)?)?)
-        .send().await?
-        .bytes().await?;
+        .send()
+        .await?
+        .bytes()
+        .await?;
 
     #[derive(Deserialize)]
     #[serde(rename_all = "kebab-case")]
@@ -647,11 +937,14 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
     let response = result.authentication_responses.remove(0);
 
     if response.status != 0 {
-        return Err(PushError::CertError(plist::from_bytes(&resp)?))
+        return Err(PushError::CertError(plist::from_bytes(&resp)?));
     }
 
-    let keypair = KeyPairNew { cert: response.cert.into(), private: key };
-    
+    let keypair = KeyPairNew {
+        cert: response.cert.into(),
+        private: key,
+    };
+
     Ok(IDSUser {
         auth_keypair: keypair,
         user_id: user_id.to_string(),
@@ -678,15 +971,20 @@ impl NonceType {
 pub fn generate_nonce(typ: NonceType) -> Vec<u8> {
     [
         vec![typ.get_header()],
-        (duration_since_epoch().as_secs() * 1000).to_be_bytes().to_vec(),
+        (duration_since_epoch().as_secs() * 1000)
+            .to_be_bytes()
+            .to_vec(),
         rand::thread_rng().gen::<[u8; 8]>().to_vec(),
-    ].concat()
+    ]
+    .concat()
 }
 
 pub fn build_payload(nonce: &[u8], fields: &[&[u8]]) -> Vec<u8> {
-    let mut items = fields.iter().map(|i|
-        [(i.len() as u32).to_be_bytes().to_vec(), i.to_vec()].concat()).collect::<Vec<_>>();
-    
+    let mut items = fields
+        .iter()
+        .map(|i| [(i.len() as u32).to_be_bytes().to_vec(), i.to_vec()].concat())
+        .collect::<Vec<_>>();
+
     items.insert(0, nonce.to_vec());
     items.concat()
 }
@@ -735,10 +1033,10 @@ impl SignedRequest<Unsigned> {
             method,
             body: vec![],
             bag,
-            marker: PhantomData
+            marker: PhantomData,
         }
     }
-    
+
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
         self
@@ -746,77 +1044,124 @@ impl SignedRequest<Unsigned> {
 }
 
 impl<S: RequestState> SignedRequest<S> {
-
     pub fn header(mut self, name: &str, val: &str) -> Self {
-        self.headers.append::<HeaderName>(name.try_into().unwrap(), val.parse().unwrap());
+        self.headers
+            .append::<HeaderName>(name.try_into().unwrap(), val.parse().unwrap());
         self
     }
 
-    pub fn sign(mut self, pair: &KeyPairNew<RsaKey>, key_type: KeyType, aps: &APSState, item: Option<usize>) -> Result<SignedRequest<Signed>, PushError> {
+    pub fn sign(
+        mut self,
+        pair: &KeyPairNew<RsaKey>,
+        key_type: KeyType,
+        aps: &APSState,
+        item: Option<usize>,
+    ) -> Result<SignedRequest<Signed>, PushError> {
         let name = key_type.name();
         let nonce = generate_nonce(NonceType::HTTP);
         let postfix = item.map(|i| format!("-{i}")).unwrap_or_default();
-        self.headers.append::<HeaderName>(format!("x-{name}-nonce{postfix}").try_into().unwrap(), base64_encode(&nonce).parse().unwrap());
+        self.headers.append::<HeaderName>(
+            format!("x-{name}-nonce{postfix}").try_into().unwrap(),
+            base64_encode(&nonce).parse().unwrap(),
+        );
 
-        let payload = build_payload(&nonce, &[
-            self.bag.as_bytes(),
-            "".as_bytes(), // query str
-            &self.body,
-            aps.token.as_ref().unwrap(),
-        ]);   
-        self.headers.append::<HeaderName>(format!("x-{name}-sig{postfix}").try_into().unwrap(), base64_encode(&do_ids_signature(&pair.private, &payload)?).parse().unwrap());
-        self.headers.append::<HeaderName>(format!("x-{name}-cert{postfix}").try_into().unwrap(), base64_encode(&pair.cert).parse().unwrap());
+        let payload = build_payload(
+            &nonce,
+            &[
+                self.bag.as_bytes(),
+                "".as_bytes(), // query str
+                &self.body,
+                aps.token.as_ref().unwrap(),
+            ],
+        );
+        self.headers.append::<HeaderName>(
+            format!("x-{name}-sig{postfix}").try_into().unwrap(),
+            base64_encode(&do_ids_signature(&pair.private, &payload)?)
+                .parse()
+                .unwrap(),
+        );
+        self.headers.append::<HeaderName>(
+            format!("x-{name}-cert{postfix}").try_into().unwrap(),
+            base64_encode(&pair.cert).parse().unwrap(),
+        );
         Ok(SignedRequest {
             headers: self.headers,
             method: self.method,
             body: self.body,
             bag: self.bag,
-            marker: PhantomData
+            marker: PhantomData,
         })
     }
 
     pub async fn send(self, client: &Client) -> Result<Response, PushError> {
         let url = get_bag(IDS_BAG, self.bag).await?;
-        Ok(client.request(self.method, url.as_string().unwrap())
+        Ok(client
+            .request(self.method, url.as_string().unwrap())
             .headers(self.headers)
             .body(self.body)
-            .send().await?)
+            .send()
+            .await?)
     }
 
-    pub async fn send_apns(self, aps: &APSConnectionResource, topic: &'static str) -> Result<Vec<u8>, PushError> {
+    pub async fn send_apns(
+        self,
+        aps: &APSConnectionResource,
+        topic: &'static str,
+    ) -> Result<Vec<u8>, PushError> {
         let url = get_bag(IDS_BAG, self.bag).await?;
 
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();
 
-        let request = Value::Dictionary(Dictionary::from_iter([
-            ("cT", Value::String("application/x-apple-plist".to_string())),
-            ("U", Value::Data(msg_id.to_vec())),
-            ("c", 96.into()),
-            ("u", url.as_string().unwrap().into()),
-            ("h", Value::Dictionary(Dictionary::from_iter(
-                    self.headers.into_iter().map(|(a, b)| 
-                        (a.unwrap().to_string(), b.to_str().unwrap().to_string()))))),
-            ("v", 2.into()),
-            ("b", Value::Data(self.body))
-        ].into_iter()));
+        let request =
+            Value::Dictionary(Dictionary::from_iter(
+                [
+                    ("cT", Value::String("application/x-apple-plist".to_string())),
+                    ("U", Value::Data(msg_id.to_vec())),
+                    ("c", 96.into()),
+                    ("u", url.as_string().unwrap().into()),
+                    (
+                        "h",
+                        Value::Dictionary(Dictionary::from_iter(self.headers.into_iter().map(
+                            |(a, b)| (a.unwrap().to_string(), b.to_str().unwrap().to_string()),
+                        ))),
+                    ),
+                    ("v", 2.into()),
+                    ("b", Value::Data(self.body)),
+                ]
+                .into_iter(),
+            ));
 
-        debug!("sending apns query {:?}", request);
+        debug!("Sending APNS authentication query");
 
         let receiver = aps.subscribe().await;
         aps.send_message(topic, request, None).await?;
 
-        let response = aps.wait_for_timeout(receiver, get_message(|payload| {
-            let Some(recv_id) = payload.as_dictionary().unwrap().get("U") else {
-                return None
-            };
-            if recv_id.as_data().unwrap() == msg_id { Some(payload) } else { None }
-        }, &[topic])).await?;
-        
+        let response = aps
+            .wait_for_timeout(
+                receiver,
+                get_message(
+                    |payload| {
+                        let Some(recv_id) = payload.as_dictionary().unwrap().get("U") else {
+                            return None;
+                        };
+                        if recv_id.as_data().unwrap() == msg_id {
+                            Some(payload)
+                        } else {
+                            None
+                        }
+                    },
+                    &[topic],
+                ),
+            )
+            .await?;
+
         let response = response.as_dictionary().unwrap();
         if let Some(b) = response.get("b") {
             Ok(ungzip(b.as_data().unwrap())?)
         } else {
-            Err(PushError::WebTunnelError(response["s"].as_unsigned_integer().unwrap() as u16))
+            Err(PushError::WebTunnelError(
+                response["s"].as_unsigned_integer().unwrap() as u16,
+            ))
         }
     }
 }
@@ -874,7 +1219,6 @@ pub struct IdmsAuthListener {
     _interest_token: APSInterestToken,
 }
 
-
 #[derive(AsnType, Encode, Decode)]
 struct CircleStep0 {
     circle_step: rasn::types::Integer,
@@ -927,9 +1271,11 @@ impl CircleEncryptedChannel {
     fn new(key: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(None, key);
         let mut recv_send = [0u8; 16];
-        hk.expand("recv->send".as_bytes(), &mut recv_send).expect("Failed to expand key!");
+        hk.expand("recv->send".as_bytes(), &mut recv_send)
+            .expect("Failed to expand key!");
         let mut send_recv = [0u8; 16];
-        hk.expand("send->recv".as_bytes(), &mut send_recv).expect("Failed to expand key!");
+        hk.expand("send->recv".as_bytes(), &mut send_recv)
+            .expect("Failed to expand key!");
         Self {
             recv_send,
             send_recv,
@@ -939,7 +1285,9 @@ impl CircleEncryptedChannel {
     fn encrypt(data: &[u8], key: [u8; 16]) -> Vec<u8> {
         let nonce: [u8; 16] = rand::random();
         let cipher = Aes128Gcm16ByteNonce::new(&key.into());
-        let mut encrypted = cipher.encrypt(Nonce::from_slice(&nonce), data).expect("AES GCM failed?");
+        let mut encrypted = cipher
+            .encrypt(Nonce::from_slice(&nonce), data)
+            .expect("AES GCM failed?");
 
         let tag = encrypted.split_off(encrypted.len() - 16);
 
@@ -947,13 +1295,19 @@ impl CircleEncryptedChannel {
             iv: nonce.to_vec().into(),
             ciphertext: encrypted.into(),
             tag: tag.into(),
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     fn decrypt(payload: &[u8], key: [u8; 16]) -> Option<Vec<u8>> {
         let _self: CircleEncryptedPayload = rasn::der::decode(payload).ok()?;
         let cipher = Aes128Gcm16ByteNonce::new(&key.into());
-        cipher.decrypt(Nonce::from_slice(&_self.iv), &*[&_self.ciphertext[..], &_self.tag[..]].concat()).ok()
+        cipher
+            .decrypt(
+                Nonce::from_slice(&_self.iv),
+                &*[&_self.ciphertext[..], &_self.tag[..]].concat(),
+            )
+            .ok()
     }
 
     fn encrypt_to_client(&self, data: &[u8]) -> Vec<u8> {
@@ -1015,7 +1369,11 @@ pub struct CircleClientSession<P: AnisetteProvider> {
 impl<P: AnisetteProvider> CircleClientSession<P> {
     // WARN: you, the caller, are responsible for advertising a BLE GATT service with the uuid of session_id
     // modern OSes may refuse to add you to the circle if you are not in physical proximity
-    pub async fn new(dsid: u64, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
+    pub async fn new(
+        dsid: u64,
+        account: Arc<DebugMutex<AppleAccount<P>>>,
+        push_token: [u8; 32],
+    ) -> Result<Self, PushError> {
         // note, -0 is the attempt number. Each time there is another attempt (send new code) the -0 increments by 1
         let atxid = format!("{}-0", rand::random::<u32>() / 2);
 
@@ -1024,20 +1382,30 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         let a: [u8; 32] = rand::random();
         let a_pub = srp_client.compute_public_ephemeral(&a);
 
-        let response = account.lock().await.circle(&CircleSendMessage {
-            atxid: atxid.clone(),
-            circlestep: 0,
-            idmsdata: None,
-            pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep0 {
-                circle_step: 0.into(),
-                public_ephermeral: a_pub.into(),
-                unk3: 1.into(),
-                req_uuid: Uuid::new_v4().into_bytes().to_vec().into(),
-                tag: "o".as_bytes().into(),
-            }).unwrap())),
-            ptkn: encode_hex(&push_token).to_uppercase(),
-            ec: None,
-        }, true).await?;
+        let response = account
+            .lock()
+            .await
+            .circle(
+                &CircleSendMessage {
+                    atxid: atxid.clone(),
+                    circlestep: 0,
+                    idmsdata: None,
+                    pakedata: Some(base64_encode(
+                        &rasn::der::encode(&CircleStep0 {
+                            circle_step: 0.into(),
+                            public_ephermeral: a_pub.into(),
+                            unk3: 1.into(),
+                            req_uuid: Uuid::new_v4().into_bytes().to_vec().into(),
+                            tag: "o".as_bytes().into(),
+                        })
+                        .unwrap(),
+                    )),
+                    ptkn: encode_hex(&push_token).to_uppercase(),
+                    ec: None,
+                },
+                true,
+            )
+            .await?;
         Ok(Self {
             account,
             push_token,
@@ -1057,66 +1425,97 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
     }
 
     pub async fn send_code(&mut self, password: &str) -> Result<(), PushError> {
-        
         let Some(request) = &self.saved_step else {
             self.saved_password = Some(password.to_string());
-            return Ok(())
+            return Ok(());
         };
 
         if request.step != 2 {
-            return Err(PushError::WrongStep(request.step))
+            return Err(PushError::WrongStep(request.step));
         }
 
-        let step2: CircleStep1 = rasn::der::decode(&base64_decode(request.pake.as_ref().expect("No Pake!"))).expect("failed to decode circlestep1");
-        let body: CircleStep1Body = rasn::der::decode(step2.body.as_ref()).expect("failed to decode circlestep1body");
+        let step2: CircleStep1 =
+            rasn::der::decode(&base64_decode(request.pake.as_ref().expect("No Pake!")))
+                .expect("failed to decode circlestep1");
+        let body: CircleStep1Body =
+            rasn::der::decode(step2.body.as_ref()).expect("failed to decode circlestep1body");
 
-        let verifier: SrpClientVerifier<Sha256> = self.srp_client
-            .process_reply(&self.a, format!("{}", self.dsid).as_bytes(), password.as_ref(), &body.salt, &body.public_ephermeral, false).unwrap();
+        let verifier: SrpClientVerifier<Sha256> = self
+            .srp_client
+            .process_reply(
+                &self.a,
+                format!("{}", self.dsid).as_bytes(),
+                password.as_ref(),
+                &body.salt,
+                &body.public_ephermeral,
+                false,
+            )
+            .unwrap();
 
         let step2 = rasn::der::encode(&CircleStep2 {
             circle_step: 2.into(),
             proof: verifier.proof().to_vec().into(),
-        }).unwrap();
+        })
+        .unwrap();
 
         self.verifier = Some(verifier);
 
-        self.account.lock().await.circle(&CircleSendMessage {
-            atxid: request.atxnid.clone(),
-            circlestep: 2,
-            idmsdata: Some(request.idmsdata.clone()),
-            pakedata: Some(base64_encode(&step2)),
-            ptkn: encode_hex(&self.push_token).to_uppercase(),
-            ec: None,
-        }, true).await?;
+        self.account
+            .lock()
+            .await
+            .circle(
+                &CircleSendMessage {
+                    atxid: request.atxnid.clone(),
+                    circlestep: 2,
+                    idmsdata: Some(request.idmsdata.clone()),
+                    pakedata: Some(base64_encode(&step2)),
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: None,
+                },
+                true,
+            )
+            .await?;
 
         Ok(())
     }
 
     pub async fn cancel(&self) -> Result<(), PushError> {
-        self.account.lock().await.circle(&CircleSendMessage {
-            atxid: self.atxid.clone(),
-            circlestep: 0,
-            ptkn: encode_hex(&self.push_token).to_uppercase(),
-            ec: Some(-9004),
-            idmsdata: None,
-            pakedata: None,
-        }, true).await?;
+        self.account
+            .lock()
+            .await
+            .circle(
+                &CircleSendMessage {
+                    atxid: self.atxid.clone(),
+                    circlestep: 0,
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: Some(-9004),
+                    idmsdata: None,
+                    pakedata: None,
+                },
+                true,
+            )
+            .await?;
         return Ok(());
     }
 
-    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<Option<LoginState>, PushError> {
+    pub async fn handle_circle_request(
+        &mut self,
+        request: &IdmsCircleMessage,
+    ) -> Result<Option<LoginState>, PushError> {
         if let Some(ec) = &request.ec {
             if *ec != -9005 {
                 if *ec == -9003 {
                     // bad password
                     return Err(PushError::Bad2FaCode);
                 }
-                return Err(PushError::IdmsCircleError(*ec))
+                return Err(PushError::IdmsCircleError(*ec));
             }
             // 9005 is proximity check failed which is expected since we don't support proximity checks.
             // We can continue anyways, it is a soft error.
         }
-        let Some(pake) = &request.pake else { return Err(PushError::IdmsCircleError(50)) };
+        let Some(pake) = &request.pake else {
+            return Err(PushError::IdmsCircleError(50));
+        };
         match request.step {
             2 => {
                 self.saved_step = Some(request.clone());
@@ -1125,24 +1524,34 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                 }
             }
             4 => {
-                let step3: CircleStep3 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep1");
-                self.verifier.as_ref().unwrap().verify_server(&step3.proof).unwrap();
+                let step3: CircleStep3 =
+                    rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep1");
+                self.verifier
+                    .as_ref()
+                    .unwrap()
+                    .verify_server(&step3.proof)
+                    .unwrap();
 
-                self.channel = Some(CircleEncryptedChannel::new(self.verifier.as_ref().unwrap().key()));
+                self.channel = Some(CircleEncryptedChannel::new(
+                    self.verifier.as_ref().unwrap().key(),
+                ));
                 let channel = self.channel.as_ref().unwrap();
 
-                let decoded: String = rasn::der::decode(&channel.decrypt_from_server(&step3.payload)).expect("Failed to encode der?");
-                info!("Got code {}", decoded);
+                let decoded: String =
+                    rasn::der::decode(&channel.decrypt_from_server(&step3.payload))
+                        .expect("Failed to encode der?");
+                info!("Received encrypted-channel verification code");
 
                 self.saved_step = Some(request.clone());
 
                 return Ok(Some(self.account.lock().await.verify_2fa(decoded).await?));
-            },
+            }
             6 => {
-                let step5: CircleStep5 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep1");
+                let step5: CircleStep5 =
+                    rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep1");
                 if step5.voucher.is_empty() {
                     warn!("Not joining clique because peer did not send voucher!");
-                    return Ok(Some(LoginState::LoggedIn))
+                    return Ok(Some(LoginState::LoggedIn));
                 }
                 use prost::Message;
                 let message = OctagonPairingMessage::decode(Cursor::new(&step5.voucher))?;
@@ -1150,8 +1559,20 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                     info: message.step5.as_ref().unwrap().voucher.clone(),
                     signature: message.step5.as_ref().unwrap().voucher_sig.clone(),
                 };
-                self.trusted_peers.as_ref().unwrap().join_clique(self.saved_device_password.as_ref().unwrap(), self.private_identity.as_ref().expect("no private identity??"), Some(info), &[], vec![]).await?;
-                return Ok(Some(LoginState::LoggedIn))
+                self.trusted_peers
+                    .as_ref()
+                    .unwrap()
+                    .join_clique(
+                        self.saved_device_password.as_ref().unwrap(),
+                        self.private_identity
+                            .as_ref()
+                            .expect("no private identity??"),
+                        Some(info),
+                        &[],
+                        vec![],
+                    )
+                    .await?;
+                return Ok(Some(LoginState::LoggedIn));
             }
             _circlestep => {
                 warn!("Ignoring unknown circle step {_circlestep}");
@@ -1160,24 +1581,31 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         Ok(None)
     }
 
-    pub async fn setup_trusted_peers(&mut self, peers: Arc<KeychainClient<P>>, device_password: &[u8]) -> Result<(), PushError> {
+    pub async fn setup_trusted_peers(
+        &mut self,
+        peers: Arc<KeychainClient<P>>,
+        device_password: &[u8],
+    ) -> Result<(), PushError> {
         self.private_identity = Some(peers.new_user_identity(false).await?);
 
         peers.sync_trust().await?;
 
-        let Some(request) = &self.saved_step else { return Ok(()) };
+        let Some(request) = &self.saved_step else {
+            return Ok(());
+        };
         if request.step != 4 {
-            return Err(PushError::WrongStep(request.step))
+            return Err(PushError::WrongStep(request.step));
         }
 
         if request.ec.is_some() {
             // we failed the proximity check
-            return Err(PushError::CircleOver)
+            return Err(PushError::CircleOver);
         }
 
         let state = peers.state.read().await;
         let identity = state.user_identity.as_ref().unwrap();
-        let stable_info = identity.sign_payload(peers.generate_stable_info(&state), "TPPB.PeerStableInfo")?;
+        let stable_info =
+            identity.sign_payload(peers.generate_stable_info(&state), "TPPB.PeerStableInfo")?;
 
         use prost::Message;
 
@@ -1192,25 +1620,43 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                     stable_info_sig: stable_info.signature.clone(),
                 }),
                 step5: None,
-                supports_octagon: Some(octagon_pairing_message::SupportsOctagon { supports_octagon: Some(true) }),
-                supports_sos: Some(octagon_pairing_message::SupportsSos { supports_sos: Some(false) }),
-            })
-        }.encode_to_vec();
+                supports_octagon: Some(octagon_pairing_message::SupportsOctagon {
+                    supports_octagon: Some(true),
+                }),
+                supports_sos: Some(octagon_pairing_message::SupportsSos {
+                    supports_sos: Some(false),
+                }),
+            }),
+        }
+        .encode_to_vec();
 
         let message = rasn::der::encode(&CircleStep4 {
             circle_step: 4.into(),
-            welcome: self.channel.as_ref().unwrap().encrypt_to_server(&pairing).into(),
+            welcome: self
+                .channel
+                .as_ref()
+                .unwrap()
+                .encrypt_to_server(&pairing)
+                .into(),
             unk2: None,
-        }).expect("outer encoding failed");
-        
-        self.account.lock().await.circle(&CircleSendMessage {
-            atxid: request.atxnid.clone(),
-            circlestep: 4,
-            idmsdata: Some(request.idmsdata.clone()),
-            pakedata: Some(base64_encode(&message)),
-            ptkn: encode_hex(&self.push_token).to_uppercase(),
-            ec: None,
-        }, true).await?;
+        })
+        .expect("outer encoding failed");
+
+        self.account
+            .lock()
+            .await
+            .circle(
+                &CircleSendMessage {
+                    atxid: request.atxnid.clone(),
+                    circlestep: 4,
+                    idmsdata: Some(request.idmsdata.clone()),
+                    pakedata: Some(base64_encode(&message)),
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: None,
+                },
+                true,
+            )
+            .await?;
 
         drop(state);
 
@@ -1236,11 +1682,21 @@ pub struct CircleServerSession<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> CircleServerSession<P> {
-    pub fn new(dsid: u64, otp: u32, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32], trusted_peers: Option<Arc<KeychainClient<P>>>) -> Self {
+    pub fn new(
+        dsid: u64,
+        otp: u32,
+        account: Arc<DebugMutex<AppleAccount<P>>>,
+        push_token: [u8; 32],
+        trusted_peers: Option<Arc<KeychainClient<P>>>,
+    ) -> Self {
         let salt: [u8; 16] = rand::random();
         let client = SrpClient::<Sha256>::new(&G_3072);
         // check password, was guess
-        let verifier = client.compute_verifier(format!("{dsid}").as_bytes(), format!("{:0>6}", otp).as_bytes(), &salt);
+        let verifier = client.compute_verifier(
+            format!("{dsid}").as_bytes(),
+            format!("{:0>6}", otp).as_bytes(),
+            &salt,
+        );
 
         Self {
             salt,
@@ -1256,101 +1712,175 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
         }
     }
 
-    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<bool, PushError> {
+    pub async fn handle_circle_request(
+        &mut self,
+        request: &IdmsCircleMessage,
+    ) -> Result<bool, PushError> {
         if let Some(ec) = &request.ec {
-            return Err(PushError::IdmsCircleError(*ec))
+            return Err(PushError::IdmsCircleError(*ec));
         }
-        let Some(pake) = &request.pake else { return Err(PushError::IdmsCircleError(50)) };
+        let Some(pake) = &request.pake else {
+            return Err(PushError::IdmsCircleError(50));
+        };
         match request.step {
             1 => {
-                let step0: CircleStep0 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
+                let step0: CircleStep0 =
+                    rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
                 self.client_public = Some(step0.public_ephermeral.into());
-                let b_pub = self.server.compute_public_ephemeral(&self.b, &self.verifier);
+                let b_pub = self
+                    .server
+                    .compute_public_ephemeral(&self.b, &self.verifier);
 
                 use prost::Message;
 
                 let is_in_clique = if let Some(tp) = &self.trusted_peers {
                     tp.is_in_clique().await
-                } else { false };
+                } else {
+                    false
+                };
 
                 let step1 = rasn::der::encode(&CircleStep1 {
                     circle_step: 1.into(),
                     body: rasn::der::encode(&CircleStep1Body {
                         salt: self.salt.to_vec().into(),
-                        public_ephermeral: b_pub.into()
-                    }).unwrap().into(),
-                    octagon: if is_in_clique { Some(OctagonPairingMessage {
-                        step1: Some(octagon_pairing_message::Step1 {
-                            epoch: Some(1),
-                        }),
-                        step4: None,
-                        step5: None,
-                        supports_octagon: Some(octagon_pairing_message::SupportsOctagon { supports_octagon: Some(true) }),
-                        supports_sos: Some(octagon_pairing_message::SupportsSos { supports_sos: Some(false) }),
-                    }.encode_to_vec().into()) } else { None }
-                }).unwrap();
+                        public_ephermeral: b_pub.into(),
+                    })
+                    .unwrap()
+                    .into(),
+                    octagon: if is_in_clique {
+                        Some(
+                            OctagonPairingMessage {
+                                step1: Some(octagon_pairing_message::Step1 { epoch: Some(1) }),
+                                step4: None,
+                                step5: None,
+                                supports_octagon: Some(octagon_pairing_message::SupportsOctagon {
+                                    supports_octagon: Some(true),
+                                }),
+                                supports_sos: Some(octagon_pairing_message::SupportsSos {
+                                    supports_sos: Some(false),
+                                }),
+                            }
+                            .encode_to_vec()
+                            .into(),
+                        )
+                    } else {
+                        None
+                    },
+                })
+                .unwrap();
 
-                println!("Body {}", encode_hex(&step1));
+                debug!("Created initial circle pairing message");
 
-                self.account.lock().await.circle(&CircleSendMessage {
-                    atxid: request.atxnid.clone(),
-                    circlestep: 1,
-                    idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: Some(base64_encode(&step1)),
-                    ptkn: encode_hex(&self.push_token).to_uppercase(),
-                    ec: None,
-                }, false).await?;
-            },
+                self.account
+                    .lock()
+                    .await
+                    .circle(
+                        &CircleSendMessage {
+                            atxid: request.atxnid.clone(),
+                            circlestep: 1,
+                            idmsdata: Some(request.idmsdata.clone()),
+                            pakedata: Some(base64_encode(&step1)),
+                            ptkn: encode_hex(&self.push_token).to_uppercase(),
+                            ec: None,
+                        },
+                        false,
+                    )
+                    .await?;
+            }
             3 => {
-                let step2: CircleStep2 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
-                let verifier = self.server.process_reply(&self.b, &self.verifier, self.client_public.as_ref().unwrap(), format!("{}", self.dsid).as_bytes(), &self.salt).expect("Srp failure");
+                let step2: CircleStep2 =
+                    rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
+                let verifier = self
+                    .server
+                    .process_reply(
+                        &self.b,
+                        &self.verifier,
+                        self.client_public.as_ref().unwrap(),
+                        format!("{}", self.dsid).as_bytes(),
+                        &self.salt,
+                    )
+                    .expect("Srp failure");
                 if let Err(e) = verifier.verify_client(&step2.proof) {
                     warn!("SRP auth error {e}");
-                    self.account.lock().await.circle(&CircleSendMessage {
-                        atxid: request.atxnid.clone(),
-                        circlestep: 3,
-                        idmsdata: Some(request.idmsdata.clone()),
-                        pakedata: Some(base64_encode(&rasn::der::encode(&CircleError {
-                            extra_code: 0.into(),
-                            meta: vec![].into()
-                        }).unwrap())),
-                        ptkn: encode_hex(&self.push_token).to_uppercase(),
-                        ec: Some(-9003),
-                    }, false).await?;
+                    self.account
+                        .lock()
+                        .await
+                        .circle(
+                            &CircleSendMessage {
+                                atxid: request.atxnid.clone(),
+                                circlestep: 3,
+                                idmsdata: Some(request.idmsdata.clone()),
+                                pakedata: Some(base64_encode(
+                                    &rasn::der::encode(&CircleError {
+                                        extra_code: 0.into(),
+                                        meta: vec![].into(),
+                                    })
+                                    .unwrap(),
+                                )),
+                                ptkn: encode_hex(&self.push_token).to_uppercase(),
+                                ec: Some(-9003),
+                            },
+                            false,
+                        )
+                        .await?;
                     return Ok(false);
                 }
                 let receipt = verifier.proof();
 
                 let channel = CircleEncryptedChannel::new(verifier.key());
 
-                let twofa_code = self.account.lock().await.anisette.lock().await.provider.get_2fa_code().await?;
+                let twofa_code = self
+                    .account
+                    .lock()
+                    .await
+                    .anisette
+                    .lock()
+                    .await
+                    .provider
+                    .get_2fa_code()
+                    .await?;
                 let twofa_str = format!("{:0>6}", twofa_code);
-                
+
                 let message = rasn::der::encode(&CircleStep3 {
                     circle_step: 3.into(),
                     proof: receipt.to_vec().into(),
-                    payload: channel.encrypt_to_client(&rasn::der::encode(&twofa_str).expect("Failed to encode der?")).into(),
-                }).expect("outer encoding failed");
+                    payload: channel
+                        .encrypt_to_client(
+                            &rasn::der::encode(&twofa_str).expect("Failed to encode der?"),
+                        )
+                        .into(),
+                })
+                .expect("outer encoding failed");
 
-                self.account.lock().await.circle(&CircleSendMessage {
-                    atxid: request.atxnid.clone(),
-                    circlestep: 3,
-                    idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: Some(base64_encode(&message)),
-                    ptkn: encode_hex(&self.push_token).to_uppercase(),
-                    ec: None,
-                }, false).await?;
+                self.account
+                    .lock()
+                    .await
+                    .circle(
+                        &CircleSendMessage {
+                            atxid: request.atxnid.clone(),
+                            circlestep: 3,
+                            idmsdata: Some(request.idmsdata.clone()),
+                            pakedata: Some(base64_encode(&message)),
+                            ptkn: encode_hex(&self.push_token).to_uppercase(),
+                            ec: None,
+                        },
+                        false,
+                    )
+                    .await?;
 
                 self.channel = Some(channel);
-            },
+            }
             5 => {
-                let step4: CircleStep4 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
+                let step4: CircleStep4 =
+                    rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
 
                 let channel = self.channel.as_ref().unwrap();
 
                 let is_in_clique = if let Some(tp) = &self.trusted_peers {
                     tp.is_in_clique().await
-                } else { false };
+                } else {
+                    false
+                };
                 use prost::Message;
 
                 let wrapper = if let Some(wrapper) = channel.decrypt_from_client(&step4.welcome) {
@@ -1361,57 +1891,91 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 
                 if !is_in_clique || wrapper.is_err() {
                     // Let's just say "I don't have them", because, well, I don't
-                    self.account.lock().await.circle(&CircleSendMessage {
-                        atxid: request.atxnid.clone(),
-                        circlestep: 5,
-                        idmsdata: Some(request.idmsdata.clone()),
-                        pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep5 {
-                            circle_step: 5.into(),
-                            voucher: vec![].into(),
-                        }).expect("outer encoding failed"))),
-                        ptkn: encode_hex(&self.push_token).to_uppercase(),
-                        ec: None,
-                    }, false).await?;
-                    return Ok(true)
+                    self.account
+                        .lock()
+                        .await
+                        .circle(
+                            &CircleSendMessage {
+                                atxid: request.atxnid.clone(),
+                                circlestep: 5,
+                                idmsdata: Some(request.idmsdata.clone()),
+                                pakedata: Some(base64_encode(
+                                    &rasn::der::encode(&CircleStep5 {
+                                        circle_step: 5.into(),
+                                        voucher: vec![].into(),
+                                    })
+                                    .expect("outer encoding failed"),
+                                )),
+                                ptkn: encode_hex(&self.push_token).to_uppercase(),
+                                ec: None,
+                            },
+                            false,
+                        )
+                        .await?;
+                    return Ok(true);
                 }
 
                 let wrapper = wrapper.unwrap().step4.unwrap();
                 let cuttlefish_peer = EncodedPeer(CuttlefishPeer {
                     hash: wrapper.peer_id,
-                    permanent_info: Some(SignedInfo { info: wrapper.permanent_info, signature: wrapper.permanent_info_sig }),
-                    stable_info: Some(SignedInfo { info: wrapper.stable_info, signature: wrapper.stable_info_sig }),
+                    permanent_info: Some(SignedInfo {
+                        info: wrapper.permanent_info,
+                        signature: wrapper.permanent_info_sig,
+                    }),
+                    stable_info: Some(SignedInfo {
+                        info: wrapper.stable_info,
+                        signature: wrapper.stable_info_sig,
+                    }),
                     dynamic_info: None,
                     voucher: None,
                 });
-
 
                 let peers = self.trusted_peers.as_ref().unwrap();
                 let tlks = peers.get_share_tlks().await?;
                 peers.share_tlks_to_peer(&cuttlefish_peer, &tlks).await?;
 
-                let voucher = peers.state.read().await.user_identity.as_ref().unwrap().vouch_for(cuttlefish_peer.0.hash().to_string())?;
-                
-                self.account.lock().await.circle(&CircleSendMessage {
-                    atxid: request.atxnid.clone(),
-                    circlestep: 5,
-                    idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep5 {
-                        circle_step: 5.into(),
-                        voucher: OctagonPairingMessage {
-                            step1: None,
-                            step4: None,
-                            step5: Some(Step5 {
-                                voucher: voucher.info,
-                                voucher_sig: voucher.signature,
-                            }),
-                            supports_octagon: Some(Default::default()),
-                            supports_sos: Some(Default::default()),
-                        }.encode_to_vec().into(),
-                    }).expect("outer encoding failed"))),
-                    ptkn: encode_hex(&self.push_token).to_uppercase(),
-                    ec: None,
-                }, false).await?;
-            },
+                let voucher = peers
+                    .state
+                    .read()
+                    .await
+                    .user_identity
+                    .as_ref()
+                    .unwrap()
+                    .vouch_for(cuttlefish_peer.0.hash().to_string())?;
+
+                self.account
+                    .lock()
+                    .await
+                    .circle(
+                        &CircleSendMessage {
+                            atxid: request.atxnid.clone(),
+                            circlestep: 5,
+                            idmsdata: Some(request.idmsdata.clone()),
+                            pakedata: Some(base64_encode(
+                                &rasn::der::encode(&CircleStep5 {
+                                    circle_step: 5.into(),
+                                    voucher: OctagonPairingMessage {
+                                        step1: None,
+                                        step4: None,
+                                        step5: Some(Step5 {
+                                            voucher: voucher.info,
+                                            voucher_sig: voucher.signature,
+                                        }),
+                                        supports_octagon: Some(Default::default()),
+                                        supports_sos: Some(Default::default()),
+                                    }
+                                    .encode_to_vec()
+                                    .into(),
+                                })
+                                .expect("outer encoding failed"),
+                            )),
+                            ptkn: encode_hex(&self.push_token).to_uppercase(),
+                            ec: None,
+                        },
+                        false,
+                    )
+                    .await?;
+            }
             _circlestep => {
                 warn!("Ignoring unknown circle step {_circlestep}");
             }
@@ -1419,7 +1983,6 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
         Ok(true)
     }
 }
-
 
 impl IdmsAuthListener {
     pub async fn new(conn: APSConnection) -> Self {
@@ -1429,17 +1992,37 @@ impl IdmsAuthListener {
     }
 
     pub fn handle(&self, message: APSMessage) -> Result<Option<IdmsMessage>, PushError> {
-        let APSMessage::Notification { topic, payload: Value::Data(payload), .. } = message else { return Ok(None) };
-        if &topic != &sha1("com.apple.idmsauth".as_bytes()) { return Ok(None) }
+        let APSMessage::Notification {
+            topic,
+            payload: Value::Data(payload),
+            ..
+        } = message
+        else {
+            return Ok(None);
+        };
+        if &topic != &sha1("com.apple.idmsauth".as_bytes()) {
+            return Ok(None);
+        }
 
-        let data: serde_json::value::Map<String, serde_json::Value> = serde_json::from_slice(&payload)?;
+        let data: serde_json::value::Map<String, serde_json::Value> =
+            serde_json::from_slice(&payload)?;
 
-        debug!("Got idms message {data:?}");
+        debug!(
+            "Received IDMS message (command_present={})",
+            data.contains_key("cmd")
+        );
 
         Ok(match data["cmd"].as_u64().unwrap() {
-            100 => Some(IdmsMessage::RequestedSignIn(serde_json::from_slice(&payload)?)),
-            400 => Some(IdmsMessage::TeardownSignIn(serde_json::from_slice(&payload)?)),
-            700 => Some(IdmsMessage::CircleRequest(serde_json::from_slice(&payload)?, serde_json::from_slice(&payload).ok())),
+            100 => Some(IdmsMessage::RequestedSignIn(serde_json::from_slice(
+                &payload,
+            )?)),
+            400 => Some(IdmsMessage::TeardownSignIn(serde_json::from_slice(
+                &payload,
+            )?)),
+            700 => Some(IdmsMessage::CircleRequest(
+                serde_json::from_slice(&payload)?,
+                serde_json::from_slice(&payload).ok(),
+            )),
             _cmd => {
                 debug!("Ignoring unknown IDMS message");
                 None
@@ -1447,4 +2030,3 @@ impl IdmsAuthListener {
         })
     }
 }
-

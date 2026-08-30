@@ -1,13 +1,25 @@
 use std::{collections::HashMap, io::Cursor, sync::RwLock};
 
+use crate::{
+    EcCurve, EncryptMode, KeyType, Keystore, KeystoreAccessRules, KeystoreDigest, KeystoreError,
+    KeystorePadding,
+};
+use aes_gcm::KeyInit;
 use aes_gcm::{Aes256Gcm, Nonce, aead::Aead};
-use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcGroupRef, EcKey, EcPoint}, encrypt::{Decrypter, Encrypter}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sign::{Signer, Verifier}};
+use openssl::{
+    bn::BigNumContext,
+    derive::Deriver,
+    ec::{EcGroup, EcGroupRef, EcKey, EcPoint},
+    encrypt::{Decrypter, Encrypter},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    rsa::{Padding, Rsa},
+    sign::{Signer, Verifier},
+};
 use plist::Data;
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::{EcCurve, EncryptMode, KeyType, Keystore, KeystoreAccessRules, KeystoreDigest, KeystoreError, KeystorePadding};
-use aes_gcm::KeyInit;
-
 
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
@@ -73,8 +85,20 @@ pub struct SoftwareKeystoreState {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum SoftwareKeystoreKey {
-    Rsa(#[serde(serialize_with = "rsa_serialize_priv", deserialize_with = "rsa_deserialize_priv")] Rsa<Private>),
-    Ec(#[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv")] EcKey<Private>),
+    Rsa(
+        #[serde(
+            serialize_with = "rsa_serialize_priv",
+            deserialize_with = "rsa_deserialize_priv"
+        )]
+        Rsa<Private>,
+    ),
+    Ec(
+        #[serde(
+            serialize_with = "ec_serialize_priv",
+            deserialize_with = "ec_deserialize_priv"
+        )]
+        EcKey<Private>,
+    ),
     Aes(#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>),
 }
 
@@ -82,15 +106,17 @@ impl SoftwareKeystoreKey {
     fn get_type(&self) -> KeyType {
         match self {
             Self::Rsa(rsa) => KeyType::Rsa(rsa.size() as u16 * 8),
-            Self::Aes(n) => KeyType::Rsa(n.len() as u16 * 8),
-            Self::Ec(k) => KeyType::Ec(ec_group_to_curve(k.group()))
+            Self::Aes(n) => KeyType::Aes(n.len() as u16 * 8),
+            Self::Ec(k) => KeyType::Ec(ec_group_to_curve(k.group())),
         }
     }
 
     pub(crate) fn new(r#type: KeyType) -> Result<Self, KeystoreError> {
         Ok(match r#type {
             KeyType::Aes(bits) => {
-                if bits % 8 != 0 { return Err(KeystoreError::NotSupported) }
+                if bits % 8 != 0 {
+                    return Err(KeystoreError::NotSupported);
+                }
                 let bytes = bits / 8;
 
                 let mut random = vec![0u8; bytes as usize];
@@ -101,7 +127,7 @@ impl SoftwareKeystoreKey {
             KeyType::Ec(curve) => {
                 let key = EcKey::generate(&ec_curve_to_openssl(curve))?;
                 SoftwareKeystoreKey::Ec(key)
-            },
+            }
             KeyType::Rsa(bits) => {
                 let rsa = Rsa::generate(bits as u32)?;
                 SoftwareKeystoreKey::Rsa(rsa)
@@ -119,13 +145,11 @@ impl SoftwareKeystoreKey {
 
     pub(crate) fn import(priv_key: &[u8], r#type: KeyType) -> Result<Self, KeystoreError> {
         Ok(match r#type {
-            KeyType::Aes(_) => {
-                SoftwareKeystoreKey::Aes(priv_key.to_vec())
-            }
+            KeyType::Aes(_) => SoftwareKeystoreKey::Aes(priv_key.to_vec()),
             KeyType::Ec(_) => {
                 let key = EcKey::private_key_from_der(priv_key)?;
                 SoftwareKeystoreKey::Ec(key)
-            },
+            }
             KeyType::Rsa(_) => {
                 let rsa = Rsa::private_key_from_der(priv_key)?;
                 SoftwareKeystoreKey::Rsa(rsa)
@@ -167,14 +191,57 @@ impl SoftwareKeystoreEncryptor for SoftwareEncryptor {
     }
 }
 
+impl SoftwareKeystoreState {
+    /// Validates every encrypted entry and re-wraps it with a new encryptor.
+    ///
+    /// Key payloads are decoded and encoded again so a syntactically invalid
+    /// legacy entry cannot be silently carried into a new keystore format.
+    pub fn rewrap(
+        &self,
+        source: &impl SoftwareKeystoreEncryptor,
+        destination: &impl SoftwareKeystoreEncryptor,
+    ) -> Result<Self, KeystoreError> {
+        let mut keys = HashMap::with_capacity(self.keys.len());
+        for (alias, wrapped) in &self.keys {
+            let plaintext = source.decrypt(wrapped.as_ref())?;
+            let key: SoftwareKeystoreKey = plist::from_bytes(&plaintext).map_err(|_| {
+                KeystoreError::KeystoreError("Invalid software key entry".to_string())
+            })?;
+            let canonical = plist_to_bin(&key).map_err(|_| {
+                KeystoreError::KeystoreError("Failed to encode software key entry".to_string())
+            })?;
+            keys.insert(alias.clone(), destination.encrypt(&canonical)?.into());
+        }
+
+        let mut secrets = HashMap::with_capacity(self.secrets.len());
+        for (alias, wrapped) in &self.secrets {
+            let plaintext = source.decrypt(wrapped.as_ref())?;
+            secrets.insert(alias.clone(), destination.encrypt(&plaintext)?.into());
+        }
+
+        Ok(Self { keys, secrets })
+    }
+
+    pub fn validate(
+        &self,
+        encryptor: &impl SoftwareKeystoreEncryptor,
+    ) -> Result<(), KeystoreError> {
+        self.rewrap(encryptor, encryptor).map(|_| ())
+    }
+}
+
 impl<T: Keystore> SoftwareKeystoreEncryptor for T {
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
-        self.ensure_exists("keystore:software:encryptor", KeyType::Aes(256), KeystoreAccessRules {
-            block_modes: vec![EncryptMode::Gcm],
-            can_encrypt: true,
-            can_decrypt: true,
-            ..Default::default()
-        })?;
+        self.ensure_exists(
+            "keystore:software:encryptor",
+            KeyType::Aes(256),
+            KeystoreAccessRules {
+                block_modes: vec![EncryptMode::Gcm],
+                can_encrypt: true,
+                can_decrypt: true,
+                ..Default::default()
+            },
+        )?;
 
         self.encrypt("keystore:software:encryptor", data, &mut EncryptMode::Gcm)
     }
@@ -194,14 +261,15 @@ pub(crate) fn ec_curve_to_openssl(curve: EcCurve) -> EcGroup {
     EcGroup::from_curve_name(match curve {
         EcCurve::P256 => Nid::X9_62_PRIME256V1,
         EcCurve::P384 => Nid::SECP384R1,
-    }).expect("Failed to get ECGroup")
+    })
+    .expect("Failed to get ECGroup")
 }
 
 pub(crate) fn ec_group_to_curve(group: &EcGroupRef) -> EcCurve {
     match group.curve_name().expect("No Curve name") {
         Nid::X9_62_PRIME256V1 => EcCurve::P256,
         Nid::SECP384R1 => EcCurve::P384,
-        _ => panic!("Unknown curve!")
+        _ => panic!("Unknown curve!"),
     }
 }
 
@@ -214,36 +282,54 @@ pub(crate) fn digest_to_md(digest: KeystoreDigest) -> MessageDigest {
 }
 
 pub(crate) fn contained_gcm_encrypt(key: &[u8], secret: &[u8]) -> Result<Vec<u8>, KeystoreError> {
-    let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
+        KeystoreError::KeystoreError("Invalid software-encryption key length".to_string())
+    })?;
 
     let nonce: [u8; 12] = rand::random();
-    let cipher = cipher.encrypt(Nonce::from_slice(&nonce), &*secret).expect("Failed to GCM");
+    let cipher = cipher
+        .encrypt(Nonce::from_slice(&nonce), secret)
+        .map_err(|_| KeystoreError::KeystoreError("Software encryption failed".to_string()))?;
 
     Ok([nonce.to_vec(), cipher].concat())
 }
 
 pub(crate) fn contained_gcm_decrypt(key: &[u8], text: &[u8]) -> Result<Vec<u8>, KeystoreError> {
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-                
-    Ok(cipher.decrypt(Nonce::from_slice(&text[..12]), &text[12..]).expect("Failed to GCM"))
+    if text.len() < 12 {
+        return Err(KeystoreError::KeystoreError(
+            "Truncated software-encryption payload".to_string(),
+        ));
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
+        KeystoreError::KeystoreError("Invalid software-encryption key length".to_string())
+    })?;
+
+    cipher
+        .decrypt(Nonce::from_slice(&text[..12]), &text[12..])
+        .map_err(|_| {
+            KeystoreError::KeystoreError("Software-encryption authentication failed".to_string())
+        })
 }
 
 impl<T: SoftwareKeystoreEncryptor> SoftwareKeystore<T> {
-
     fn get_key(&self, alias: &str) -> Result<SoftwareKeystoreKey, KeystoreError> {
         let state = self.state.read().expect("Failed to read!");
         let key = state.keys.get(alias).ok_or(KeystoreError::KeyNotFound)?;
-        
+
         let cipher = self.encryptor.decrypt(&key.as_ref())?;
-        Ok(plist::from_bytes(&cipher).expect("Failed to decrypt!"))
+        plist::from_bytes(&cipher)
+            .map_err(|_| KeystoreError::KeystoreError("Invalid software key entry".to_string()))
     }
 
     fn save_key(&self, alias: &str, key: SoftwareKeystoreKey) -> Result<(), KeystoreError> {
-        let key = self.encryptor.encrypt(&plist_to_bin(&key).expect("Failed to serialize!"))?;
-        
+        let encoded = plist_to_bin(&key).map_err(|_| {
+            KeystoreError::KeystoreError("Failed to encode software key entry".to_string())
+        })?;
+        let key = self.encryptor.encrypt(&encoded)?;
+
         let mut state = self.state.write().expect("Failed to read!");
         if state.keys.contains_key(alias) {
-            return Err(KeystoreError::KeyAlreadyExists)
+            return Err(KeystoreError::KeyAlreadyExists);
         }
         state.keys.insert(alias.to_string(), key.into());
         (self.update_state)(&*state);
@@ -252,7 +338,12 @@ impl<T: SoftwareKeystoreEncryptor> SoftwareKeystore<T> {
 }
 
 impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for SoftwareKeystore<T> {
-    fn create_key(&self, alias: &str, r#type: KeyType, _access_rules: KeystoreAccessRules) -> Result<(), KeystoreError> {
+    fn create_key(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        _access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError> {
         let key = SoftwareKeystoreKey::new(r#type)?;
 
         self.save_key(alias, key)?;
@@ -261,7 +352,9 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
 
     fn set_secret(&self, alias: &str, secret: &[u8]) -> Result<(), KeystoreError> {
         let mut state = self.state.write().expect("Failed to write!");
-        state.secrets.insert(alias.to_string(), self.encryptor.encrypt(secret)?.into());
+        state
+            .secrets
+            .insert(alias.to_string(), self.encryptor.encrypt(secret)?.into());
         (self.update_state)(&*state);
         Ok(())
     }
@@ -270,7 +363,9 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
         let state = self.state.read().expect("Failed to write!");
         Ok(if let Some(secret) = state.secrets.get(alias) {
             Some(self.encryptor.decrypt(secret.as_ref())?)
-        } else { None })
+        } else {
+            None
+        })
     }
 
     fn delete_secret(&self, alias: &str) -> Result<(), KeystoreError> {
@@ -292,19 +387,32 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
         Ok(())
     }
 
-    fn import_key(&self, alias: &str, r#type: KeyType, priv_key: &[u8], _access_rules: KeystoreAccessRules) -> Result<(), KeystoreError> {
+    fn import_key(
+        &self,
+        alias: &str,
+        r#type: KeyType,
+        priv_key: &[u8],
+        _access_rules: KeystoreAccessRules,
+    ) -> Result<(), KeystoreError> {
         let key = SoftwareKeystoreKey::import(priv_key, r#type)?;
 
         self.save_key(alias, key)?;
         Ok(())
     }
 
-    fn decrypt(&self, alias: &str, ciphertext: &[u8], mode: &crate::EncryptMode) -> Result<Vec<u8>, KeystoreError> {
+    fn decrypt(
+        &self,
+        alias: &str,
+        ciphertext: &[u8],
+        mode: &crate::EncryptMode,
+    ) -> Result<Vec<u8>, KeystoreError> {
         let key = self.get_key(alias)?;
 
         let result = match key {
             SoftwareKeystoreKey::Rsa(rsa) => {
-                let EncryptMode::Rsa(m) = mode else { return Err(KeystoreError::NotSupported) };
+                let EncryptMode::Rsa(m) = mode else {
+                    return Err(KeystoreError::NotSupported);
+                };
 
                 let pkey = PKey::from_rsa(rsa.clone())?;
                 let mut decrypter = Decrypter::new(&pkey)?;
@@ -313,7 +421,7 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
                         decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
                         decrypter.set_rsa_mgf1_md(digest_to_md(*mgf1))?;
                         decrypter.set_rsa_oaep_md(digest_to_md(*md))?;
-                    },
+                    }
                     KeystorePadding::PKCS1 => decrypter.set_rsa_padding(Padding::PKCS1)?,
                     KeystorePadding::None => {}
                 };
@@ -324,25 +432,27 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
                 rsa_body.truncate(decrypted_len);
 
                 rsa_body
-            },
-            SoftwareKeystoreKey::Aes(e) => {
-                let cipher = Aes256Gcm::new_from_slice(&e).unwrap();
-                
-                let cipher = cipher.decrypt(Nonce::from_slice(&ciphertext[..12]), &ciphertext[12..]).expect("Failed to GCM");
-                cipher
             }
+            SoftwareKeystoreKey::Aes(e) => contained_gcm_decrypt(&e, ciphertext)?,
             _ => return Err(KeystoreError::BadKeyType(key.get_type())),
         };
 
         Ok(result)
     }
 
-    fn encrypt(&self, alias: &str, plaintext: &[u8], mode: &mut crate::EncryptMode) -> Result<Vec<u8>, KeystoreError> {
+    fn encrypt(
+        &self,
+        alias: &str,
+        plaintext: &[u8],
+        mode: &mut crate::EncryptMode,
+    ) -> Result<Vec<u8>, KeystoreError> {
         let key = self.get_key(alias)?;
 
         let result = match key {
             SoftwareKeystoreKey::Rsa(rsa) => {
-                let EncryptMode::Rsa(m) = mode else { return Err(KeystoreError::NotSupported) };
+                let EncryptMode::Rsa(m) = mode else {
+                    return Err(KeystoreError::NotSupported);
+                };
 
                 let pkey = PKey::from_rsa(rsa.clone())?;
                 let mut encrypter = Encrypter::new(&pkey)?;
@@ -351,7 +461,7 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
                         encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
                         encrypter.set_rsa_mgf1_md(digest_to_md(*mgf1))?;
                         encrypter.set_rsa_oaep_md(digest_to_md(*md))?;
-                    },
+                    }
                     KeystorePadding::PKCS1 => encrypter.set_rsa_padding(Padding::PKCS1)?,
                     KeystorePadding::None => {}
                 };
@@ -362,18 +472,11 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
                 rsa_body.truncate(encrypted_len);
 
                 rsa_body
-            },
-            SoftwareKeystoreKey::Aes(e) => {
-                let cipher = Aes256Gcm::new_from_slice(&e).unwrap();
-                
-                let nonce: [u8; 12] = rand::random();
-                let cipher = cipher.encrypt(Nonce::from_slice(&nonce), plaintext).expect("Failed to GCM");
-                
-                [nonce.to_vec(), cipher].concat()
             }
+            SoftwareKeystoreKey::Aes(e) => contained_gcm_encrypt(&e, plaintext)?,
             _ => return Err(KeystoreError::BadKeyType(key.get_type())),
         };
-        
+
         Ok(result)
     }
 
@@ -394,9 +497,11 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
         Ok(result)
     }
 
-    fn derive(&self, alias: &str, peer: &[u8]) -> Result<Vec<u8>, KeystoreError> {       
+    fn derive(&self, alias: &str, peer: &[u8]) -> Result<Vec<u8>, KeystoreError> {
         let key = self.get_key(alias)?;
-        let SoftwareKeystoreKey::Ec(ec) = key else { return Err(KeystoreError::NotSupported) };
+        let SoftwareKeystoreKey::Ec(ec) = key else {
+            return Err(KeystoreError::NotSupported);
+        };
 
         let group = ec.group();
         let mut num_context_ref = BigNumContext::new()?;
@@ -411,7 +516,13 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
         Ok(deriver.derive_to_vec()?)
     }
 
-    fn sign(&self, alias: &str, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+    fn sign(
+        &self,
+        alias: &str,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+    ) -> Result<Vec<u8>, KeystoreError> {
         let key = self.get_key(alias)?;
 
         let pkey = match key {
@@ -424,7 +535,7 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
             KeystorePadding::OAEP { md, mgf1 } => {
                 my_signer.set_rsa_padding(Padding::PKCS1_OAEP)?;
                 my_signer.set_rsa_mgf1_md(digest_to_md(mgf1))?;
-            },
+            }
             KeystorePadding::PKCS1 => my_signer.set_rsa_padding(Padding::PKCS1)?,
             KeystorePadding::None => {}
         };
@@ -433,7 +544,14 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
         Ok(data)
     }
 
-    fn verify(&self, alias: &str, digest: KeystoreDigest, padding: KeystorePadding, data: &[u8], sig: &[u8]) -> Result<bool, KeystoreError> {
+    fn verify(
+        &self,
+        alias: &str,
+        digest: KeystoreDigest,
+        padding: KeystorePadding,
+        data: &[u8],
+        sig: &[u8],
+    ) -> Result<bool, KeystoreError> {
         let key = self.get_key(alias)?;
 
         let pkey = match key {
@@ -446,7 +564,7 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
             KeystorePadding::OAEP { md, mgf1 } => {
                 my_signer.set_rsa_padding(Padding::PKCS1_OAEP)?;
                 my_signer.set_rsa_mgf1_md(digest_to_md(mgf1))?;
-            },
+            }
             KeystorePadding::PKCS1 => my_signer.set_rsa_padding(Padding::PKCS1)?,
             KeystorePadding::None => {}
         };
@@ -455,3 +573,49 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contained_gcm_rejects_truncated_and_tampered_payloads() {
+        let key = [7_u8; 32];
+        assert!(contained_gcm_decrypt(&key, &[1, 2, 3]).is_err());
+
+        let mut encrypted = contained_gcm_encrypt(&key, b"secret").expect("encrypt");
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0x80;
+        assert!(contained_gcm_decrypt(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn state_rewrap_validates_keys_and_secrets() {
+        let source = SoftwareEncryptor([1_u8; 32]);
+        let destination = SoftwareEncryptor([2_u8; 32]);
+        let key = SoftwareKeystoreKey::Aes(vec![9_u8; 32]);
+        let key_bytes = plist_to_bin(&key).expect("encode key");
+
+        let state = SoftwareKeystoreState {
+            keys: HashMap::from([(
+                "test-key".to_string(),
+                source.encrypt(&key_bytes).expect("wrap key").into(),
+            )]),
+            secrets: HashMap::from([(
+                "test-secret".to_string(),
+                source.encrypt(b"value").expect("wrap secret").into(),
+            )]),
+        };
+
+        let migrated = state.rewrap(&source, &destination).expect("rewrap");
+        migrated
+            .validate(&destination)
+            .expect("validate destination");
+        assert!(migrated.validate(&source).is_err());
+    }
+
+    #[test]
+    fn aes_key_reports_the_correct_type() {
+        let key = SoftwareKeystoreKey::Aes(vec![0_u8; 32]);
+        assert!(matches!(key.get_type(), KeyType::Aes(256)));
+    }
+}
