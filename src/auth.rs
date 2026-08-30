@@ -131,7 +131,7 @@ struct CloudKitReadAuthenticationGeneration {
     revoked: AtomicBool,
 }
 
-type CloudKitReadAuthenticationInvalidator = Arc<dyn Fn() + Send + Sync>;
+type CloudKitReadAuthenticationInvalidator = Arc<dyn Fn() -> Result<(), PushError> + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct CloudKitReadAuthenticationLease {
@@ -178,7 +178,7 @@ impl CloudKitReadAuthenticationLease {
         Ok(CloudKitReadAuthenticationAdmission { _guard: guard })
     }
 
-    fn revoker(&self) -> CloudKitReadAuthenticationRevoker {
+    pub(crate) fn revoker(&self) -> CloudKitReadAuthenticationRevoker {
         CloudKitReadAuthenticationRevoker {
             generation: self.generation.clone(),
         }
@@ -195,6 +195,14 @@ pub struct CloudKitReadAuthenticationRevoker {
 }
 
 impl CloudKitReadAuthenticationRevoker {
+    fn matches(&self, lease: &CloudKitReadAuthenticationLease) -> bool {
+        Arc::ptr_eq(&self.generation, &lease.generation)
+    }
+
+    pub fn is_same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+    }
+
     pub async fn revoke(&self) {
         let _guard = self.generation.gate.clone().write_owned().await;
         self.generation.revoked.store(true, Ordering::Release);
@@ -212,6 +220,7 @@ pub struct TokenProvider<T: AnisetteProvider> {
     mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
     mme_refreshed: DebugMutex<SystemTime>,
     cloudkit_read_authentication: DebugMutex<Option<CloudKitReadAuthenticationCache>>,
+    cloudkit_read_authentication_mutation: DebugMutex<()>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -278,6 +287,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             mme_delegate: DebugMutex::new(None),
             mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
             cloudkit_read_authentication: DebugMutex::new(None),
+            cloudkit_read_authentication_mutation: DebugMutex::new(()),
         })
     }
 
@@ -292,7 +302,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         invalidator: F,
     ) -> Option<CloudKitReadAuthenticationRevoker>
     where
-        F: Fn() + Send + Sync + 'static,
+        F: Fn() -> Result<(), PushError> + Send + Sync + 'static,
     {
         if mme_auth_token.is_empty()
             || cloudkit_token.is_empty()
@@ -301,18 +311,22 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             return None;
         }
 
-        let mut cache = self.cloudkit_read_authentication.lock().await;
-        if let Some(existing) = cache.as_ref() {
-            if existing.refreshed >= refreshed && !existing.lease.is_revoked() {
-                return Some(existing.lease.revoker());
+        let _mutation = self.cloudkit_read_authentication_mutation.lock().await;
+        let existing = {
+            let mut cache = self.cloudkit_read_authentication.lock().await;
+            if let Some(existing) = cache.as_ref() {
+                if existing.refreshed >= refreshed && !existing.lease.is_revoked() {
+                    return Some(existing.lease.revoker());
+                }
             }
-        }
-        if let Some(existing) = cache.take() {
+            cache.take()
+        };
+        if let Some(existing) = existing {
             existing.lease.revoker().revoke().await;
         }
         let lease = CloudKitReadAuthenticationLease::new(mme_auth_token, cloudkit_token);
         let revoker = lease.revoker();
-        *cache = Some(CloudKitReadAuthenticationCache {
+        *self.cloudkit_read_authentication.lock().await = Some(CloudKitReadAuthenticationCache {
             lease,
             refreshed,
             invalidator: Arc::new(invalidator),
@@ -320,13 +334,38 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         Some(revoker)
     }
 
-    pub async fn invalidate_cloudkit_read_authentication(&self) {
-        let mut cache = self.cloudkit_read_authentication.lock().await;
-        let cached = cache.take();
+    pub async fn invalidate_cloudkit_read_authentication(&self) -> Result<bool, PushError> {
+        let _mutation = self.cloudkit_read_authentication_mutation.lock().await;
+        let cached = self.cloudkit_read_authentication.lock().await.take();
         if let Some(cached) = cached {
             cached.lease.revoker().revoke().await;
-            (cached.invalidator)();
+            (cached.invalidator)()?;
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// Invalidates only the exact generation that authenticated a failed
+    /// request. The request's read admission must be dropped before calling
+    /// this method so revocation can wait for every admitted use to finish.
+    pub(crate) async fn invalidate_cloudkit_read_authentication_generation(
+        &self,
+        failed_generation: &CloudKitReadAuthenticationRevoker,
+    ) -> Result<bool, PushError> {
+        let _mutation = self.cloudkit_read_authentication_mutation.lock().await;
+        let cached = {
+            let mut cache = self.cloudkit_read_authentication.lock().await;
+            if !cache
+                .as_ref()
+                .is_some_and(|cached| failed_generation.matches(&cached.lease))
+            {
+                return Ok(false);
+            }
+            cache.take().expect("matched CloudKit read authentication")
+        };
+        cached.lease.revoker().revoke().await;
+        (cached.invalidator)()?;
+        Ok(true)
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
@@ -525,21 +564,38 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     pub(crate) async fn cloudkit_read_authentication_lease(
         &self,
     ) -> Result<CloudKitReadAuthenticationLease, PushError> {
-        let mut cache = self.cloudkit_read_authentication.lock().await;
-        let refreshed = cache
-            .as_ref()
-            .map_or(SystemTime::UNIX_EPOCH, |cache| cache.refreshed);
-        if mme_delegate_is_warm(cache.is_some(), refreshed, SystemTime::now())
-            && cache
-                .as_ref()
-                .is_some_and(|cache| !cache.lease.is_revoked())
         {
-            return Ok(cache.as_ref().expect("validated cache").lease.clone());
+            let cache = self.cloudkit_read_authentication.lock().await;
+            let refreshed = cache
+                .as_ref()
+                .map_or(SystemTime::UNIX_EPOCH, |cache| cache.refreshed);
+            if mme_delegate_is_warm(cache.is_some(), refreshed, SystemTime::now())
+                && cache
+                    .as_ref()
+                    .is_some_and(|cache| !cache.lease.is_revoked())
+            {
+                return Ok(cache.as_ref().expect("validated cache").lease.clone());
+            }
         }
-        let stale = cache.take();
+
+        let _mutation = self.cloudkit_read_authentication_mutation.lock().await;
+        let stale = {
+            let mut cache = self.cloudkit_read_authentication.lock().await;
+            let refreshed = cache
+                .as_ref()
+                .map_or(SystemTime::UNIX_EPOCH, |cache| cache.refreshed);
+            if mme_delegate_is_warm(cache.is_some(), refreshed, SystemTime::now())
+                && cache
+                    .as_ref()
+                    .is_some_and(|cache| !cache.lease.is_revoked())
+            {
+                return Ok(cache.as_ref().expect("validated cache").lease.clone());
+            }
+            cache.take()
+        };
         if let Some(stale) = stale {
             stale.lease.revoker().revoke().await;
-            (stale.invalidator)();
+            (stale.invalidator)()?;
         }
         Err(PushError::CloudKitWarmAuthenticationRequired)
     }
@@ -590,6 +646,15 @@ mod token_provider_tests {
             lease.admit().await,
             Err(PushError::CloudKitWarmAuthenticationRequired)
         ));
+    }
+
+    #[test]
+    fn revokers_identify_only_their_exact_authentication_generation() {
+        let first = CloudKitReadAuthenticationLease::new_for_test("mme-one", "cloudkit-one");
+        let second = CloudKitReadAuthenticationLease::new_for_test("mme-two", "cloudkit-two");
+
+        assert!(first.revoker().is_same_generation(&first.revoker()));
+        assert!(!first.revoker().is_same_generation(&second.revoker()));
     }
 }
 

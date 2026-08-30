@@ -1921,15 +1921,45 @@ mod cloud_message_save_tests {
 pub struct CloudMessagesClient<P: AnisetteProvider> {
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
     container_initialization: Mutex<()>,
+    read_authentication_container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    read_authentication_container_initialization: Mutex<()>,
     pub client: Arc<CloudKitClient<P>>,
     pub keychain: Arc<KeychainClient<P>>,
 }
 
 impl<P: AnisetteProvider> CloudMessagesClient<P> {
+    async fn clear_general_container_if_same(
+        &self,
+        stale: &Arc<CloudKitOpenContainer<'static, P>>,
+    ) {
+        let mut cached = self.container.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            *cached = None;
+        }
+    }
+
+    async fn clear_read_authentication_container_if_same(
+        &self,
+        stale: &Arc<CloudKitOpenContainer<'static, P>>,
+    ) {
+        let mut cached = self.read_authentication_container.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            *cached = None;
+        }
+    }
+
     pub fn new(client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>) -> Self {
         Self {
             container: Mutex::new(None),
             container_initialization: Mutex::new(()),
+            read_authentication_container: Mutex::new(None),
+            read_authentication_container_initialization: Mutex::new(()),
             client,
             keychain,
         }
@@ -1942,8 +1972,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         container: Arc<CloudKitOpenContainer<'static, P>>,
     ) -> Self {
         Self {
-            container: Mutex::new(Some(container)),
+            container: Mutex::new(None),
             container_initialization: Mutex::new(()),
+            read_authentication_container: Mutex::new(Some(container)),
+            read_authentication_container_initialization: Mutex::new(()),
             client,
             keychain,
         }
@@ -1997,14 +2029,39 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        if let Some(container) = self.container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.clear_general_container_if_same(&container).await;
         }
         let _initialization = self.container_initialization.lock().await;
-        if let Some(container) = self.container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self.container.lock().await.as_ref().cloned();
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.clear_general_container_if_same(&container).await;
         }
         let container = Arc::new(MESSAGES_CONTAINER.init(self.client.clone()).await?);
+        container
+            .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
+            .await?;
         *self.container.lock().await = Some(container.clone());
         Ok(container)
     }
@@ -2017,27 +2074,50 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         permit: &CloudKitReadAuthenticationPermit<'_>,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         permit.validate()?;
-        let cached = self.container.lock().await.as_ref().cloned();
+        let cached = self
+            .read_authentication_container
+            .lock()
+            .await
+            .as_ref()
+            .cloned();
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Messages,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.clear_read_authentication_container_if_same(&container)
+                .await;
         }
-        let _initialization = self.container_initialization.lock().await;
+        let _initialization = self
+            .read_authentication_container_initialization
+            .lock()
+            .await;
         permit.validate()?;
-        let cached = self.container.lock().await.as_ref().cloned();
+        let cached = self
+            .read_authentication_container
+            .lock()
+            .await
+            .as_ref()
+            .cloned();
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Messages,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.clear_read_authentication_container_if_same(&container)
+                .await;
         }
         let container = Arc::new(
             MESSAGES_CONTAINER
@@ -2048,7 +2128,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 )
                 .await?,
         );
-        *self.container.lock().await = Some(container.clone());
+        *self.read_authentication_container.lock().await = Some(container.clone());
         Ok(container)
     }
 
@@ -2060,7 +2140,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         permit: &CloudKitReadAuthenticationPermit<'_>,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         permit.validate()?;
-        let container = self.get_container_lookup_only().await?;
+        let container = self.get_read_authentication_container_lookup_only().await?;
         permit.validate()?;
         container
             .validate_read_authentication_identity(
@@ -2072,18 +2152,45 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(container)
     }
 
-    /// Returns only a container opened by the explicit Cloud Sync V2 auth
-    /// snapshot (or another reviewed authentication path). Semantic fetch and
-    /// decode must not invoke `ckAppInit` or refresh login state themselves.
+    /// Returns only a general container that has already been initialized by
+    /// the legacy/write-capable authentication path. Write preparation must
+    /// never consume a container initialized under restored read auth.
     pub async fn get_container_lookup_only(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        self.container
+        let container = self
+            .container
             .lock()
             .await
             .as_ref()
             .cloned()
-            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+        container
+            .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
+            .await?;
+        Ok(container)
+    }
+
+    /// Returns only a container initialized under the restored read-auth
+    /// lease. Semantic fetch and decode must not fall back to a general or
+    /// write-capable container cache.
+    async fn get_read_authentication_container_lookup_only(
+        &self,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        let container = self
+            .read_authentication_container
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+        container
+            .validate_read_authentication_identity(
+                &self.client,
+                CloudKitReadAuthenticationContainer::Messages,
+            )
+            .await?;
+        Ok(container)
     }
 
     /// Fetches one stable MessageEncryptedV3 record for ambiguous-write
@@ -2102,7 +2209,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = self.get_container_lookup_only().await?;
         let zone = container.private_zone("messageManateeZone".to_string());
         let key = container
-            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .get_cached_zone_encryption_config_exact(&zone)
             .await?;
         let expected_record_identifier = record_identifier(zone, server_record_name);
         let operations = [FetchRecordOperation::new(
@@ -2181,7 +2288,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             let container = self.get_container_lookup_only().await?;
             let zone = container.private_zone("messageManateeZone".to_string());
             let key = container
-                .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+                .get_cached_zone_encryption_config_exact(&zone)
                 .await?;
 
             let mut operations = Vec::with_capacity(messages.len());
@@ -2225,7 +2332,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         continuation_token: Option<Vec<u8>>,
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
-        let container = self.get_container_lookup_only().await?;
+        let container = self.get_read_authentication_container_lookup_only().await?;
         let zone = container.private_zone(zone_name.to_string());
         let page = FetchRecordChangesOperation::fetch_page_with_limit_lookup_only(
             &container,
@@ -2919,7 +3026,7 @@ mod cloud_message_identity_tests {
             acquire_cloudkit_read_authentication, pause_cloudkit_writer_operations,
             resume_cloudkit_writer_operations,
         },
-        keychain::{KeychainClient, KeychainClientState},
+        keychain::{CloudKitContainerCaches, KeychainClient, KeychainClientState},
         DebugMeta, DebugRwLock, OSConfig, RegisterMeta, TokenProvider,
     };
     use icloud_auth::{AppleAccount, LoginClientInfo};
@@ -2944,6 +3051,32 @@ mod cloud_message_identity_tests {
     }
 
     #[test]
+    fn write_paths_require_general_container_and_already_cached_pcs_configuration() {
+        let source = include_str!("cloud_messages.rs");
+        for (method_name, following_method_name) in [
+            (
+                "pub async fn lookup_message_record",
+                "pub async fn prepare_message_save_submission",
+            ),
+            (
+                "pub async fn prepare_message_save_submission",
+                "pub async fn execute_message_save_submission",
+            ),
+        ] {
+            let method_start = source.find(method_name).expect("write-path method");
+            let following_method = source[method_start..]
+                .find(following_method_name)
+                .expect("following write-path method");
+            let method = &source[method_start..method_start + following_method];
+
+            assert!(method.contains("self.get_container_lookup_only().await?"));
+            assert!(method.contains(".get_cached_zone_encryption_config_exact(&zone)"));
+            assert!(!method.contains("get_zone_encryption_config_lookup_only"));
+            assert!(!method.contains("get_container_for_read_authentication"));
+        }
+    }
+
+    #[test]
     fn cached_container_accessor_structurally_validates_permit_without_initializing() {
         let source = include_str!("cloud_messages.rs");
         let method_start = source
@@ -2955,7 +3088,7 @@ mod cloud_message_identity_tests {
         let method = &source[method_start..method_start + following_method];
 
         assert!(method.matches("permit.validate()?").count() >= 3);
-        assert!(method.contains("self.get_container_lookup_only().await?"));
+        assert!(method.contains("get_read_authentication_container_lookup_only"));
         assert!(method.contains("validate_read_authentication_identity"));
         assert!(!method.contains("init_for_read_authentication"));
         assert!(!method.contains("container_initialization"));
@@ -3191,6 +3324,142 @@ mod cloud_message_identity_tests {
     }
 
     #[tokio::test]
+    async fn restored_read_authentication_containers_are_provenance_separated() {
+        static CUTTLEFISH_CONTAINER_FOR_TEST: CloudKitContainer<'static> = CloudKitContainer {
+            database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
+            bundleid: "com.apple.security.cuttlefish",
+            containerid: "com.apple.security.keychain",
+            env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        };
+        static SECURITYD_CONTAINER_FOR_TEST: CloudKitContainer<'static> = CloudKitContainer {
+            database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
+            bundleid: "com.apple.securityd",
+            containerid: "com.apple.security.keychain",
+            env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        };
+
+        let fixture = valid_fixture();
+        let client = fixture.client.clone();
+        let keychain = fixture.messages.keychain.clone();
+        let read_generation = client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("test read generation");
+        let cached = |container: &'static CloudKitContainer<'static>, provenance: &str| {
+            Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+                container,
+                client.clone(),
+                provenance.to_owned(),
+                "123".to_owned(),
+            ))
+        };
+
+        let general_messages = cached(&MESSAGES_CONTAINER, "general-messages");
+        let restored_messages = Arc::new(CloudKitOpenContainer::new_cached_read_identity_for_test(
+            &MESSAGES_CONTAINER,
+            client.clone(),
+            "restored-messages".to_owned(),
+            "123".to_owned(),
+            read_generation.clone(),
+        ));
+        let general_cuttlefish = cached(&CUTTLEFISH_CONTAINER_FOR_TEST, "general-cuttlefish");
+        let restored_cuttlefish =
+            Arc::new(CloudKitOpenContainer::new_cached_read_identity_for_test(
+                &CUTTLEFISH_CONTAINER_FOR_TEST,
+                client.clone(),
+                "restored-cuttlefish".to_owned(),
+                "123".to_owned(),
+                read_generation.clone(),
+            ));
+        let general_securityd = cached(&SECURITYD_CONTAINER_FOR_TEST, "general-securityd");
+        let restored_securityd =
+            Arc::new(CloudKitOpenContainer::new_cached_read_identity_for_test(
+                &SECURITYD_CONTAINER_FOR_TEST,
+                client.clone(),
+                "restored-securityd".to_owned(),
+                "123".to_owned(),
+                read_generation,
+            ));
+
+        *fixture.messages.container.lock().await = Some(general_messages.clone());
+        *fixture.messages.read_authentication_container.lock().await =
+            Some(restored_messages.clone());
+        *keychain.container.lock().await = Some(CloudKitContainerCaches::new_for_test(
+            general_cuttlefish.clone(),
+            restored_cuttlefish.clone(),
+        ));
+        *keychain.security_container.lock().await = Some(CloudKitContainerCaches::new_for_test(
+            general_securityd.clone(),
+            restored_securityd.clone(),
+        ));
+
+        let general_messages_result = fixture.messages.get_container().await;
+        let general_cuttlefish_result = keychain.get_container().await;
+        let general_securityd_result = keychain.get_security_container().await;
+
+        const TOKEN: u64 = 0xCA_CE_D0_02;
+        pause_cloudkit_writer_operations(TOKEN)
+            .await
+            .expect("test writer pause");
+        let permit = match acquire_cloudkit_read_authentication(TOKEN) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = resume_cloudkit_writer_operations(TOKEN).await;
+                panic!("test read-authentication permit: {error}");
+            }
+        };
+        let restored_messages_result = fixture
+            .messages
+            .get_container_for_read_authentication(&permit)
+            .await;
+        let restored_cuttlefish_result = keychain
+            .get_container_for_read_authentication(&permit)
+            .await;
+        let restored_securityd_result = keychain
+            .get_security_container_for_read_authentication(&permit)
+            .await;
+        drop(permit);
+        let resume_result = resume_cloudkit_writer_operations(TOKEN).await;
+
+        assert!(general_messages_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &general_messages)));
+        assert!(general_cuttlefish_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &general_cuttlefish)));
+        assert!(general_securityd_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &general_securityd)));
+        assert!(restored_messages_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &restored_messages)));
+        assert!(restored_cuttlefish_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &restored_cuttlefish)));
+        assert!(restored_securityd_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &restored_securityd)));
+        assert!(!Arc::ptr_eq(&general_messages, &restored_messages));
+        assert!(!Arc::ptr_eq(&general_cuttlefish, &restored_cuttlefish));
+        assert!(!Arc::ptr_eq(&general_securityd, &restored_securityd));
+        assert!(general_messages
+            .validate_general_identity(&client, CloudKitReadAuthenticationContainer::Messages)
+            .await
+            .is_ok());
+        assert!(restored_messages
+            .validate_general_identity(&client, CloudKitReadAuthenticationContainer::Messages)
+            .await
+            .is_err());
+        resume_result.expect("resume test writer operations");
+    }
+
+    #[tokio::test]
     async fn cached_container_accessor_requires_warm_exact_messages_identity() {
         static WRONG_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
             database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
@@ -3201,22 +3470,34 @@ mod cloud_message_identity_tests {
 
         let cold = valid_fixture();
         let keychain = cold.messages.keychain.clone();
-        let warm_open = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+        let generation = cold
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("test read generation");
+        let warm_open = Arc::new(CloudKitOpenContainer::new_cached_read_identity_for_test(
             &MESSAGES_CONTAINER,
             cold.client.clone(),
             "cached-user".to_owned(),
             "123".to_owned(),
+            generation.clone(),
         ));
         let warm = CloudMessagesClient::new_warm_for_test(
             cold.client.clone(),
             keychain.clone(),
             warm_open.clone(),
         );
-        let wrong_open = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+        let wrong_open = Arc::new(CloudKitOpenContainer::new_cached_read_identity_for_test(
             &WRONG_CONTAINER,
             cold.client.clone(),
             "cached-user".to_owned(),
             "123".to_owned(),
+            generation,
         ));
         let wrong =
             CloudMessagesClient::new_warm_for_test(cold.client.clone(), keychain, wrong_open);

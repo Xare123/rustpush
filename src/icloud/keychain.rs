@@ -860,15 +860,93 @@ pub const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
     env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
 };
 
+/// Provenance-separated cache slots for one CloudKit container identity.
+/// The outer `Option` on each client field keeps existing construction valid.
+pub struct CloudKitContainerCaches<P: AnisetteProvider> {
+    general: Option<Arc<CloudKitOpenContainer<'static, P>>>,
+    restored_read_authentication: Option<Arc<CloudKitOpenContainer<'static, P>>>,
+    restored_read_authentication_initialization: Arc<Mutex<()>>,
+}
+
+impl<P: AnisetteProvider> Default for CloudKitContainerCaches<P> {
+    fn default() -> Self {
+        Self {
+            general: None,
+            restored_read_authentication: None,
+            restored_read_authentication_initialization: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+impl<P: AnisetteProvider> CloudKitContainerCaches<P> {
+    fn general(&self) -> Option<Arc<CloudKitOpenContainer<'static, P>>> {
+        self.general.clone()
+    }
+
+    fn restored_read_authentication(&self) -> Option<Arc<CloudKitOpenContainer<'static, P>>> {
+        self.restored_read_authentication.clone()
+    }
+
+    fn restored_read_authentication_initialization(&self) -> Arc<Mutex<()>> {
+        self.restored_read_authentication_initialization.clone()
+    }
+
+    fn set_general(&mut self, container: Arc<CloudKitOpenContainer<'static, P>>) {
+        self.general = Some(container);
+    }
+
+    fn clear_general_if_same(&mut self, stale: &Arc<CloudKitOpenContainer<'static, P>>) {
+        if self
+            .general
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            self.general = None;
+        }
+    }
+
+    fn set_restored_read_authentication(
+        &mut self,
+        container: Arc<CloudKitOpenContainer<'static, P>>,
+    ) {
+        self.restored_read_authentication = Some(container);
+    }
+
+    fn clear_restored_read_authentication_if_same(
+        &mut self,
+        stale: &Arc<CloudKitOpenContainer<'static, P>>,
+    ) {
+        if self
+            .restored_read_authentication
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            self.restored_read_authentication = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        general: Arc<CloudKitOpenContainer<'static, P>>,
+        restored_read_authentication: Arc<CloudKitOpenContainer<'static, P>>,
+    ) -> Self {
+        Self {
+            general: Some(general),
+            restored_read_authentication: Some(restored_read_authentication),
+            restored_read_authentication_initialization: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
 pub struct KeychainClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
     pub token_provider: Arc<TokenProvider<P>>,
     pub state: DebugRwLock<KeychainClientState>,
     pub config: Arc<dyn OSConfig>,
     pub update_state: Box<dyn Fn(&KeychainClientState) + Send + Sync>,
-    pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    pub container: Mutex<Option<CloudKitContainerCaches<P>>>,
     pub container_initialization: Mutex<()>,
-    pub security_container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
+    pub security_container: Mutex<Option<CloudKitContainerCaches<P>>>,
     pub security_container_initialization: Mutex<()>,
     pub client: Arc<CloudKitClient<P>>,
 }
@@ -1368,6 +1446,8 @@ pub struct KeychainClientState {
     current_bottle: Option<Vec<u8>>,
     keystore: KeychainKeyStore,
     pub items: HashMap<String, SavedKeychainZone>,
+    #[serde(skip)]
+    record_sync: Arc<Mutex<()>>,
 }
 
 impl KeychainClientState {
@@ -1394,6 +1474,7 @@ impl KeychainClientState {
             current_bottle: None,
             keystore: KeychainKeyStore(vec![]),
             items: HashMap::new(),
+            record_sync: Arc::new(Mutex::new(())),
         })
     }
 
@@ -1629,15 +1710,67 @@ impl ReadOnlyCuttlefishMethod {
 
 impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        if let Some(container) = self.container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self
+            .container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::general);
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Cuttlefish,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_general_if_same(&container));
         }
         let _initialization = self.container_initialization.lock().await;
-        if let Some(container) = self.container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self
+            .container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::general);
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Cuttlefish,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_general_if_same(&container));
         }
         let container = Arc::new(CUTTLEFISH_CONTAINER.init(self.client.clone()).await?);
-        *self.container.lock().await = Some(container.clone());
+        container
+            .validate_general_identity(
+                &self.client,
+                CloudKitReadAuthenticationContainer::Cuttlefish,
+            )
+            .await?;
+        self.container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .set_general(container.clone());
         Ok(container)
     }
 
@@ -1646,27 +1779,61 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         permit: &CloudKitReadAuthenticationPermit<'_>,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         permit.validate()?;
-        let cached = self.container.lock().await.as_ref().cloned();
+        let cached = self
+            .container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::restored_read_authentication);
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Cuttlefish,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_restored_read_authentication_if_same(&container));
         }
-        let _initialization = self.container_initialization.lock().await;
+        let initialization = self
+            .container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .restored_read_authentication_initialization();
+        let _initialization = initialization.lock().await;
         permit.validate()?;
-        let cached = self.container.lock().await.as_ref().cloned();
+        let cached = self
+            .container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::restored_read_authentication);
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Cuttlefish,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_restored_read_authentication_if_same(&container));
         }
         let container = Arc::new(
             CUTTLEFISH_CONTAINER
@@ -1677,7 +1844,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 )
                 .await?,
         );
-        *self.container.lock().await = Some(container.clone());
+        self.container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .set_restored_read_authentication(container.clone());
         Ok(container)
     }
 
@@ -1686,26 +1857,83 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     async fn get_container_lookup_only(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        self.container
+        let container = self
+            .container
             .lock()
             .await
             .as_ref()
-            .cloned()
-            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
+            .and_then(CloudKitContainerCaches::restored_read_authentication)
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+        container
+            .validate_read_authentication_identity(
+                &self.client,
+                CloudKitReadAuthenticationContainer::Cuttlefish,
+            )
+            .await?;
+        Ok(container)
     }
 
     pub async fn get_security_container(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        if let Some(container) = self.security_container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self
+            .security_container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::general);
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Securityd,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.security_container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_general_if_same(&container));
         }
         let _initialization = self.security_container_initialization.lock().await;
-        if let Some(container) = self.security_container.lock().await.as_ref().cloned() {
-            return Ok(container);
+        let cached = self
+            .security_container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::general);
+        if let Some(container) = cached {
+            if container
+                .validate_general_identity(
+                    &self.client,
+                    CloudKitReadAuthenticationContainer::Securityd,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.security_container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_general_if_same(&container));
         }
         let container = Arc::new(SECURITYD_CONTAINER.init(self.client.clone()).await?);
-        *self.security_container.lock().await = Some(container.clone());
+        container
+            .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Securityd)
+            .await?;
+        self.security_container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .set_general(container.clone());
         Ok(container)
     }
 
@@ -1714,27 +1942,61 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         permit: &CloudKitReadAuthenticationPermit<'_>,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
         permit.validate()?;
-        let cached = self.security_container.lock().await.as_ref().cloned();
+        let cached = self
+            .security_container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::restored_read_authentication);
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Securityd,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.security_container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_restored_read_authentication_if_same(&container));
         }
-        let _initialization = self.security_container_initialization.lock().await;
+        let initialization = self
+            .security_container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .restored_read_authentication_initialization();
+        let _initialization = initialization.lock().await;
         permit.validate()?;
-        let cached = self.security_container.lock().await.as_ref().cloned();
+        let cached = self
+            .security_container
+            .lock()
+            .await
+            .as_ref()
+            .and_then(CloudKitContainerCaches::restored_read_authentication);
         if let Some(container) = cached {
-            container
+            if container
                 .validate_read_authentication_identity(
                     &self.client,
                     CloudKitReadAuthenticationContainer::Securityd,
                 )
-                .await?;
-            return Ok(container);
+                .await
+                .is_ok()
+            {
+                return Ok(container);
+            }
+            self.security_container
+                .lock()
+                .await
+                .as_mut()
+                .into_iter()
+                .for_each(|cache| cache.clear_restored_read_authentication_if_same(&container));
         }
         let container = Arc::new(
             SECURITYD_CONTAINER
@@ -1745,7 +2007,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 )
                 .await?,
         );
-        *self.security_container.lock().await = Some(container.clone());
+        self.security_container
+            .lock()
+            .await
+            .get_or_insert_with(CloudKitContainerCaches::default)
+            .set_restored_read_authentication(container.clone());
         Ok(container)
     }
 
@@ -1754,12 +2020,20 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     async fn get_security_container_lookup_only(
         &self,
     ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
-        self.security_container
+        let container = self
+            .security_container
             .lock()
             .await
             .as_ref()
-            .cloned()
-            .ok_or(PushError::CloudKitWarmAuthenticationRequired)
+            .and_then(CloudKitContainerCaches::restored_read_authentication)
+            .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+        container
+            .validate_read_authentication_identity(
+                &self.client,
+                CloudKitReadAuthenticationContainer::Securityd,
+            )
+            .await?;
+        Ok(container)
     }
 
     async fn invoke_cuttlefish<T: prost::Message, R: prost::Message + Default>(
@@ -2016,18 +2290,23 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         zones: &[&str],
         lookup_only: bool,
     ) -> Result<(), PushError> {
-        let state = self.state.read().await;
-        if state.keystore.0.is_empty() {
-            let identity = state.user_identity.as_ref().ok_or(PushError::NotInClique)?;
-            let shares = if lookup_only {
-                self.fetch_shares_for_lookup_only(identity).await?
+        let record_sync = self.state.read().await.record_sync.clone();
+        let _record_sync = record_sync.lock().await;
+        let identity = {
+            let state = self.state.read().await;
+            if state.keystore.0.is_empty() {
+                Some(state.user_identity.clone().ok_or(PushError::NotInClique)?)
             } else {
-                self.fetch_shares_for(identity).await?
+                None
+            }
+        };
+        if let Some(identity) = identity {
+            let shares = if lookup_only {
+                self.fetch_shares_for_lookup_only(&identity).await?
+            } else {
+                self.fetch_shares_for(&identity).await?
             };
-            drop(state);
             self.store_keys(&shares).await?;
-        } else {
-            drop(state);
         }
 
         let security_container = if lookup_only {
@@ -2036,20 +2315,22 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             self.get_security_container().await?
         };
 
-        let mut state = self.state.write().await;
-        let zone_requests = zones
-            .iter()
-            .map(|zone| {
-                (
-                    security_container.private_zone(zone.to_string()),
-                    state
-                        .items
-                        .get(*zone)
-                        .and_then(|z| z.change_tag.clone())
-                        .map(|z| z.into()),
-                )
-            })
-            .collect::<Vec<_>>();
+        let zone_requests = {
+            let state = self.state.read().await;
+            zones
+                .iter()
+                .map(|zone| {
+                    (
+                        security_container.private_zone(zone.to_string()),
+                        state
+                            .items
+                            .get(*zone)
+                            .and_then(|z| z.change_tag.clone())
+                            .map(|z| z.into()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut result = if lookup_only {
             FetchRecordChangesOperation::do_sync_lookup_only(
                 &security_container,
@@ -2061,8 +2342,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             FetchRecordChangesOperation::do_sync(&security_container, &zone_requests, &ALL_ASSETS)
                 .await
         };
-        if should_reset(result.as_ref().err()) {
-            state.items.clear();
+        let reset_projection = should_reset(result.as_ref().err());
+        if reset_projection {
             let reset_zone_requests = zones
                 .iter()
                 .map(|zone| (security_container.private_zone(zone.to_string()), None))
@@ -2085,6 +2366,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         }
         let item = result?;
 
+        let mut state = self.state.write().await;
+        if reset_projection {
+            state.items.clear();
+        }
         let state = &mut *state;
         let cloudkey_access = state.get_cloudkey_access_key()?;
         let keychain_access = state.get_keychain_access_key()?;

@@ -25,7 +25,10 @@ use crate::{
 };
 
 use crate::{
-    auth::{CloudKitReadAuthenticationLease, MobileMeDelegateResponse, TokenProvider},
+    auth::{
+        CloudKitReadAuthenticationLease, CloudKitReadAuthenticationRevoker,
+        MobileMeDelegateResponse, TokenProvider,
+    },
     keychain::KeychainClient,
     mmcs::{
         get_headers, get_mmcs, get_mmcs_pre_authorized_download_only, put_authorize_body, put_mmcs,
@@ -3209,6 +3212,7 @@ impl<'t> CloudKitContainer<'t> {
     ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
         let session = CloudKitSession::new();
         let account_dsid = client.state.read().await.dsid.clone();
+        let mut read_authentication_generation = None;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -3232,6 +3236,9 @@ impl<'t> CloudKitContainer<'t> {
                     (lease.mme_auth_token().to_owned(), Some(lease))
                 }
             };
+            read_authentication_generation = read_authentication
+                .as_ref()
+                .map(CloudKitReadAuthenticationLease::revoker);
             let init_request_uuid = Uuid::new_v4().to_string().to_uppercase();
             let request = self
                 .headers(
@@ -3259,10 +3266,13 @@ impl<'t> CloudKitContainer<'t> {
                 break response;
             }
             if authentication == CkAppInitAuthentication::CachedSemanticRead {
-                client
-                    .token_provider
-                    .invalidate_cloudkit_read_authentication()
-                    .await;
+                if let Some(read_authentication) = read_authentication.as_ref() {
+                    let failed_generation = read_authentication.revoker();
+                    client
+                        .token_provider
+                        .invalidate_cloudkit_read_authentication_generation(&failed_generation)
+                        .await?;
+                }
                 return Err(PushError::UnauthorizedAccountError);
             }
             retry_budget.authorize_refresh()?;
@@ -3280,6 +3290,9 @@ impl<'t> CloudKitContainer<'t> {
             user_id: response.cloud_kit_user_id,
             client,
             account_dsid,
+            read_authentication_generation,
+            #[cfg(test)]
+            test_read_authentication_lease: None,
             keys: DebugMutex::new(HashMap::new()),
         })
     }
@@ -3345,6 +3358,9 @@ pub struct CloudKitOpenContainer<'t, T: AnisetteProvider> {
     pub user_id: String,
     pub client: Arc<CloudKitClient<T>>,
     account_dsid: String,
+    read_authentication_generation: Option<CloudKitReadAuthenticationRevoker>,
+    #[cfg(test)]
+    test_read_authentication_lease: Option<CloudKitReadAuthenticationLease>,
     pub keys: DebugMutex<HashMap<String, PCSZoneConfig>>,
     pub database_type: cloudkit_proto::request_operation::header::Database,
 }
@@ -3369,12 +3385,36 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             user_id,
             client,
             account_dsid,
+            read_authentication_generation: None,
+            #[cfg(test)]
+            test_read_authentication_lease: None,
             keys: DebugMutex::new(HashMap::new()),
             database_type: container.database_type,
         }
     }
 
-    pub(crate) async fn validate_read_authentication_identity(
+    #[cfg(test)]
+    pub(crate) fn new_cached_read_identity_for_test(
+        container: &'t CloudKitContainer<'t>,
+        client: Arc<CloudKitClient<T>>,
+        user_id: String,
+        account_dsid: String,
+        generation: CloudKitReadAuthenticationRevoker,
+    ) -> Self {
+        Self {
+            container,
+            user_id,
+            client,
+            account_dsid,
+            read_authentication_generation: Some(generation),
+            #[cfg(test)]
+            test_read_authentication_lease: None,
+            keys: DebugMutex::new(HashMap::new()),
+            database_type: container.database_type,
+        }
+    }
+
+    pub(crate) async fn validate_general_identity(
         &self,
         expected_client: &Arc<CloudKitClient<T>>,
         allowed_container: CloudKitReadAuthenticationContainer,
@@ -3383,13 +3423,74 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             && self.database_type == cloudkit_proto::request_operation::header::Database::PrivateDb;
         let exact_client = Arc::ptr_eq(&self.client, expected_client);
         let exact_account = expected_client.state.read().await.dsid == self.account_dsid;
-        if !exact_container || !exact_client || !exact_account {
+        let general_provenance = self.read_authentication_generation.is_none();
+        if !exact_container || !exact_client || !exact_account || !general_provenance {
+            return Err(PushError::IoError(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "cached general CloudKit identity mismatch",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn validate_read_authentication_identity_for_generation(
+        &self,
+        expected_client: &Arc<CloudKitClient<T>>,
+        allowed_container: CloudKitReadAuthenticationContainer,
+        expected_generation: &CloudKitReadAuthenticationRevoker,
+    ) -> Result<(), PushError> {
+        let exact_container = allowed_container.matches(self.container)
+            && self.database_type == cloudkit_proto::request_operation::header::Database::PrivateDb;
+        let exact_client = Arc::ptr_eq(&self.client, expected_client);
+        let exact_account = expected_client.state.read().await.dsid == self.account_dsid;
+        let exact_generation = self
+            .read_authentication_generation
+            .as_ref()
+            .is_some_and(|generation| generation.is_same_generation(expected_generation));
+        if !exact_container || !exact_client || !exact_account || !exact_generation {
             return Err(PushError::IoError(std::io::Error::new(
                 ErrorKind::PermissionDenied,
                 "cached CloudKit read-authentication identity mismatch",
             )));
         }
         Ok(())
+    }
+
+    pub(crate) async fn validate_read_authentication_identity(
+        &self,
+        expected_client: &Arc<CloudKitClient<T>>,
+        allowed_container: CloudKitReadAuthenticationContainer,
+    ) -> Result<(), PushError> {
+        #[cfg(test)]
+        let generation = if CLOUDKIT_TEST_WARM_AUTHENTICATION.try_with(|_| ()).is_ok() {
+            if let Some(lease) = self.test_read_authentication_lease.as_ref() {
+                lease.revoker()
+            } else {
+                expected_client
+                    .token_provider
+                    .cloudkit_read_authentication_lease()
+                    .await?
+                    .revoker()
+            }
+        } else {
+            expected_client
+                .token_provider
+                .cloudkit_read_authentication_lease()
+                .await?
+                .revoker()
+        };
+        #[cfg(not(test))]
+        let generation = expected_client
+            .token_provider
+            .cloudkit_read_authentication_lease()
+            .await?
+            .revoker();
+        self.validate_read_authentication_identity_for_generation(
+            expected_client,
+            allowed_container,
+            &generation,
+        )
+        .await
     }
 
     pub fn private_zone(&self, name: String) -> cloudkit_proto::RecordZoneIdentifier {
@@ -3797,6 +3898,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             user_id: self.user_id.clone(),
             client: self.client.clone(),
             account_dsid: self.account_dsid.clone(),
+            read_authentication_generation: None,
+            #[cfg(test)]
+            test_read_authentication_lease: None,
             keys: DebugMutex::new(HashMap::new()),
             database_type: Database::SharedDb,
         }
@@ -4681,10 +4785,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     ) -> Result<CloudKitPreparedAuthentication<T>, PushError> {
         #[cfg(test)]
         if CLOUDKIT_TEST_WARM_AUTHENTICATION.try_with(|_| ()).is_ok() {
-            let read_authentication = CloudKitReadAuthenticationLease::new_for_test(
-                "semantic-test-mme-token",
-                "semantic-test-warm-token",
-            );
+            let read_authentication = self
+                .test_read_authentication_lease
+                .clone()
+                .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
             return Ok(CloudKitPreparedAuthentication {
                 client: self.client.clone(),
                 user_id: self.user_id.clone(),
@@ -4731,9 +4835,30 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         isolation_level: IsolationLevel,
     ) -> Result<Vec<Result<Op::Response, PushError>>, PushError> {
         let _recorded = record_semantic_read_operations(operations)?;
+        let allowed_container = [
+            CloudKitReadAuthenticationContainer::Messages,
+            CloudKitReadAuthenticationContainer::Cuttlefish,
+            CloudKitReadAuthenticationContainer::Securityd,
+        ]
+        .into_iter()
+        .find(|allowed| allowed.matches(self.container))
+        .ok_or(PushError::CloudKitSemanticOperationDenied)?;
         let mut responses = Vec::with_capacity(operations.len());
         for batch in operations.chunks(CLOUDKIT_MAX_OPERATIONS_PER_REQUEST) {
             let prepared_authentication = self.prepare_semantic_read_authentication().await?;
+            let authentication_generation = prepared_authentication
+                .read_authentication
+                .as_ref()
+                .ok_or(PushError::CloudKitWarmAuthenticationRequired)?
+                .revoker();
+            self.validate_read_authentication_identity(&self.client, allowed_container)
+                .await?;
+            self.validate_read_authentication_identity_for_generation(
+                &self.client,
+                allowed_container,
+                &authentication_generation,
+            )
+            .await?;
             let request_identity = CloudKitRequestIdentity::generated(batch.len());
             let retry_policy = CloudKitRetryPolicy {
                 max_attempts: 1,
@@ -4755,8 +4880,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     if failure.failure_class == Some(CloudKitFailureClass::Authentication) {
                         self.client
                             .token_provider
-                            .invalidate_cloudkit_read_authentication()
-                            .await;
+                            .invalidate_cloudkit_read_authentication_generation(
+                                &authentication_generation,
+                            )
+                            .await?;
                     }
                     return Err(failure.error);
                 }
@@ -4768,8 +4895,8 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             {
                 self.client
                     .token_provider
-                    .invalidate_cloudkit_read_authentication()
-                    .await;
+                    .invalidate_cloudkit_read_authentication_generation(&authentication_generation)
+                    .await?;
             }
             responses.extend(
                 batch_response
@@ -5475,6 +5602,7 @@ mod cloud_sync_transport_tests {
         atomic::{AtomicBool, Ordering},
         Mutex as StdMutex, OnceLock,
     };
+    use std::time::SystemTime;
 
     const HTTP_REQUEST_UUID: &str = "11111111-2222-4ABC-8DEF-555555555555";
     const OPERATION_UUID_A: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
@@ -5662,12 +5790,18 @@ mod cloud_sync_transport_tests {
             config,
             token_provider,
         });
+        let test_read_authentication_lease = CloudKitReadAuthenticationLease::new_for_test(
+            "semantic-test-mme-token",
+            "semantic-test-warm-token",
+        );
 
         CloudKitOpenContainer {
             container,
             user_id: "test-cloudkit-user".to_owned(),
             client,
             account_dsid: "test-dsid".to_owned(),
+            read_authentication_generation: Some(test_read_authentication_lease.revoker()),
+            test_read_authentication_lease: Some(test_read_authentication_lease),
             keys: DebugMutex::new(HashMap::new()),
             database_type: container.database_type,
         }
@@ -5711,7 +5845,10 @@ mod cloud_sync_transport_tests {
                 "read-mme-token".to_owned(),
                 "read-cloudkit-token".to_owned(),
                 SystemTime::now(),
-                move || invalidation_marker.store(true, Ordering::SeqCst),
+                move || {
+                    invalidation_marker.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
             )
             .await
             .expect("current read authentication should restore");
@@ -5739,6 +5876,124 @@ mod cloud_sync_transport_tests {
     }
 
     #[tokio::test]
+    async fn stale_authentication_failure_cannot_invalidate_newer_generation() {
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let stale_invalidated = Arc::new(AtomicBool::new(false));
+        let stale_invalidation_marker = stale_invalidated.clone();
+        let stale_generation = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "stale-read-mme-token".to_owned(),
+                "stale-read-cloudkit-token".to_owned(),
+                SystemTime::now() - Duration::from_secs(1),
+                move || {
+                    stale_invalidation_marker.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("stale generation should restore before replacement");
+        let stale_lease = open
+            .client
+            .token_provider
+            .cloudkit_read_authentication_lease()
+            .await
+            .expect("stale generation lease");
+        let admission = stale_lease.admit().await.expect("stale request admission");
+
+        let newer_invalidated = Arc::new(AtomicBool::new(false));
+        let newer_invalidation_marker = newer_invalidated.clone();
+        let token_provider = open.client.token_provider.clone();
+        let mut replacement = tokio::spawn(async move {
+            token_provider
+                .restore_cloudkit_read_authentication(
+                    "newer-read-mme-token".to_owned(),
+                    "newer-read-cloudkit-token".to_owned(),
+                    SystemTime::now(),
+                    move || {
+                        newer_invalidation_marker.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("newer generation should replace stale generation")
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut replacement)
+                .await
+                .is_err()
+        );
+        drop(admission);
+        let newer_generation = tokio::time::timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement should finish after stale request exits")
+            .expect("replacement task");
+
+        assert!(matches!(
+            stale_lease.admit().await,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(!open
+            .client
+            .token_provider
+            .invalidate_cloudkit_read_authentication_generation(&stale_generation)
+            .await
+            .expect("stale invalidation result"));
+        let current = open
+            .client
+            .token_provider
+            .cloudkit_read_authentication_lease()
+            .await
+            .expect("newer generation must remain current");
+        assert_eq!(current.cloudkit_token(), "newer-read-cloudkit-token");
+        assert!(!stale_invalidated.load(Ordering::SeqCst));
+        assert!(!newer_invalidated.load(Ordering::SeqCst));
+
+        assert!(open
+            .client
+            .token_provider
+            .invalidate_cloudkit_read_authentication_generation(&newer_generation)
+            .await
+            .expect("newer invalidation result"));
+        assert!(newer_invalidated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn semantic_read_invalidation_propagates_persisted_cache_cleanup_failure() {
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let generation = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Err(PushError::BadMsg),
+            )
+            .await
+            .expect("current read authentication should restore");
+
+        assert!(matches!(
+            open.client
+                .token_provider
+                .invalidate_cloudkit_read_authentication_generation(&generation)
+                .await,
+            Err(PushError::BadMsg)
+        ));
+        assert!(
+            !open
+                .client
+                .token_provider
+                .cloudkit_read_authentication_is_warm()
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn revoked_prepared_semantic_authentication_cannot_start_a_request() {
         let container = one_shot_test_container();
         let open = one_shot_test_open_container(&container);
@@ -5749,7 +6004,7 @@ mod cloud_sync_transport_tests {
                 "read-mme-token".to_owned(),
                 "read-cloudkit-token".to_owned(),
                 SystemTime::now(),
-                || {},
+                || Ok(()),
             )
             .await
             .expect("current read authentication should restore");
@@ -5815,7 +6070,10 @@ mod cloud_sync_transport_tests {
                     "read-mme-token".to_owned(),
                     "read-cloudkit-token".to_owned(),
                     SystemTime::now(),
-                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                    move || {
+                        invalidation_marker.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
                 )
                 .await
                 .expect("current read authentication should restore");
@@ -5878,7 +6136,10 @@ mod cloud_sync_transport_tests {
                     "read-mme-token".to_owned(),
                     "read-cloudkit-token".to_owned(),
                     SystemTime::now(),
-                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                    move || {
+                        invalidation_marker.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
                 )
                 .await
                 .expect("current read authentication should restore");
@@ -5935,7 +6196,10 @@ mod cloud_sync_transport_tests {
                     "read-mme-token".to_owned(),
                     "read-cloudkit-token".to_owned(),
                     SystemTime::now(),
-                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                    move || {
+                        invalidation_marker.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
                 )
                 .await
                 .expect("current read authentication should restore");
@@ -6030,6 +6294,19 @@ mod cloud_sync_transport_tests {
             env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
         };
         let open = one_shot_test_open_container(&messages_container);
+        let generation = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("test read generation");
+        let mut open = open;
+        open.read_authentication_generation = Some(generation);
         open.validate_read_authentication_identity(
             &open.client,
             CloudKitReadAuthenticationContainer::Messages,
@@ -6038,6 +6315,19 @@ mod cloud_sync_transport_tests {
         .unwrap();
 
         let wrong_container = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let wrong_generation = wrong_container
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "wrong-read-mme-token".to_owned(),
+                "wrong-read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("wrong-container read generation");
+        let mut wrong_container = wrong_container;
+        wrong_container.read_authentication_generation = Some(wrong_generation);
         assert!(matches!(
             wrong_container
                 .validate_read_authentication_identity(
@@ -6069,7 +6359,71 @@ mod cloud_sync_transport_tests {
             Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
         ));
 
+        let general = CloudKitOpenContainer::new_cached_identity_for_test(
+            &messages_container,
+            open.client.clone(),
+            "general-user".to_owned(),
+            "test-dsid".to_owned(),
+        );
+        general
+            .validate_general_identity(&open.client, CloudKitReadAuthenticationContainer::Messages)
+            .await
+            .expect("general identity initially matches");
+
         open.client.state.write().await.dsid = "different-dsid".to_owned();
+        assert!(matches!(
+            general
+                .validate_general_identity(
+                    &open.client,
+                    CloudKitReadAuthenticationContainer::Messages,
+                )
+                .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            open.validate_read_authentication_identity(
+                &open.client,
+                CloudKitReadAuthenticationContainer::Messages,
+            )
+            .await,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_read_authentication_rejects_rotated_generation() {
+        let container = one_shot_test_container();
+        let mut open = one_shot_test_open_container(&container);
+        let old_generation = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "old-read-mme-token".to_owned(),
+                "old-read-cloudkit-token".to_owned(),
+                SystemTime::now() - Duration::from_secs(1),
+                || Ok(()),
+            )
+            .await
+            .expect("old read generation");
+        open.read_authentication_generation = Some(old_generation);
+        open.validate_read_authentication_identity(
+            &open.client,
+            CloudKitReadAuthenticationContainer::Messages,
+        )
+        .await
+        .expect("old generation initially matches");
+
+        open.client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "new-read-mme-token".to_owned(),
+                "new-read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("new read generation");
+
         assert!(matches!(
             open.validate_read_authentication_identity(
                 &open.client,
