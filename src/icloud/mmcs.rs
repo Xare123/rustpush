@@ -1382,7 +1382,10 @@ pub async fn get_mmcs(
 
     let AuthorizedOperation { url, body, dsid } = authorized;
 
-    debug!("Received MMCS authorize-get response (bytes={})", body.len());
+    debug!(
+        "Received MMCS authorize-get response (bytes={})",
+        body.len()
+    );
     let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body)).unwrap();
 
     if response.f1.is_none() {
@@ -1516,8 +1519,6 @@ pub async fn get_mmcs(
             let data = cipher
                 .decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..])
                 .unwrap();
-            println!("{}", encode_hex(&data));
-
             let chunks = FordChunk::decode(Cursor::new(&data))?;
             let item = chunks.item.expect("Ford chunks missing?");
             for (ford, reference) in item.chunks.into_iter().zip(references.iter()) {
@@ -1529,10 +1530,6 @@ pub async fn get_mmcs(
                     (ford.key, ford.chunk_len),
                 );
             }
-
-            let mut total_hasher = Sha1::new();
-            total_hasher.update(&ford);
-            println!("{}", encode_hex(&total_hasher.finish()))
         }
     }
 
