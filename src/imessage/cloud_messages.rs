@@ -2052,6 +2052,26 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(container)
     }
 
+    /// Returns only the already-warmed Messages container while the exact
+    /// read-authentication permit remains valid. This accessor never enters
+    /// container initialization, authentication refresh, or ckAppInit.
+    pub async fn get_cached_container_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        permit.validate()?;
+        let container = self.get_container_lookup_only().await?;
+        permit.validate()?;
+        container
+            .validate_read_authentication_identity(
+                &self.client,
+                CloudKitReadAuthenticationContainer::Messages,
+            )
+            .await?;
+        permit.validate()?;
+        Ok(container)
+    }
+
     /// Returns only a container opened by the explicit Cloud Sync V2 auth
     /// snapshot (or another reviewed authentication path). Semantic fetch and
     /// decode must not invoke `ckAppInit` or refresh login state themselves.
@@ -2084,9 +2104,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let key = container
             .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
             .await?;
+        let expected_record_identifier = record_identifier(zone, server_record_name);
         let operations = [FetchRecordOperation::new(
             &NO_ASSETS,
-            record_identifier(zone, server_record_name),
+            expected_record_identifier.clone(),
         )];
         let response = match container
             .perform_operations_detailed(
@@ -2117,7 +2138,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .ok_or(PushError::BadMsg)?;
         match outcome.result {
             Ok(record) => {
-                record.verify_id(server_record_name)?;
+                record.verify_identifier(&expected_record_identifier)?;
                 Ok(CloudMessageRecordLookup::Found(
                     record.get_record(Some(&key))?,
                 ))
@@ -2695,7 +2716,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
         let record: Vec<CloudAttachment> = files
             .keys()
-            .map(|f| records.get_record(f, Some(&key)))
+            .map(|record_id| {
+                records.get_record_exact(&record_identifier(zone.clone(), record_id), Some(&key))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         container
@@ -2708,6 +2731,78 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                     .collect::<Vec<_>>(),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Downloads one attachment under an already-active Cloud Sync writer
+    /// pause, only when the fetched record still has the non-empty etag from
+    /// the protected source. The closed semantic transport admits only the
+    /// concrete record GET; container, PCS, save, delete, zone-create, and
+    /// subscription mutation paths are unavailable here.
+    pub async fn download_attachment_checked_lookup_only<T: Write + Send + Sync>(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        expected_native_account_identifier: &str,
+        record_id: String,
+        expected_record_etag: String,
+        file: T,
+    ) -> Result<(), PushError> {
+        if expected_native_account_identifier.is_empty() || expected_record_etag.is_empty() {
+            return Err(PushError::VerificationFailed);
+        }
+        permit.validate()?;
+        if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        let container = self
+            .get_cached_container_for_read_authentication(permit)
+            .await?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let expected_record_identifier = record_identifier(zone.clone(), &record_id);
+        let key = container
+            .get_cached_zone_encryption_config_exact(&zone)
+            .await?;
+
+        // Revalidate the non-cloneable pause and exact native account as close
+        // as possible to the first remote read.
+        permit.validate()?;
+        if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        let invoke = container
+            .perform_semantic_read_only_operations(
+                &CloudKitSession::new(),
+                &[FetchRecordOperation::new(
+                    &ALL_ASSETS,
+                    expected_record_identifier.clone(),
+                )],
+                IsolationLevel::Operation,
+            )
+            .await?;
+        if invoke.len() != 1 {
+            return Err(PushError::BadMsg);
+        }
+        let fetched = invoke.into_iter().next().ok_or(PushError::BadMsg)??;
+        let records = FetchedRecords::new(&[Ok(fetched)]);
+        if records.record_etag(&expected_record_identifier)? != expected_record_etag {
+            return Err(PushError::VerificationFailed);
+        }
+        let record: CloudAttachment =
+            records.get_record_exact(&expected_record_identifier, Some(&key))?;
+        // MMCS is another remote read. Do not let it start after a pause or
+        // account transition, and reject a transition before reporting
+        // completion to the native cache.
+        permit.validate()?;
+        if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        container
+            .get_assets_download_only(&records.assets, vec![(&record.lqa, file)])
+            .await?;
+        permit.validate()?;
+        if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            return Err(PushError::UnauthorizedAccountError);
+        }
         Ok(())
     }
 
@@ -2735,7 +2830,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let records = FetchedRecords::new(&invoke);
         let record: Vec<CloudChat> = files
             .keys()
-            .map(|f| records.get_record(f, Some(&key)))
+            .map(|record_id| {
+                records.get_record_exact(&record_identifier(zone.clone(), record_id), Some(&key))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         if record.iter().any(|r| r.group_photo.is_none()) {
@@ -2818,12 +2915,51 @@ mod cloud_message_identity_tests {
     use super::*;
     use crate::{
         cloudkit::{CloudKitClient, CloudKitState},
+        cloudkit_operation_gate::{
+            acquire_cloudkit_read_authentication, pause_cloudkit_writer_operations,
+            resume_cloudkit_writer_operations,
+        },
         keychain::{KeychainClient, KeychainClientState},
         DebugMeta, DebugRwLock, OSConfig, RegisterMeta, TokenProvider,
     };
     use icloud_auth::{AppleAccount, LoginClientInfo};
     use omnisette::{AnisetteClient, AnisetteError, ArcAnisetteClient};
     use std::{collections::HashMap, future::Future};
+
+    #[test]
+    fn attachment_download_structurally_uses_cached_container_and_pcs_configuration() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("pub async fn download_attachment_checked_lookup_only")
+            .expect("attachment download method");
+        let following_method = source[method_start..]
+            .find("pub async fn download_group_photo")
+            .expect("following attachment method");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.contains(".get_cached_container_for_read_authentication(permit)"));
+        assert!(!method.contains("get_container_for_read_authentication(permit)"));
+        assert!(method.contains(".get_cached_zone_encryption_config_exact(&zone)"));
+        assert!(!method.contains("get_zone_encryption_config_lookup_only"));
+    }
+
+    #[test]
+    fn cached_container_accessor_structurally_validates_permit_without_initializing() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("pub async fn get_cached_container_for_read_authentication")
+            .expect("cached container accessor");
+        let following_method = source[method_start..]
+            .find("pub async fn get_container_lookup_only")
+            .expect("following lookup-only accessor");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.matches("permit.validate()?").count() >= 3);
+        assert!(method.contains("self.get_container_lookup_only().await?"));
+        assert!(method.contains("validate_read_authentication_identity"));
+        assert!(!method.contains("init_for_read_authentication"));
+        assert!(!method.contains("container_initialization"));
+    }
 
     struct NoBootstrapAnisette;
 
@@ -3052,6 +3188,76 @@ mod cloud_message_identity_tests {
             "123",
             "adsid-123",
         )
+    }
+
+    #[tokio::test]
+    async fn cached_container_accessor_requires_warm_exact_messages_identity() {
+        static WRONG_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
+            database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
+            bundleid: "com.apple.MobileSMS",
+            containerid: "com.apple.messages.cloud",
+            env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        };
+
+        let cold = valid_fixture();
+        let keychain = cold.messages.keychain.clone();
+        let warm_open = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+            &MESSAGES_CONTAINER,
+            cold.client.clone(),
+            "cached-user".to_owned(),
+            "123".to_owned(),
+        ));
+        let warm = CloudMessagesClient::new_warm_for_test(
+            cold.client.clone(),
+            keychain.clone(),
+            warm_open.clone(),
+        );
+        let wrong_open = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+            &WRONG_CONTAINER,
+            cold.client.clone(),
+            "cached-user".to_owned(),
+            "123".to_owned(),
+        ));
+        let wrong =
+            CloudMessagesClient::new_warm_for_test(cold.client.clone(), keychain, wrong_open);
+
+        const TOKEN: u64 = 0xCA_CE_D0_01;
+        pause_cloudkit_writer_operations(TOKEN)
+            .await
+            .expect("test writer pause");
+        let permit = match acquire_cloudkit_read_authentication(TOKEN) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = resume_cloudkit_writer_operations(TOKEN).await;
+                panic!("test read-authentication permit: {error}");
+            }
+        };
+
+        let cold_result = cold
+            .messages
+            .get_cached_container_for_read_authentication(&permit)
+            .await;
+        let warm_result = warm
+            .get_cached_container_for_read_authentication(&permit)
+            .await;
+        let wrong_result = wrong
+            .get_cached_container_for_read_authentication(&permit)
+            .await;
+        drop(permit);
+        let resume_result = resume_cloudkit_writer_operations(TOKEN).await;
+
+        assert!(matches!(
+            cold_result,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(warm_result
+            .as_ref()
+            .is_ok_and(|container| Arc::ptr_eq(container, &warm_open)));
+        assert!(matches!(
+            wrong_result,
+            Err(PushError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        resume_result.expect("resume test writer operations");
     }
 
     #[tokio::test]

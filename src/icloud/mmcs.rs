@@ -1,4 +1,12 @@
-use std::{collections::HashMap, io::Cursor};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use crate::{
     aps::get_message,
@@ -29,8 +37,8 @@ use plist::Data;
 use prost::Message;
 use rand::{Rng, RngCore};
 use reqwest::{
-    header::{HeaderMap, HeaderName},
-    Body, Client, Response,
+    header::{HeaderMap, HeaderName, HeaderValue},
+    Body, Certificate, Client, Response,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -58,6 +66,876 @@ pub struct MMCSConfig {
     pub cloudkit_headers: HashMap<&'static str, String>,
     pub extra_1: Option<String>,
     pub extra_2: Option<String>,
+}
+
+/// Network policy for an MMCS download. The CloudKit attachment materializer
+/// uses `PreauthorizedDownloadOnly`, which can issue only the exact HTTPS GETs
+/// described by the CloudKit authorize response. It never calls authorizeGet,
+/// follows redirects, adds an application-level retry, or sends getComplete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MMCSGetNetworkPolicy {
+    Standard,
+    PreauthorizedDownloadOnly,
+}
+
+const MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_AUTHORIZATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS: usize = 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES: usize = 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER: usize = 8192;
+const MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNKS: usize = 16384;
+const MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST: usize = 128;
+const MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_HEADERS: usize = 128 * 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES: usize = 8192;
+const MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES: usize = 65536;
+const MAX_PREAUTHORIZED_DOWNLOAD_WIRE_FIELDS: usize = 1_000_000;
+const MAX_PREAUTHORIZED_DOWNLOAD_PATH_BYTES: usize = 16 * 1024;
+const MAX_PREAUTHORIZED_DOWNLOAD_HEADER_NAME_BYTES: usize = 256;
+const MAX_PREAUTHORIZED_DOWNLOAD_HEADER_VALUE_BYTES: usize = 16 * 1024;
+const MMCS_BOUNDED_SKIP_BYTES: usize = 64 * 1024;
+
+impl MMCSGetNetworkPolicy {
+    fn sends_completion(self) -> bool {
+        self == Self::Standard
+    }
+
+    fn collects_completion_receipts(self) -> bool {
+        self == Self::Standard
+    }
+}
+
+fn validate_download_only_chunk_request(request: &HttpRequest) -> Result<(), PushError> {
+    let domain = request.domain.as_str();
+    if domain.is_empty() || !domain.is_ascii() || domain.len() > 253 {
+        return Err(PushError::VerificationFailed);
+    }
+
+    let mut label_count = 0usize;
+    let mut final_label = None;
+    for label in domain.split('.') {
+        label_count = label_count
+            .checked_add(1)
+            .ok_or(PushError::VerificationFailed)?;
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        final_label = Some(label);
+    }
+    let final_label = final_label.ok_or(PushError::VerificationFailed)?;
+    let valid_dns_name = label_count >= 2
+        && final_label.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && !final_label.eq_ignore_ascii_case("local")
+        && domain.parse::<IpAddr>().is_err();
+
+    if request.method != "GET"
+        || request.scheme != "https"
+        || request.port != 443
+        || !valid_dns_name
+        || request.path.len() > MAX_PREAUTHORIZED_DOWNLOAD_PATH_BYTES
+        || !request.path.starts_with('/')
+        || request.path.starts_with("//")
+        || request
+            .path
+            .chars()
+            .any(|character| character.is_ascii_control() || character == '\\')
+    {
+        return Err(PushError::VerificationFailed);
+    }
+
+    // Header names in authorize responses have varied across MMCS revisions,
+    // so retain Apple authorization headers while rejecting every routing,
+    // method-tunnelling, hop-by-hop, authority, and framing control that could
+    // change the closed GET request shape.
+    if request.headers.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST {
+        return Err(PushError::VerificationFailed);
+    }
+    for header in &request.headers {
+        if header.name.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADER_NAME_BYTES
+            || header.value.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADER_VALUE_BYTES
+            || download_only_header_changes_request_shape(&header.name)
+            || HeaderName::from_bytes(header.name.as_bytes()).is_err()
+            || HeaderValue::from_str(&header.value).is_err()
+        {
+            return Err(PushError::VerificationFailed);
+        }
+    }
+
+    Ok(())
+}
+
+fn download_only_header_changes_request_shape(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "host"
+            | "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-length"
+            | "expect"
+            | "forwarded"
+            | "via"
+            | "x-real-ip"
+            | "x-client-ip"
+            | "x-cluster-client-ip"
+            | "authority"
+            | "x-authority"
+            | "x-host"
+            | "destination"
+            | "x-http-destinationurl"
+            | "max-forwards"
+            | "proxy"
+            | "x-original-host"
+            | "x-original-url"
+            | "x-original-uri"
+            | "x-rewrite-url"
+            | "x-original-method"
+            | "x-method-override"
+            | "x-apple-put-complete-at-edge-version"
+    ) || name.starts_with("x-forwarded-")
+        || name == "x-forwarded"
+        || name.starts_with("proxy-")
+        || name == "x-http-method"
+        || name.starts_with("x-http-method-")
+        || name == "x-method"
+        || name.starts_with("x-method-")
+        || name.starts_with("x-original-")
+        || name.starts_with("x-rewrite-")
+        || name.starts_with("x-envoy-original-")
+        || name.starts_with("x-amzn-remapped-")
+}
+
+fn is_public_download_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_download_ipv4(address),
+        IpAddr::V6(address) => is_public_download_ipv6(address),
+    }
+}
+
+fn is_public_download_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 240)
+}
+
+fn is_public_download_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_download_ipv4(mapped);
+    }
+
+    let segments = address.segments();
+    let well_known_nat64 = segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let well_known_nat64_embeds_public_ipv4 = if well_known_nat64 {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        is_public_download_ipv4(Ipv4Addr::new(a, b, c, d))
+    } else {
+        true
+    };
+    let global_unicast = (segments[0] & 0xe000) == 0x2000 || well_known_nat64;
+    let ietf_protocol_assignment = segments[0] == 0x2001 && segments[1] < 0x0200;
+    let documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0);
+    let local_nat64 = segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 1;
+    let discard_only = segments[..4] == [0x100, 0, 0, 0];
+    let six_to_four_non_public = if segments[0] == 0x2002 {
+        let [a, b] = segments[1].to_be_bytes();
+        let [c, d] = segments[2].to_be_bytes();
+        !is_public_download_ipv4(Ipv4Addr::new(a, b, c, d))
+    } else {
+        false
+    };
+
+    global_unicast
+        && !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && (segments[0] & 0xfe00) != 0xfc00
+        && (segments[0] & 0xfe00) != 0xfe00
+        && segments[..4] != [0, 0, 0, 0]
+        && !local_nat64
+        && well_known_nat64_embeds_public_ipv4
+        && !discard_only
+        && !ietf_protocol_assignment
+        && !documentation
+        && segments[0] != 0x5f00
+        && !six_to_four_non_public
+}
+
+fn validate_download_only_resolved_addresses(addresses: &[SocketAddr]) -> Result<(), PushError> {
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| address.port() != 443 || !is_public_download_address(address.ip()))
+    {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AuthorizationWireMessage {
+    Root,
+    ResponseData,
+    Container,
+    ChunkWrapper,
+    ChunkMeta,
+    EncryptionMeta,
+    EncryptedChunks,
+    ChunkReferences,
+    ChunkReference,
+    HttpRequest,
+    HttpHeader,
+    Error,
+    ErrorDetail,
+}
+
+#[derive(Default)]
+struct AuthorizationWireCounts {
+    fields: usize,
+    containers: usize,
+    references: usize,
+    chunks: usize,
+    headers: usize,
+    chunk_references: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ProtobufWireField<'a> {
+    number: u32,
+    wire_type: u8,
+    length_delimited: Option<&'a [u8]>,
+}
+
+fn read_canonical_protobuf_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64, PushError> {
+    let mut value = 0u64;
+    for index in 0..10usize {
+        let byte = *bytes.get(*cursor).ok_or(PushError::VerificationFailed)?;
+        *cursor = cursor.checked_add(1).ok_or(PushError::VerificationFailed)?;
+        if index == 9 && byte > 1 {
+            return Err(PushError::VerificationFailed);
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            if index > 0 && byte == 0 {
+                return Err(PushError::VerificationFailed);
+            }
+            return Ok(value);
+        }
+    }
+    Err(PushError::VerificationFailed)
+}
+
+fn read_protobuf_wire_field<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+) -> Result<ProtobufWireField<'a>, PushError> {
+    let key = read_canonical_protobuf_varint(bytes, cursor)?;
+    let field_number = key >> 3;
+    if field_number == 0 || field_number > 0x1fff_ffff {
+        return Err(PushError::VerificationFailed);
+    }
+    let wire_type = (key & 0x07) as u8;
+    let length_delimited = match wire_type {
+        0 => {
+            read_canonical_protobuf_varint(bytes, cursor)?;
+            None
+        }
+        1 => {
+            *cursor = cursor
+                .checked_add(8)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(PushError::VerificationFailed)?;
+            None
+        }
+        2 => {
+            let length = usize::try_from(read_canonical_protobuf_varint(bytes, cursor)?)
+                .map_err(|_| PushError::VerificationFailed)?;
+            let end = cursor
+                .checked_add(length)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(PushError::VerificationFailed)?;
+            let value = bytes
+                .get(*cursor..end)
+                .ok_or(PushError::VerificationFailed)?;
+            *cursor = end;
+            Some(value)
+        }
+        5 => {
+            *cursor = cursor
+                .checked_add(4)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(PushError::VerificationFailed)?;
+            None
+        }
+        _ => return Err(PushError::VerificationFailed),
+    };
+
+    Ok(ProtobufWireField {
+        number: u32::try_from(field_number).map_err(|_| PushError::VerificationFailed)?,
+        wire_type,
+        length_delimited,
+    })
+}
+
+fn require_wire_type(field: ProtobufWireField<'_>, wire_type: u8) -> Result<(), PushError> {
+    if field.wire_type != wire_type {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(())
+}
+
+fn preflight_nested_authorization_message(
+    field: ProtobufWireField<'_>,
+    message: AuthorizationWireMessage,
+    counts: &mut AuthorizationWireCounts,
+) -> Result<(), PushError> {
+    require_wire_type(field, 2)?;
+    preflight_authorization_message(
+        field
+            .length_delimited
+            .ok_or(PushError::VerificationFailed)?,
+        message,
+        counts,
+    )
+}
+
+fn increment_wire_count(count: &mut usize, maximum: usize) -> Result<(), PushError> {
+    *count = count
+        .checked_add(1)
+        .filter(|count| *count <= maximum)
+        .ok_or(PushError::VerificationFailed)?;
+    Ok(())
+}
+
+fn preflight_authorization_message(
+    bytes: &[u8],
+    message: AuthorizationWireMessage,
+    counts: &mut AuthorizationWireCounts,
+) -> Result<(), PushError> {
+    let mut cursor = 0usize;
+    let mut local_chunks = 0usize;
+    let mut local_headers = 0usize;
+    let mut local_chunk_references = 0usize;
+    let mut local_ford_references = 0usize;
+
+    while cursor < bytes.len() {
+        let field = read_protobuf_wire_field(bytes, &mut cursor)?;
+        increment_wire_count(&mut counts.fields, MAX_PREAUTHORIZED_DOWNLOAD_WIRE_FIELDS)?;
+
+        match (message, field.number) {
+            (AuthorizationWireMessage::Root, 1) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::ResponseData,
+                counts,
+            )?,
+            (AuthorizationWireMessage::Root, 2) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::Error,
+                counts,
+            )?,
+            (AuthorizationWireMessage::Root, 4) => require_wire_type(field, 0)?,
+
+            (AuthorizationWireMessage::ResponseData, 1) => {
+                increment_wire_count(
+                    &mut counts.containers,
+                    MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS,
+                )?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::Container,
+                    counts,
+                )?;
+            }
+            (AuthorizationWireMessage::ResponseData, 2) => {
+                increment_wire_count(
+                    &mut counts.references,
+                    MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES,
+                )?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::ChunkReferences,
+                    counts,
+                )?;
+            }
+
+            (AuthorizationWireMessage::Container, 1) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::HttpRequest,
+                counts,
+            )?,
+            (AuthorizationWireMessage::Container, 3 | 4) => require_wire_type(field, 2)?,
+            (AuthorizationWireMessage::Container, 5) => {
+                increment_wire_count(
+                    &mut local_chunks,
+                    MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER,
+                )?;
+                increment_wire_count(&mut counts.chunks, MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNKS)?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::ChunkWrapper,
+                    counts,
+                )?;
+            }
+
+            (AuthorizationWireMessage::ChunkWrapper, 1) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::ChunkMeta,
+                counts,
+            )?,
+            (AuthorizationWireMessage::ChunkWrapper, 2) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::EncryptionMeta,
+                counts,
+            )?,
+
+            (AuthorizationWireMessage::ChunkMeta, 1 | 2) => require_wire_type(field, 2)?,
+            (AuthorizationWireMessage::ChunkMeta, 3 | 4) => require_wire_type(field, 0)?,
+
+            (AuthorizationWireMessage::EncryptionMeta, 1 | 2) => require_wire_type(field, 0)?,
+            (AuthorizationWireMessage::EncryptionMeta, 3) => {
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::EncryptedChunks,
+                    counts,
+                )?
+            }
+            (AuthorizationWireMessage::EncryptedChunks, 1 | 2) => require_wire_type(field, 2)?,
+
+            (AuthorizationWireMessage::ChunkReferences, 1 | 3) => require_wire_type(field, 2)?,
+            (AuthorizationWireMessage::ChunkReferences, 2) => {
+                increment_wire_count(
+                    &mut local_chunk_references,
+                    MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES,
+                )?;
+                increment_wire_count(
+                    &mut counts.chunk_references,
+                    MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES,
+                )?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::ChunkReference,
+                    counts,
+                )?;
+            }
+            (AuthorizationWireMessage::ChunkReferences, 5) => require_wire_type(field, 0)?,
+            (AuthorizationWireMessage::ChunkReferences, 6) => {
+                increment_wire_count(&mut local_ford_references, 1)?;
+                increment_wire_count(
+                    &mut counts.chunk_references,
+                    MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES,
+                )?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::ChunkReference,
+                    counts,
+                )?;
+            }
+            (AuthorizationWireMessage::ChunkReference, 1 | 2) => require_wire_type(field, 0)?,
+
+            (AuthorizationWireMessage::HttpRequest, 1 | 3 | 4 | 5 | 6 | 7 | 9) => {
+                require_wire_type(field, 2)?
+            }
+            (AuthorizationWireMessage::HttpRequest, 2 | 11 | 13) => require_wire_type(field, 0)?,
+            (AuthorizationWireMessage::HttpRequest, 8) => {
+                increment_wire_count(
+                    &mut local_headers,
+                    MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST,
+                )?;
+                increment_wire_count(
+                    &mut counts.headers,
+                    MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_HEADERS,
+                )?;
+                preflight_nested_authorization_message(
+                    field,
+                    AuthorizationWireMessage::HttpHeader,
+                    counts,
+                )?;
+            }
+            (AuthorizationWireMessage::HttpHeader, 1 | 2) => require_wire_type(field, 2)?,
+
+            (AuthorizationWireMessage::Error, 2) => preflight_nested_authorization_message(
+                field,
+                AuthorizationWireMessage::ErrorDetail,
+                counts,
+            )?,
+            (AuthorizationWireMessage::ErrorDetail, 3) => require_wire_type(field, 2)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_preauthorized_authorization_body(body: &[u8]) -> Result<(), PushError> {
+    if body.len() > MAX_PREAUTHORIZED_DOWNLOAD_AUTHORIZATION_BYTES {
+        return Err(PushError::VerificationFailed);
+    }
+    preflight_authorization_message(
+        body,
+        AuthorizationWireMessage::Root,
+        &mut AuthorizationWireCounts::default(),
+    )
+}
+
+fn record_preauthorized_response_bytes(
+    counter: &AtomicU64,
+    byte_count: usize,
+) -> Result<(), PushError> {
+    let byte_count = u64::try_from(byte_count).map_err(|_| PushError::VerificationFailed)?;
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current
+                .checked_add(byte_count)
+                .filter(|total| *total <= MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
+        })
+        .map(|_| ())
+        .map_err(|_| PushError::VerificationFailed)
+}
+
+async fn build_pinned_download_only_client(domain: &str) -> Result<Client, PushError> {
+    let mut addresses = tokio::net::lookup_host((domain, 443))
+        .await
+        .map_err(|_| PushError::VerificationFailed)?
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    validate_download_only_resolved_addresses(&addresses)?;
+    let normalized_domain = domain.to_ascii_lowercase();
+
+    let certificates = [
+        Certificate::from_pem(include_bytes!(
+            "../../certs/root/profileidentity.ess.apple.com.cert"
+        ))?,
+        Certificate::from_pem(include_bytes!("../../certs/root/init.ess.apple.com.cert"))?,
+    ];
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    let mut builder = Client::builder()
+        .use_rustls_tls()
+        .no_proxy()
+        .default_headers(default_headers)
+        .http1_title_case_headers()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&normalized_domain, &addresses);
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder.build()?)
+}
+
+fn select_source_chunks(
+    chunks: Vec<ChunkDesc>,
+    network_policy: MMCSGetNetworkPolicy,
+    required_chunk_ids: &HashSet<[u8; 21]>,
+) -> Vec<ChunkDesc> {
+    if network_policy == MMCSGetNetworkPolicy::Standard {
+        return chunks;
+    }
+    chunks
+        .into_iter()
+        .filter(|chunk| required_chunk_ids.contains(&chunk.id))
+        .collect()
+}
+
+fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PushError> {
+    bytes.try_into().map_err(|_| PushError::VerificationFailed)
+}
+
+fn response_chunk<'a>(
+    containers: &'a [ProtoContainer],
+    container_index: u32,
+    chunk_index: u32,
+) -> Result<&'a mmcsp::container::ChunkWrapper, PushError> {
+    containers
+        .get(container_index as usize)
+        .and_then(|container| container.chunks.get(chunk_index as usize))
+        .ok_or(PushError::VerificationFailed)
+}
+
+fn validate_preauthorized_container_segment(
+    offset: u64,
+    size: u64,
+    previous_end: &mut u64,
+) -> Result<(), PushError> {
+    let end = offset
+        .checked_add(size)
+        .filter(|end| *end <= MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
+        .ok_or(PushError::VerificationFailed)?;
+    if offset < *previous_end {
+        return Err(PushError::VerificationFailed);
+    }
+    *previous_end = end;
+    Ok(())
+}
+
+fn validate_preauthorized_download_response(
+    response: &authorize_get_response::F1,
+    requested_files: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<(), PushError> {
+    if response.containers.is_empty()
+        || response.references.is_empty()
+        || requested_files.is_empty()
+        || response.containers.len() > MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS
+        || response.references.len() > MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES
+        || requested_files.len() > MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES
+    {
+        return Err(PushError::VerificationFailed);
+    }
+    if requested_files
+        .iter()
+        .any(|(checksum, _)| checksum.len() != 21)
+        || response
+            .references
+            .iter()
+            .any(|reference| reference.file_checksum.len() != 21)
+    {
+        return Err(PushError::VerificationFailed);
+    }
+
+    let mut aggregate_chunk_bytes = 0u64;
+    let mut total_chunks = 0usize;
+    for container in &response.containers {
+        validate_download_only_chunk_request(
+            container
+                .request
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?,
+        )?;
+        if container.chunks.is_empty()
+            || container.chunks.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        total_chunks = total_chunks
+            .checked_add(container.chunks.len())
+            .filter(|count| *count <= MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNKS)
+            .ok_or(PushError::VerificationFailed)?;
+        let mut previous_end = 0u64;
+        for chunk in &container.chunks {
+            match (&chunk.meta, &chunk.encryption) {
+                (Some(meta), None) => {
+                    fixed_bytes::<21>(&meta.checksum)?;
+                    if meta.size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES {
+                        return Err(PushError::VerificationFailed);
+                    }
+                    validate_preauthorized_container_segment(
+                        meta.offset,
+                        meta.size,
+                        &mut previous_end,
+                    )?;
+                    aggregate_chunk_bytes = aggregate_chunk_bytes
+                        .checked_add(meta.size)
+                        .filter(|total| *total <= MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
+                        .ok_or(PushError::VerificationFailed)?;
+                    usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+                    usize::try_from(meta.offset).map_err(|_| PushError::VerificationFailed)?;
+                    if let Some(key) = &meta.encryption_key {
+                        fixed_bytes::<17>(key)?;
+                    }
+                }
+                (None, Some(encryption)) => {
+                    let encryption_size = u64::from(encryption.size);
+                    if encryption_size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES {
+                        return Err(PushError::VerificationFailed);
+                    }
+                    validate_preauthorized_container_segment(
+                        u64::from(encryption.offset),
+                        encryption_size,
+                        &mut previous_end,
+                    )?;
+                    aggregate_chunk_bytes = aggregate_chunk_bytes
+                        .checked_add(encryption_size)
+                        .filter(|total| *total <= MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
+                        .ok_or(PushError::VerificationFailed)?;
+                    let for_chunks = encryption
+                        .for_chunks
+                        .as_ref()
+                        .ok_or(PushError::VerificationFailed)?;
+                    fixed_bytes::<21>(&for_chunks.container)?;
+                    fixed_bytes::<21>(&for_chunks.keys_container)?;
+                }
+                _ => {
+                    return Err(PushError::VerificationFailed);
+                }
+            }
+        }
+    }
+
+    let mut matched = vec![false; requested_files.len()];
+    let mut aggregate_chunk_references = 0usize;
+    for reference in &response.references {
+        if reference.chunk_references.is_empty()
+            || reference.chunk_references.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        aggregate_chunk_references = aggregate_chunk_references
+            .checked_add(reference.chunk_references.len())
+            .and_then(|count| count.checked_add(usize::from(reference.ford_reference.is_some())))
+            .filter(|count| *count <= MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES)
+            .ok_or(PushError::VerificationFailed)?;
+        let Some(requested_index) = requested_files
+            .iter()
+            .position(|(checksum, _)| checksum == &reference.file_checksum)
+        else {
+            return Err(PushError::VerificationFailed);
+        };
+        if matched
+            .get(requested_index)
+            .copied()
+            .ok_or(PushError::VerificationFailed)?
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        for chunk_reference in &reference.chunk_references {
+            let chunk = response_chunk(
+                &response.containers,
+                chunk_reference.container_index,
+                chunk_reference.chunk_index,
+            )?;
+            let meta = chunk.meta.as_ref().ok_or(PushError::VerificationFailed)?;
+            fixed_bytes::<21>(&meta.checksum)?;
+        }
+        let requested_key = requested_files
+            .get(requested_index)
+            .and_then(|(_, key)| key.as_deref());
+        if requested_key.is_some() != reference.ford_reference.is_some() {
+            return Err(PushError::VerificationFailed);
+        }
+        if let (Some(key), Some(ford_reference)) = (requested_key, &reference.ford_reference) {
+            let expected_ford_reference = ford_key_signature(key)?;
+            let chunk = response_chunk(
+                &response.containers,
+                ford_reference.container_index,
+                ford_reference.chunk_index,
+            )?;
+            let encryption = chunk
+                .encryption
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            let for_chunks = encryption
+                .for_chunks
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            if fixed_bytes::<21>(&for_chunks.keys_container)? != expected_ford_reference {
+                return Err(PushError::VerificationFailed);
+            }
+        }
+        *matched
+            .get_mut(requested_index)
+            .ok_or(PushError::VerificationFailed)? = true;
+    }
+
+    if matched.iter().any(|matched| !matched) {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(())
+}
+
+fn ford_key_signature(key: &[u8]) -> Result<[u8; 21], PushError> {
+    if key.is_empty() {
+        return Err(PushError::VerificationFailed);
+    }
+    let mut signature = [0u8; 21];
+    signature[0] = 0x01;
+    signature[1..].copy_from_slice(&sha1(key));
+    Ok(signature)
+}
+
+fn decode_ford_item(ford: &[u8], key: &[u8]) -> Result<FordItem, PushError> {
+    if key.is_empty() || ford.len() <= 17 {
+        return Err(PushError::VerificationFailed);
+    }
+    let version = [*ford.first().ok_or(PushError::VerificationFailed)?];
+    let iv = ford.get(1..17).ok_or(PushError::VerificationFailed)?;
+    let ciphertext = ford.get(17..).ok_or(PushError::VerificationFailed)?;
+
+    let hk = Hkdf::<Sha256>::new(Some(b"PCSMMCS2"), key);
+    let mut result = [0u8; 64];
+    hk.expand(&[], &mut result)
+        .map_err(|_| PushError::VerificationFailed)?;
+    let mut cipher =
+        CmacSiv::<Aes256>::new_from_slice(&result).map_err(|_| PushError::VerificationFailed)?;
+    let data = cipher
+        .decrypt::<&[&[u8]], &&[u8]>(&[iv, &version], &ciphertext)
+        .map_err(|_| PushError::VerificationFailed)?;
+    require_ford_item(FordChunk::decode(Cursor::new(data))?)
+}
+
+fn require_ford_item(chunk: FordChunk) -> Result<FordItem, PushError> {
+    chunk.item.ok_or(PushError::VerificationFailed)
+}
+
+fn add_ford_item_keys(
+    keymap: &mut HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+    item: FordItem,
+    references: &[authorize_get_response::f1::chunk_references::ChunkReference],
+    containers: &[ProtoContainer],
+    network_policy: MMCSGetNetworkPolicy,
+) -> Result<(), PushError> {
+    if item.chunks.len() != references.len() {
+        return Err(PushError::VerificationFailed);
+    }
+
+    for (ford, reference) in item.chunks.into_iter().zip(references) {
+        fixed_bytes::<33>(&ford.key)?;
+        let plaintext_length = fixed_bytes::<4>(&ford.chunk_len)?;
+        if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+            && u64::from(u32::from_le_bytes(plaintext_length))
+                > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        let chunk = response_chunk(containers, reference.container_index, reference.chunk_index)?;
+        let checksum = &chunk
+            .meta
+            .as_ref()
+            .ok_or(PushError::VerificationFailed)?
+            .checksum;
+        fixed_bytes::<21>(checksum)?;
+        let value = (ford.key, ford.chunk_len);
+        if let Some(existing) = keymap.get(checksum) {
+            if existing != &value {
+                return Err(PushError::VerificationFailed);
+            }
+        } else {
+            keymap.insert(checksum.clone(), value);
+        }
+    }
+    Ok(())
 }
 
 async fn send_mmcs_req(
@@ -714,7 +1592,10 @@ pub async fn put_mmcs(
                     .clone()
                     .into_iter()
                     .map(|mut i| {
-                        i.key = ChunkEncryption::None;
+                        // This is the locally prepared plaintext source. The
+                        // corresponding upload target applies and verifies the
+                        // protocol encryption/signature before network I/O.
+                        i.key = ChunkEncryption::TrustedLocal;
                         i
                     })
                     .collect(),
@@ -746,7 +1627,9 @@ pub async fn put_mmcs(
             let desc = ChunkDesc {
                 id: ford_idx_to_id(ford_ctr),
                 size: ford_data.len(),
-                key: ChunkEncryption::None,
+                // Upload-only FORD indices are routing identifiers, not MMCS
+                // content checksums. The FORD payload authenticates itself.
+                key: ChunkEncryption::TrustedLocal,
                 offset: None,
             };
 
@@ -830,7 +1713,7 @@ pub async fn transfer_mmcs_container(
     let mut upload_resp = match req.method.as_str() {
         "GET" => client.get(&data_url),
         "PUT" => client.put(&data_url),
-        _method => panic!("Cannot upload {}", _method),
+        _ => return Err(PushError::VerificationFailed),
     }
     .header(
         "x-apple-request-uuid",
@@ -852,12 +1735,50 @@ pub async fn transfer_mmcs_container(
     Ok(upload_resp.send().await?)
 }
 
+async fn transfer_mmcs_download_only_container(
+    request: &HttpRequest,
+    user_agent: &str,
+) -> Result<Response, PushError> {
+    validate_download_only_chunk_request(request)?;
+    let client = build_pinned_download_only_client(&request.domain).await?;
+
+    let mut headers = HeaderMap::new();
+    for header in &request.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| PushError::VerificationFailed)?;
+        let value =
+            HeaderValue::from_str(&header.value).map_err(|_| PushError::VerificationFailed)?;
+        headers.append(name, value);
+    }
+
+    Ok(client
+        .get(get_container_url(request))
+        .header(
+            "x-apple-request-uuid",
+            Uuid::new_v4().to_string().to_uppercase(),
+        )
+        .header("user-agent", user_agent)
+        .headers(headers)
+        .send()
+        .await?)
+}
+
 #[async_trait]
 pub trait Container {}
 
 #[async_trait]
 pub trait ReadContainer: Container {
     async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError>;
+    async fn skip(&mut self, mut len: usize) -> Result<(), PushError> {
+        while len > 0 {
+            let step = len.min(MMCS_BOUNDED_SKIP_BYTES);
+            if self.read(step).await?.len() != step {
+                return Err(PushError::VerificationFailed);
+            }
+            len -= step;
+        }
+        Ok(())
+    }
     // read ONE chunk
     async fn finalize(&mut self, config: &MMCSConfig) -> Result<Option<MMCSReceipt>, PushError> {
         Ok(None)
@@ -892,20 +1813,35 @@ pub struct ChunkDesc {
 }
 
 impl ChunkDesc {
+    fn verify_legacy_integrity(&self, data: &[u8]) -> Result<(), PushError> {
+        let (signature, _) = gen_chunk_sig(data, self.id[0]);
+        if signature != self.id {
+            return Err(PushError::VerificationFailed);
+        }
+        Ok(())
+    }
+
     fn encrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
         Ok(match self.key {
-            ChunkEncryption::V1(key) => encrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V1(key) => {
+                self.verify_legacy_integrity(&data)?;
+                encrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?
+            }
             ChunkEncryption::V2(key, _) => {
                 let hk = Hkdf::<Sha256>::new(None, &key[1..]);
                 let mut expanded_key = [0u8; 0x60];
                 hk.expand("signature-key".as_bytes(), &mut expanded_key)
-                    .unwrap();
+                    .map_err(|_| PushError::VerificationFailed)?;
 
                 let hmac = PKey::hmac(&expanded_key[0x20..0x40])?;
 
                 let mut id = self.id[1..].to_vec();
                 id.resize(40, 0);
-                id[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                id[32..36].copy_from_slice(
+                    &u32::try_from(data.len())
+                        .map_err(|_| PushError::VerificationFailed)?
+                        .to_le_bytes(),
+                );
 
                 let h = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&id)?;
 
@@ -922,28 +1858,42 @@ impl ChunkDesc {
                 let h = Signer::new(MessageDigest::sha256(), &sig_hmac)?
                     .sign_oneshot_to_vec(&plaintext_hash)?;
 
-                assert_eq!(&h[..self.id.len() - 1], &self.id[1..]);
+                if &h[..self.id.len() - 1] != &self.id[1..] {
+                    return Err(PushError::VerificationFailed);
+                }
 
                 result
             }
-            ChunkEncryption::None => data,
+            ChunkEncryption::None => {
+                self.verify_legacy_integrity(&data)?;
+                data
+            }
+            ChunkEncryption::TrustedLocal | ChunkEncryption::FordEnvelope => data,
         })
     }
 
     fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
         Ok(match self.key {
-            ChunkEncryption::V1(key) => decrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V1(key) => {
+                let result = decrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?;
+                self.verify_legacy_integrity(&result)?;
+                result
+            }
             ChunkEncryption::V2(key, len) => {
                 let hk = Hkdf::<Sha256>::new(None, &key[1..]);
                 let mut expanded_key = [0u8; 0x60];
                 hk.expand("signature-key".as_bytes(), &mut expanded_key)
-                    .unwrap();
+                    .map_err(|_| PushError::VerificationFailed)?;
 
                 let hmac = PKey::hmac(&expanded_key[0x20..0x40])?;
 
                 let mut id = self.id[1..].to_vec();
                 id.resize(40, 0);
-                id[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                id[32..36].copy_from_slice(
+                    &u32::try_from(data.len())
+                        .map_err(|_| PushError::VerificationFailed)?
+                        .to_le_bytes(),
+                );
 
                 let h = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&id)?;
 
@@ -963,11 +1913,17 @@ impl ChunkDesc {
                 let h = Signer::new(MessageDigest::sha256(), &sig_hmac)?
                     .sign_oneshot_to_vec(&plaintext_hash)?;
 
-                assert_eq!(&h[..self.id.len() - 1], &self.id[1..]);
+                if &h[..self.id.len() - 1] != &self.id[1..] {
+                    return Err(PushError::VerificationFailed);
+                }
 
                 result
             }
-            ChunkEncryption::None => data,
+            ChunkEncryption::None => {
+                self.verify_legacy_integrity(&data)?;
+                data
+            }
+            ChunkEncryption::TrustedLocal | ChunkEncryption::FordEnvelope => data,
         })
     }
 }
@@ -977,6 +1933,13 @@ pub enum ChunkEncryption {
     V1([u8; 17]),
     V2([u8; 33], [u8; 4]),
     None,
+    /// Locally prepared upload plaintext whose target performs the protocol
+    /// integrity check before network I/O.
+    TrustedLocal,
+    /// Encrypted FORD metadata. Its requested key-derived reference is fenced
+    /// before transfer and its ciphertext is authenticated by AES-SIV before
+    /// any contained chunk keys are used.
+    FordEnvelope,
 }
 
 // used for files on disk and containers, for files there is just one container with the chunks in "correct order"
@@ -1013,21 +1976,35 @@ impl<T: Container + Send + Sync> ChunkedContainer<T> {
 impl<T: ReadContainer + Send + Sync> ChunkedContainer<T> {
     // (chunk id, data)
     async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), PushError> {
-        let reading_chunk = &self.chunks[self.current_chunk];
+        let reading_chunk = *self
+            .chunks
+            .get(self.current_chunk)
+            .ok_or(PushError::VerificationFailed)?;
         self.current_chunk += 1;
 
         // skip over FORD chunks
         if let Some(offset) = reading_chunk.offset {
             if offset != self.current_offset {
-                let seek_offset = offset - self.current_offset;
+                let seek_offset = offset
+                    .checked_sub(self.current_offset)
+                    .ok_or(PushError::VerificationFailed)?;
                 warn!("Seeking {} bytes!", seek_offset);
-                self.container.read(seek_offset).await?;
-                self.current_offset += seek_offset;
+                self.container.skip(seek_offset).await?;
+                self.current_offset = self
+                    .current_offset
+                    .checked_add(seek_offset)
+                    .ok_or(PushError::VerificationFailed)?;
             }
         }
 
         let data = self.container.read(reading_chunk.size).await?;
-        self.current_offset += data.len();
+        if data.len() != reading_chunk.size {
+            return Err(PushError::VerificationFailed);
+        }
+        self.current_offset = self
+            .current_offset
+            .checked_add(data.len())
+            .ok_or(PushError::VerificationFailed)?;
 
         let data = reading_chunk.decrypt(data)?;
 
@@ -1039,11 +2016,11 @@ impl<T: WriteContainer + Send + Sync> ChunkedContainer<T> {
     async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) -> Result<(), PushError> {
         let chunk_id = chunk.0;
         let chunk_value = chunk.1.clone();
-        let reading_chunk = &self
+        let reading_chunk = *self
             .chunks
             .iter()
             .find(|c| &c.id[..] == &chunk.0)
-            .expect("Written chunk not found?");
+            .ok_or(PushError::VerificationFailed)?;
 
         let chunk_value = reading_chunk.encrypt(chunk_value)?;
 
@@ -1054,8 +2031,10 @@ impl<T: WriteContainer + Send + Sync> ChunkedContainer<T> {
             self.current_chunk += 1;
             if !self.complete() {
                 // try to catch up on any cached chunks
-                while let Some(cached) = self.cached_chunks.remove(&self.wanted_chunk().unwrap()) {
-                    let wanted = self.wanted_chunk().unwrap();
+                while let Some(wanted) = self.wanted_chunk() {
+                    let Some(cached) = self.cached_chunks.remove(&wanted) else {
+                        break;
+                    };
                     self.container.write(&cached).await?;
                     self.current_chunk += 1;
 
@@ -1113,13 +2092,16 @@ where
             .iter()
             .enumerate()
             .filter(|source| !source.1.complete())
-            .max_by_key(|source| {
-                targets
+            .filter_map(|(index, source)| {
+                let first = source.chunks.first()?;
+                let matches = targets
                     .iter()
-                    .filter(|target| target.wanted_chunk() == Some(source.1.chunks[0].id))
-                    .count()
-            });
-        let wanted_idx = wanted.map(|w| w.0).unwrap_or(usize::MAX);
+                    .filter(|target| target.wanted_chunk() == Some(first.id))
+                    .count();
+                Some((index, matches))
+            })
+            .max_by_key(|(_, matches)| *matches);
+        let wanted_idx = wanted.map(|(index, _)| index).unwrap_or(usize::MAX);
         // so now we know what we want, now we need to get a mutable reference
         sources.get_mut(wanted_idx)
     }
@@ -1129,7 +2111,7 @@ where
         config: &MMCSConfig,
         mut progress: impl FnMut(usize, usize) + Send + Sync,
     ) -> Result<(), PushError> {
-        let mut total_source_progress = 0;
+        let mut total_source_progress = 0usize;
         while let Some(source) = Self::best_source(&self.targets, &mut self.sources) {
             while !source.complete() {
                 let chunk = source.read_next().await?;
@@ -1151,19 +2133,23 @@ where
                         }
                     }
                 }
+                let target_progress = self.targets.iter().try_fold(0usize, |acc, target| {
+                    acc.checked_add(target.container.get_progress_count())
+                        .ok_or(PushError::VerificationFailed)
+                })?;
                 let total_progress = total_source_progress
-                    + source.container.get_progress_count()
-                    + self
-                        .targets
-                        .iter()
-                        .fold(0, |acc, tar| acc + tar.container.get_progress_count());
+                    .checked_add(source.container.get_progress_count())
+                    .and_then(|progress| progress.checked_add(target_progress))
+                    .ok_or(PushError::VerificationFailed)?;
                 info!(
                     "transferred attachment bytes {} of {}",
                     total_progress, self.total
                 );
                 progress(total_progress, self.total);
             }
-            total_source_progress += source.container.get_progress_count();
+            total_source_progress = total_source_progress
+                .checked_add(source.container.get_progress_count())
+                .ok_or(PushError::VerificationFailed)?;
         }
         Ok(())
     }
@@ -1211,82 +2197,149 @@ struct MMCSGetContainer {
     confirm: Option<MMCSReceipt>,
     transfer_progress: usize,
     user_agent: String,
+    network_policy: MMCSGetNetworkPolicy,
+    response_byte_counter: Option<Arc<AtomicU64>>,
 }
 
 impl MMCSGetContainer {
-    fn new(container: ProtoContainer, user_agent: String) -> MMCSGetContainer {
-        MMCSGetContainer {
+    fn new(
+        container: ProtoContainer,
+        user_agent: String,
+        network_policy: MMCSGetNetworkPolicy,
+        response_byte_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<MMCSGetContainer, PushError> {
+        if (network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly)
+            != response_byte_counter.is_some()
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
+            validate_download_only_chunk_request(
+                container
+                    .request
+                    .as_ref()
+                    .ok_or(PushError::VerificationFailed)?,
+            )?;
+        }
+        Ok(MMCSGetContainer {
             container,
             cacher: DataCacher::new(),
             response: None,
             confirm: None,
             transfer_progress: 0,
             user_agent,
+            network_policy,
+            response_byte_counter,
+        })
+    }
+
+    fn get_chunks(
+        &self,
+        keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+        network_policy: MMCSGetNetworkPolicy,
+        required_chunk_ids: &HashSet<[u8; 21]>,
+    ) -> Result<Vec<ChunkDesc>, PushError> {
+        let mut chunks = Vec::new();
+        for chunk in &self.container.chunks {
+            let Some(meta) = &chunk.meta else {
+                continue;
+            };
+            let id = fixed_bytes::<21>(&meta.checksum)?;
+            let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+            let offset = usize::try_from(meta.offset).map_err(|_| PushError::VerificationFailed)?;
+            let key = if let Some((key, len)) = keys.get(&meta.checksum) {
+                ChunkEncryption::V2(fixed_bytes::<33>(key)?, fixed_bytes::<4>(len)?)
+            } else if let Some(key) = &meta.encryption_key {
+                ChunkEncryption::V1(fixed_bytes::<17>(key)?)
+            } else {
+                ChunkEncryption::None
+            };
+            chunks.push(ChunkDesc {
+                id,
+                size,
+                key,
+                offset: Some(offset),
+            });
         }
+        Ok(select_source_chunks(
+            chunks,
+            network_policy,
+            required_chunk_ids,
+        ))
     }
 
-    fn get_chunks(&self, keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>) -> Vec<ChunkDesc> {
-        self.container
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                chunk.meta.as_ref().map(|meta| ChunkDesc {
-                    id: meta.checksum.clone().try_into().unwrap(),
-                    size: meta.size as usize,
-                    key: if let Some((key, len)) = keys.get(&meta.checksum) {
-                        ChunkEncryption::V2(
-                            key.clone().try_into().unwrap(),
-                            len.clone().try_into().unwrap(),
-                        )
-                    } else if let Some(key) = &meta.encryption_key {
-                        ChunkEncryption::V1(key.clone().try_into().unwrap())
-                    } else {
-                        ChunkEncryption::None
-                    },
-                    offset: Some(meta.offset as usize),
-                })
-            })
-            .collect()
-    }
-
-    fn get_ford_chunks(&self) -> Vec<ChunkDesc> {
-        self.container
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                chunk.encryption.as_ref().map(|meta| ChunkDesc {
-                    id: meta
-                        .for_chunks
-                        .as_ref()
-                        .unwrap()
-                        .keys_container
-                        .clone()
-                        .try_into()
-                        .unwrap(),
-                    size: meta.size as usize,
-                    key: ChunkEncryption::None,
-                    offset: Some(meta.offset as usize),
-                })
-            })
-            .collect()
+    fn get_ford_chunks(
+        &self,
+        network_policy: MMCSGetNetworkPolicy,
+        required_chunk_ids: &HashSet<[u8; 21]>,
+    ) -> Result<Vec<ChunkDesc>, PushError> {
+        let mut chunks = Vec::new();
+        for chunk in &self.container.chunks {
+            let Some(meta) = &chunk.encryption else {
+                continue;
+            };
+            let for_chunks = meta
+                .for_chunks
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            chunks.push(ChunkDesc {
+                id: fixed_bytes::<21>(&for_chunks.keys_container)?,
+                size: usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?,
+                // The requested FORD key is fenced to this reference and the
+                // downloaded envelope is authenticated by AES-SIV on decode.
+                key: ChunkEncryption::FordEnvelope,
+                offset: Some(
+                    usize::try_from(meta.offset).map_err(|_| PushError::VerificationFailed)?,
+                ),
+            });
+        }
+        Ok(select_source_chunks(
+            chunks,
+            network_policy,
+            required_chunk_ids,
+        ))
     }
 
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(
-                &REQWEST,
-                &self.container.request.as_ref().unwrap(),
-                None,
-                &self.user_agent,
-            )
-            .await?;
-            self.confirm = Some(MMCSReceipt::Get(confirm_for_resp(
-                &response,
-                &get_container_url(&self.container.request.as_ref().unwrap()),
-                &self.container.cl_auth_p2,
-                None,
-            )));
+            let request = self
+                .container
+                .request
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            if self.network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
+                validate_download_only_chunk_request(request)?;
+            }
+            let response = if self.network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+            {
+                transfer_mmcs_download_only_container(request, &self.user_agent).await?
+            } else {
+                transfer_mmcs_container(&REQWEST, request, None, &self.user_agent).await?
+            };
+            if self.network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+                && !response.status().is_success()
+            {
+                return Err(PushError::MMCSGetFailed(Some(format!(
+                    "chunk GET returned HTTP {}",
+                    response.status().as_u16()
+                ))));
+            }
+            if self.network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+                && response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
+            {
+                return Err(PushError::VerificationFailed);
+            }
+            if self.network_policy.collects_completion_receipts() {
+                self.confirm = Some(MMCSReceipt::Get(confirm_for_resp(
+                    &response,
+                    &get_container_url(request),
+                    &self.container.cl_auth_p2,
+                    None,
+                )));
+            }
             self.response = Some(response);
         }
         Ok(())
@@ -1303,15 +2356,25 @@ impl ReadContainer for MMCSGetContainer {
 
         let mut received = self.cacher.read_exact(len);
         while received.is_none() {
-            let Some(bytes) = self.response.as_mut().unwrap().chunk().await? else {
+            let response = self
+                .response
+                .as_mut()
+                .ok_or(PushError::VerificationFailed)?;
+            let Some(bytes) = response.chunk().await? else {
                 return Ok(self.cacher.read_all());
             };
+            if let Some(counter) = &self.response_byte_counter {
+                record_preauthorized_response_bytes(counter, bytes.len())?;
+            }
             self.cacher.data_avail(&bytes);
             received = self.cacher.read_exact(len);
         }
 
-        let read = received.unwrap();
-        self.transfer_progress += read.len();
+        let read = received.ok_or(PushError::VerificationFailed)?;
+        self.transfer_progress = self
+            .transfer_progress
+            .checked_add(read.len())
+            .ok_or(PushError::VerificationFailed)?;
         Ok(read)
     }
 
@@ -1363,6 +2426,283 @@ pub async fn authorize_get(
     })
 }
 
+async fn get_mmcs_with_network_policy(
+    config: &MMCSConfig,
+    authorized: AuthorizedOperation,
+    files: Vec<(
+        Vec<u8>,
+        &str,
+        impl WriteContainer + Send + Sync,
+        Option<Vec<u8>>,
+    )>,
+    progress: impl FnMut(usize, usize) + Send + Sync,
+    _ford: bool,
+    network_policy: MMCSGetNetworkPolicy,
+) -> Result<(), PushError> {
+    let mut files = files
+        .into_iter()
+        .map(|(a, b, c, k)| (a, b, Some(c), k))
+        .collect::<Vec<_>>();
+
+    let AuthorizedOperation { url, body, dsid } = authorized;
+
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+        && (!url.is_empty() || !dsid.is_empty())
+    {
+        // A preauthorized CloudKit asset has no standalone authorizeGet or
+        // getComplete endpoint. Rejecting either value prevents this path from
+        // acquiring a mutation-capable completion destination.
+        return Err(PushError::VerificationFailed);
+    }
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
+        validate_preauthorized_authorization_body(&body)?;
+    }
+    let response_byte_counter = (network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly)
+        .then(|| Arc::new(AtomicU64::new(0)));
+
+    debug!(
+        "Received MMCS authorize-get response (bytes={})",
+        body.len()
+    );
+    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body))?;
+
+    let Some(response_data) = response.f1.as_ref() else {
+        let reason = response
+            .error
+            .as_ref()
+            .and_then(|error| error.f2.as_ref())
+            .map(|error| error.reason.clone());
+        return Err(PushError::MMCSGetFailed(reason));
+    };
+
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
+        let requested_files = files
+            .iter()
+            .map(|(checksum, _, _, key)| (checksum.clone(), key.clone()))
+            .collect::<Vec<_>>();
+        validate_preauthorized_download_response(response_data, &requested_files)?;
+    }
+
+    let mut total_bytes = 0usize;
+    for container in &response_data.containers {
+        for chunk in &container.chunks {
+            if let Some(meta) = &chunk.meta {
+                let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+                total_bytes = total_bytes
+                    .checked_add(size)
+                    .ok_or(PushError::VerificationFailed)?;
+            }
+        }
+    }
+
+    let mut ford_containers = vec![];
+    let containers = &response_data.containers;
+    let mut targets = Vec::new();
+    for wanted_chunks in &response_data.references {
+        let Some(file_index) = files
+            .iter()
+            .position(|file| file.0 == wanted_chunks.file_checksum && file.2.is_some())
+        else {
+            continue;
+        };
+
+        if let Some(ford_reference) = &wanted_chunks.ford_reference {
+            let ford_key = files
+                .get(file_index)
+                .and_then(|file| file.3.clone())
+                .ok_or(PushError::VerificationFailed)?;
+            ford_containers.push((
+                wanted_chunks.chunk_references.clone(),
+                ford_reference.clone(),
+                Vec::new(),
+                ford_key,
+            ));
+        }
+
+        let mut target_chunks = Vec::with_capacity(wanted_chunks.chunk_references.len());
+        for chunk_reference in &wanted_chunks.chunk_references {
+            let chunk = response_chunk(
+                containers,
+                chunk_reference.container_index,
+                chunk_reference.chunk_index,
+            )?;
+            let meta = chunk.meta.as_ref().ok_or(PushError::VerificationFailed)?;
+            target_chunks.push(ChunkDesc {
+                id: fixed_bytes::<21>(&meta.checksum)?,
+                size: usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?,
+                key: ChunkEncryption::None,
+                offset: None,
+            });
+        }
+        if target_chunks.is_empty() {
+            return Err(PushError::VerificationFailed);
+        }
+        let writer = files
+            .get_mut(file_index)
+            .ok_or(PushError::VerificationFailed)?
+            .2
+            .take()
+            .ok_or(PushError::VerificationFailed)?;
+        targets.push(ChunkedContainer::new(target_chunks, writer));
+    }
+
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+        && (targets.len() != files.len() || files.iter().any(|file| file.2.is_some()))
+    {
+        return Err(PushError::VerificationFailed);
+    }
+
+    let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    if !ford_containers.is_empty() {
+        {
+            let mut ford_targets = Vec::with_capacity(ford_containers.len());
+            for (_, ford_reference, ford_bytes, _) in &mut ford_containers {
+                let chunk = response_chunk(
+                    containers,
+                    ford_reference.container_index,
+                    ford_reference.chunk_index,
+                )?;
+                let encryption = chunk
+                    .encryption
+                    .as_ref()
+                    .ok_or(PushError::VerificationFailed)?;
+                let for_chunks = encryption
+                    .for_chunks
+                    .as_ref()
+                    .ok_or(PushError::VerificationFailed)?;
+                ford_targets.push(ChunkedContainer::new(
+                    vec![ChunkDesc {
+                        id: fixed_bytes::<21>(&for_chunks.keys_container)?,
+                        size: usize::try_from(encryption.size)
+                            .map_err(|_| PushError::VerificationFailed)?,
+                        key: ChunkEncryption::FordEnvelope,
+                        offset: None,
+                    }],
+                    FileContainer::new(Cursor::new(ford_bytes)),
+                ));
+            }
+
+            let required_chunk_ids = ford_targets
+                .iter()
+                .flat_map(|target| target.chunks.iter().map(|chunk| chunk.id))
+                .collect::<HashSet<_>>();
+            let ford_sources: Vec<ChunkedContainer<MMCSGetContainer>> = containers
+                .iter()
+                .map(|container| {
+                    let container = MMCSGetContainer::new(
+                        container.clone(),
+                        config.user_agent.clone(),
+                        network_policy,
+                        response_byte_counter.clone(),
+                    )?;
+                    let chunks = container.get_ford_chunks(network_policy, &required_chunk_ids)?;
+                    Ok((!chunks.is_empty()).then(|| ChunkedContainer::new(chunks, container)))
+                })
+                .collect::<Result<Vec<_>, PushError>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+
+            let mut matcher = MMCSMatcher {
+                sources: ford_sources,
+                targets: ford_targets,
+                reciepts: vec![],
+                total: total_bytes,
+            };
+            matcher.transfer_chunks(config, |_, _| {}).await?;
+            if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+                && matcher.targets.iter().any(|target| !target.complete())
+            {
+                return Err(PushError::VerificationFailed);
+            }
+        }
+
+        for (references, _ford_ref, ford, key) in ford_containers {
+            let item = decode_ford_item(&ford, &key)?;
+            add_ford_item_keys(
+                &mut ford_keymap,
+                item,
+                &references,
+                containers,
+                network_policy,
+            )?;
+        }
+    }
+
+    let required_chunk_ids = targets
+        .iter()
+        .flat_map(|target| target.chunks.iter().map(|chunk| chunk.id))
+        .collect::<HashSet<_>>();
+    let sources: Vec<ChunkedContainer<MMCSGetContainer>> = containers
+        .iter()
+        .map(|container| {
+            let container = MMCSGetContainer::new(
+                container.clone(),
+                config.user_agent.clone(),
+                network_policy,
+                response_byte_counter.clone(),
+            )?;
+            let chunks = container.get_chunks(&ford_keymap, network_policy, &required_chunk_ids)?;
+            Ok((!chunks.is_empty()).then(|| ChunkedContainer::new(chunks, container)))
+        })
+        .collect::<Result<Vec<_>, PushError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut matcher = MMCSMatcher {
+        sources,
+        targets,
+        reciepts: vec![],
+        total: total_bytes,
+    };
+    matcher.transfer_chunks(config, progress).await?;
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+        && matcher.targets.iter().any(|target| !target.complete())
+    {
+        return Err(PushError::VerificationFailed);
+    }
+
+    // cloudkit doesn't do getComplete
+    if network_policy.sends_completion() && !url.is_empty() {
+        let confirmations = matcher
+            .get_confirm_reciepts()
+            .iter()
+            .map(|receipt| match receipt {
+                MMCSReceipt::Get(receipt) => Ok(receipt.clone()),
+                MMCSReceipt::Put(_) => Err(PushError::VerificationFailed),
+            })
+            .collect::<Result<Vec<_>, PushError>>()?;
+        let confirmation = mmcsp::ConfirmResponse {
+            inner: confirmations,
+            confirm_data: None,
+        };
+        let buf: Vec<u8> = confirmation.encode_to_vec();
+        let first_container = containers.first().ok_or(PushError::VerificationFailed)?;
+        let resp = send_mmcs_req(
+            &REQWEST,
+            config,
+            &url,
+            "getComplete",
+            &format!(
+                "{} {}",
+                first_container.cl_auth_p1, first_container.cl_auth_p2
+            ),
+            &dsid,
+            &buf,
+        )
+        .await?;
+        if !resp.status().is_success() {
+            return Err(PushError::MMCSGetFailed(Some(format!(
+                "getComplete returned HTTP {}",
+                resp.status().as_u16()
+            ))));
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn get_mmcs(
     config: &MMCSConfig,
     authorized: AuthorizedOperation,
@@ -1375,214 +2715,1087 @@ pub async fn get_mmcs(
     progress: impl FnMut(usize, usize) + Send + Sync,
     ford: bool,
 ) -> Result<(), PushError> {
-    let mut files = files
-        .into_iter()
-        .map(|(a, b, c, k)| (a, b, Some(c), k))
-        .collect::<Vec<_>>();
+    get_mmcs_with_network_policy(
+        config,
+        authorized,
+        files,
+        progress,
+        ford,
+        MMCSGetNetworkPolicy::Standard,
+    )
+    .await
+}
 
-    let AuthorizedOperation { url, body, dsid } = authorized;
+/// Downloads a CloudKit-provided MMCS authorization response using a closed
+/// network shape: server-described HTTPS GETs only, no redirect following, no
+/// application-level retry loop, no authorizeGet request, and no getComplete
+/// acknowledgement. Chunk hashes, decryption, and whole-file integrity checks
+/// remain in the normal matcher.
+pub async fn get_mmcs_pre_authorized_download_only(
+    config: &MMCSConfig,
+    authorization_body: &[u8],
+    files: Vec<(
+        Vec<u8>,
+        &str,
+        impl WriteContainer + Send + Sync,
+        Option<Vec<u8>>,
+    )>,
+    progress: impl FnMut(usize, usize) + Send + Sync,
+) -> Result<(), PushError> {
+    // Preflight before cloning so an oversized or malformed CloudKit body
+    // cannot cause a second attacker-sized allocation before Prost sees it.
+    validate_preauthorized_authorization_body(authorization_body)?;
+    get_mmcs_with_network_policy(
+        config,
+        AuthorizedOperation {
+            body: authorization_body.to_vec(),
+            ..Default::default()
+        },
+        files,
+        progress,
+        false,
+        MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+    )
+    .await
+}
 
-    debug!(
-        "Received MMCS authorize-get response (bytes={})",
-        body.len()
-    );
-    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body)).unwrap();
+#[cfg(test)]
+mod download_only_tests {
+    use super::*;
+    use crate::mmcsp::{
+        authorize_get_response::f1::{chunk_references::ChunkReference, ChunkReferences},
+        container::{encryption_meta::EncryptedChunks, ChunkMeta, ChunkWrapper, EncryptionMeta},
+        http_request::Header,
+    };
 
-    if response.f1.is_none() {
-        let Some(authorize_get_response::Error {
-            f2: Some(authorize_get_response::error::F2 { reason }),
-        }) = response.error
-        else {
-            return Err(PushError::MMCSGetFailed(None));
-        };
-        return Err(PushError::MMCSGetFailed(Some(reason)));
+    fn chunk_request(method: &str, scheme: &str) -> HttpRequest {
+        HttpRequest {
+            domain: "cvws.icloud-content.com".to_owned(),
+            port: 443,
+            method: method.to_owned(),
+            path: "/mmcs/download/chunk".to_owned(),
+            scheme: scheme.to_owned(),
+            ..Default::default()
+        }
     }
 
-    let total_bytes = response
-        .f1
-        .as_ref()
-        .expect("no container list?")
-        .containers
-        .iter()
-        .fold(0, |acc, container| {
-            acc + container.chunks.iter().fold(0, |acc, chunk| {
-                acc + chunk.meta.as_ref().map(|m| m.size).unwrap_or(0)
-            })
-        }) as usize;
+    fn chunk_reference(container_index: u32, chunk_index: u32) -> ChunkReference {
+        ChunkReference {
+            container_index,
+            chunk_index,
+        }
+    }
 
-    let mut ford_containers = vec![];
+    fn valid_download_response() -> (authorize_get_response::F1, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let file_checksum = vec![0x11; 21];
+        (
+            authorize_get_response::F1 {
+                containers: vec![ProtoContainer {
+                    request: Some(chunk_request("GET", "https")),
+                    chunks: vec![ChunkWrapper {
+                        meta: Some(ChunkMeta {
+                            checksum: vec![0x22; 21],
+                            size: 16,
+                            offset: 0,
+                            ..Default::default()
+                        }),
+                        encryption: None,
+                    }],
+                    ..Default::default()
+                }],
+                references: vec![ChunkReferences {
+                    file_checksum: file_checksum.clone(),
+                    chunk_references: vec![chunk_reference(0, 0)],
+                    ..Default::default()
+                }],
+            },
+            vec![(file_checksum, None)],
+        )
+    }
 
-    let containers = &response.f1.as_ref().unwrap().containers;
-    let targets = response
-        .f1
-        .as_ref()
-        .unwrap()
-        .references
-        .iter()
-        .filter_map(|wanted_chunks| {
-            let Some(container) = files.iter_mut().find(|container| {
-                &container.0 == &wanted_chunks.file_checksum && container.2.is_some()
-            }) else {
-                return None;
-            };
+    fn valid_ford_download_response(
+    ) -> (authorize_get_response::F1, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let (mut response, mut requested) = valid_download_response();
+        let ford_key = vec![0x55; 32];
+        response.containers[0].chunks.push(ChunkWrapper {
+            meta: None,
+            encryption: Some(EncryptionMeta {
+                size: 32,
+                offset: 16,
+                for_chunks: Some(EncryptedChunks {
+                    container: vec![0x33; 21],
+                    keys_container: ford_key_signature(&ford_key).unwrap().to_vec(),
+                }),
+            }),
+        });
+        response.references[0].ford_reference = Some(chunk_reference(0, 1));
+        requested[0].1 = Some(ford_key);
+        (response, requested)
+    }
 
-            if let Some(ford) = &wanted_chunks.ford_reference {
-                ford_containers.push((
-                    wanted_chunks.chunk_references.clone(),
-                    ford.clone(),
-                    vec![0u8; 0],
-                    container.3.clone().expect("Ford chunk has no key!"),
-                ));
+    fn encode_test_varint(mut value: u64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
             }
+            encoded.push(byte);
+            if value == 0 {
+                return encoded;
+            }
+        }
+    }
 
-            Some(ChunkedContainer::new(
-                wanted_chunks
-                    .chunk_references
-                    .iter()
-                    .map(|chunk| {
-                        let container = containers.get(chunk.container_index as usize).unwrap();
-                        let chunk = &container.chunks[chunk.chunk_index as usize];
-                        if let Some(meta) = &chunk.meta {
-                            ChunkDesc {
-                                id: meta.checksum.clone().try_into().unwrap(),
-                                size: meta.size as usize,
-                                key: ChunkEncryption::None, // do not re-encrypt for output
-                                offset: None,
-                            }
-                        } else {
-                            panic!("bad chunk type?")
-                        }
-                    })
-                    .collect(),
-                container.2.take().unwrap(),
-            ))
+    fn append_test_message(output: &mut Vec<u8>, field_number: u32, payload: &[u8]) {
+        output.extend(encode_test_varint((u64::from(field_number) << 3) | 2));
+        output.extend(encode_test_varint(payload.len() as u64));
+        output.extend_from_slice(payload);
+    }
+
+    fn wrap_test_message(field_number: u32, payload: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        append_test_message(&mut output, field_number, payload);
+        output
+    }
+
+    fn repeated_empty_test_messages(field_number: u32, count: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(count.saturating_mul(2));
+        for _ in 0..count {
+            append_test_message(&mut output, field_number, &[]);
+        }
+        output
+    }
+
+    fn opaque_authorization_body(total_len: usize) -> Vec<u8> {
+        for length_bytes in 1..=10usize {
+            let Some(payload_len) = total_len.checked_sub(1 + length_bytes) else {
+                continue;
+            };
+            let encoded_length = encode_test_varint(payload_len as u64);
+            if encoded_length.len() == length_bytes {
+                let mut body = Vec::with_capacity(total_len);
+                body.push((15 << 3) | 2);
+                body.extend(encoded_length);
+                body.resize(total_len, 0);
+                return body;
+            }
+        }
+        panic!("unable to build exact-length protobuf test body");
+    }
+
+    fn assert_verification_failed<T>(result: Result<T, PushError>) {
+        assert!(matches!(result, Err(PushError::VerificationFailed)));
+    }
+
+    #[test]
+    fn download_only_policy_allows_only_exact_https_get_shape() {
+        assert!(validate_download_only_chunk_request(&chunk_request("GET", "https")).is_ok());
+        assert!(validate_download_only_chunk_request(&chunk_request("PUT", "https")).is_err());
+        assert!(validate_download_only_chunk_request(&chunk_request("POST", "https")).is_err());
+        assert!(validate_download_only_chunk_request(&chunk_request("GET", "http")).is_err());
+
+        let mut authority_override = chunk_request("GET", "https");
+        authority_override.headers.push(Header {
+            name: "Host".to_owned(),
+            value: "elsewhere.invalid".to_owned(),
+        });
+        assert!(validate_download_only_chunk_request(&authority_override).is_err());
+
+        let mut method_override = chunk_request("GET", "https");
+        method_override.headers.push(Header {
+            name: "X-HTTP-Method-Override".to_owned(),
+            value: "POST".to_owned(),
+        });
+        assert!(validate_download_only_chunk_request(&method_override).is_err());
+    }
+
+    #[test]
+    fn download_only_policy_rejects_request_shape_headers_and_keeps_apple_auth() {
+        for name in [
+            "Host",
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "Transfer-Encoding",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Content-Length",
+            "Expect",
+            "Forwarded",
+            "Via",
+            "X-Forwarded-For",
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Real-IP",
+            "Authority",
+            "X-Authority",
+            "X-Host",
+            "Destination",
+            "X-HTTP-DestinationURL",
+            "Max-Forwards",
+            "Proxy",
+            "Proxy-Authorization",
+            "X-HTTP-Method",
+            "X-HTTP-Method-Override",
+            "X-Method-Override",
+            "X-Original-Method",
+            "X-Original-URL",
+            "X-Rewrite-URL",
+            "X-Envoy-Original-Path",
+            "X-Amzn-Remapped-Host",
+            "x-apple-put-complete-at-edge-version",
+        ] {
+            let mut request = chunk_request("GET", "https");
+            request.headers.push(Header {
+                name: name.to_owned(),
+                value: "attacker-controlled".to_owned(),
+            });
+            assert_verification_failed(validate_download_only_chunk_request(&request));
+        }
+
+        for name in [
+            "x-apple-mmcs-auth",
+            "x-apple-mmcs-proto-version",
+            "Authorization",
+        ] {
+            let mut request = chunk_request("GET", "https");
+            request.headers.push(Header {
+                name: name.to_owned(),
+                value: "required-authorization".to_owned(),
+            });
+            assert!(validate_download_only_chunk_request(&request).is_ok());
+        }
+    }
+
+    #[test]
+    fn download_only_policy_requires_public_shaped_ascii_dns_on_port_443() {
+        let mut request = chunk_request("GET", "https");
+        request.port = 80;
+        assert_verification_failed(validate_download_only_chunk_request(&request));
+
+        for domain in [
+            "localhost",
+            "printer.local",
+            "127.0.0.1",
+            "cache..example.com",
+            "-cache.example.com",
+            "cache-.example.com",
+            "cache.example.123",
+            "caché.example.com",
+        ] {
+            let mut request = chunk_request("GET", "https");
+            request.domain = domain.to_owned();
+            assert_verification_failed(validate_download_only_chunk_request(&request));
+        }
+
+        let mut valid_hyphenated = chunk_request("GET", "https");
+        valid_hyphenated.domain = "edge-cache.example.com".to_owned();
+        assert!(validate_download_only_chunk_request(&valid_hyphenated).is_ok());
+
+        let mut oversized_domain = chunk_request("GET", "https");
+        oversized_domain.domain = format!("{}.example.com", "a.".repeat(122));
+        assert_verification_failed(validate_download_only_chunk_request(&oversized_domain));
+    }
+
+    #[test]
+    fn download_only_resolution_rejects_every_non_public_or_mixed_destination() {
+        let socket = |address: &str| address.parse::<SocketAddr>().unwrap();
+        for address in [
+            "0.0.0.0:443",
+            "10.0.0.1:443",
+            "100.64.0.1:443",
+            "127.0.0.1:443",
+            "169.254.1.1:443",
+            "192.0.2.1:443",
+            "198.18.0.1:443",
+            "198.51.100.1:443",
+            "203.0.113.1:443",
+            "224.0.0.1:443",
+            "[::]:443",
+            "[::1]:443",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+            "[2001:2::1]:443",
+            "[2001:db8::1]:443",
+            "[3fff::1]:443",
+            "[64:ff9b::7f00:1]:443",
+            "[64:ff9b::c000:201]:443",
+            "[ff02::1]:443",
+        ] {
+            assert_verification_failed(validate_download_only_resolved_addresses(&[socket(
+                address,
+            )]));
+        }
+
+        assert_verification_failed(validate_download_only_resolved_addresses(&[]));
+        assert_verification_failed(validate_download_only_resolved_addresses(&[
+            socket("8.8.8.8:443"),
+            socket("127.0.0.1:443"),
+        ]));
+        assert_verification_failed(validate_download_only_resolved_addresses(&[socket(
+            "8.8.8.8:80",
+        )]));
+        assert!(validate_download_only_resolved_addresses(&[
+            socket("8.8.8.8:443"),
+            socket("[2606:4700:4700::1111]:443"),
+            socket("[64:ff9b::808:808]:443"),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn download_only_policy_rejects_malformed_transport_headers_before_io() {
+        let mut invalid_name = chunk_request("GET", "https");
+        invalid_name.headers.push(Header {
+            name: "bad header".to_owned(),
+            value: "value".to_owned(),
+        });
+        assert_verification_failed(validate_download_only_chunk_request(&invalid_name));
+
+        let mut invalid_value = chunk_request("GET", "https");
+        invalid_value.headers.push(Header {
+            name: "x-mmcs-test".to_owned(),
+            value: "value\r\ninjected: true".to_owned(),
+        });
+        assert_verification_failed(validate_download_only_chunk_request(&invalid_value));
+    }
+
+    #[test]
+    fn download_only_policy_cannot_collect_or_send_completion() {
+        let policy = MMCSGetNetworkPolicy::PreauthorizedDownloadOnly;
+        assert!(!policy.collects_completion_receipts());
+        assert!(!policy.sends_completion());
+        assert!(MMCSGetNetworkPolicy::Standard.collects_completion_receipts());
+        assert!(MMCSGetNetworkPolicy::Standard.sends_completion());
+    }
+
+    #[test]
+    fn download_only_container_rejects_mutating_server_request_before_io() {
+        let container = ProtoContainer {
+            request: Some(chunk_request("PUT", "https")),
+            ..Default::default()
+        };
+        assert!(MMCSGetContainer::new(
+            container,
+            "test-agent".to_owned(),
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+            Some(Arc::new(AtomicU64::new(0))),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn download_only_sources_are_reduced_to_requested_chunk_ids() {
+        let chunk = |id| ChunkDesc {
+            id: [id; 21],
+            size: 1,
+            key: ChunkEncryption::None,
+            offset: None,
+        };
+        let required = HashSet::from([[2; 21]]);
+
+        let selected = select_source_chunks(
+            vec![chunk(1), chunk(2), chunk(3)],
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+            &required,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, [2; 21]);
+
+        let standard = select_source_chunks(
+            vec![chunk(1), chunk(2), chunk(3)],
+            MMCSGetNetworkPolicy::Standard,
+            &required,
+        );
+        assert_eq!(standard.len(), 3);
+    }
+
+    #[test]
+    fn malformed_response_indices_return_errors_instead_of_panicking() {
+        let (response, requested) = valid_download_response();
+
+        let mut bad_container = response.clone();
+        bad_container.references[0].chunk_references[0].container_index = 1;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_container,
+            &requested,
+        ));
+
+        let mut bad_chunk = response;
+        bad_chunk.references[0].chunk_references[0].chunk_index = 1;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_chunk, &requested,
+        ));
+    }
+
+    #[test]
+    fn malformed_response_missing_metadata_or_ford_key_returns_errors() {
+        let (mut missing_meta, requested) = valid_download_response();
+        missing_meta.containers[0].chunks[0].meta = None;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &missing_meta,
+            &requested,
+        ));
+
+        let (ford_response, mut missing_key) = valid_ford_download_response();
+        missing_key[0].1 = None;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &ford_response,
+            &missing_key,
+        ));
+
+        let (mut missing_ford_meta, requested) = valid_ford_download_response();
+        missing_ford_meta.containers[0].chunks[1].encryption = None;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &missing_ford_meta,
+            &requested,
+        ));
+
+        let (mut missing_for_chunks, requested) = valid_ford_download_response();
+        missing_for_chunks.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .for_chunks = None;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &missing_for_chunks,
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn preauthorized_metadata_cardinality_and_encoded_body_are_bounded() {
+        let mut authorization_body =
+            opaque_authorization_body(MAX_PREAUTHORIZED_DOWNLOAD_AUTHORIZATION_BYTES);
+        assert!(validate_preauthorized_authorization_body(&authorization_body).is_ok());
+        authorization_body.push(0);
+        assert_verification_failed(validate_preauthorized_authorization_body(
+            &authorization_body,
+        ));
+
+        let (response, requested) = valid_download_response();
+        let container = response.containers[0].clone();
+        let reference = response.references[0].clone();
+        let chunk = container.chunks[0].clone();
+
+        let mut too_many_containers = response.clone();
+        too_many_containers.containers =
+            vec![container.clone(); MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS + 1];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_containers,
+            &requested,
+        ));
+
+        let mut too_many_references = response.clone();
+        too_many_references.references =
+            vec![reference.clone(); MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES + 1];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_references,
+            &requested,
+        ));
+
+        let mut too_many_container_chunks = response.clone();
+        too_many_container_chunks.containers[0].chunks =
+            vec![chunk.clone(); MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER + 1];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_container_chunks,
+            &requested,
+        ));
+
+        let mut too_many_total_chunks = response.clone();
+        let mut zero_chunk = chunk.clone();
+        zero_chunk.meta.as_mut().unwrap().size = 0;
+        too_many_total_chunks.containers = [
+            MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER,
+            MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER,
+            1,
+        ]
+        .into_iter()
+        .map(|count| ProtoContainer {
+            chunks: vec![zero_chunk.clone(); count],
+            ..container.clone()
         })
         .collect();
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_total_chunks,
+            &requested,
+        ));
 
-    let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
-    if !ford_containers.is_empty() {
-        let ford_sources: Vec<ChunkedContainer<MMCSGetContainer>> = response
-            .f1
-            .as_ref()
+        let mut too_many_headers = response.clone();
+        too_many_headers.containers[0]
+            .request
+            .as_mut()
             .unwrap()
-            .containers
-            .iter()
-            .map(|container| {
-                let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
-                ChunkedContainer::new(container.get_ford_chunks(), container)
+            .headers = vec![
+            Header {
+                name: "x-mmcs-test".to_owned(),
+                value: "value".to_owned(),
+            };
+            MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST + 1
+        ];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_headers,
+            &requested,
+        ));
+
+        let mut too_many_chunk_references = response;
+        too_many_chunk_references.references[0].chunk_references =
+            vec![chunk_reference(0, 0); MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES + 1];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &too_many_chunk_references,
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn protobuf_wire_preflight_enforces_nested_cardinality_at_and_over_limits() {
+        let root_from_f1 = |f1: Vec<u8>| wrap_test_message(1, &f1);
+
+        let containers = repeated_empty_test_messages(1, MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS);
+        assert!(validate_preauthorized_authorization_body(&root_from_f1(containers)).is_ok());
+        let too_many_containers =
+            repeated_empty_test_messages(1, MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS + 1);
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            too_many_containers,
+        )));
+
+        let references = repeated_empty_test_messages(2, MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES);
+        assert!(validate_preauthorized_authorization_body(&root_from_f1(references)).is_ok());
+        let too_many_references =
+            repeated_empty_test_messages(2, MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES + 1);
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            too_many_references,
+        )));
+
+        let chunks =
+            repeated_empty_test_messages(5, MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER);
+        let one_full_container = wrap_test_message(1, &chunks);
+        assert!(
+            validate_preauthorized_authorization_body(&root_from_f1(one_full_container)).is_ok()
+        );
+        let too_many_chunks =
+            repeated_empty_test_messages(5, MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER + 1);
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            wrap_test_message(1, &too_many_chunks),
+        )));
+
+        let full_container = wrap_test_message(1, &chunks);
+        let mut maximum_total_chunks = Vec::new();
+        maximum_total_chunks.extend_from_slice(&full_container);
+        maximum_total_chunks.extend_from_slice(&full_container);
+        assert!(
+            validate_preauthorized_authorization_body(&root_from_f1(maximum_total_chunks)).is_ok()
+        );
+        let mut too_many_total_chunks = Vec::new();
+        too_many_total_chunks.extend_from_slice(&full_container);
+        too_many_total_chunks.extend_from_slice(&full_container);
+        append_test_message(
+            &mut too_many_total_chunks,
+            1,
+            &repeated_empty_test_messages(5, 1),
+        );
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            too_many_total_chunks,
+        )));
+
+        let headers =
+            repeated_empty_test_messages(8, MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST);
+        let request = wrap_test_message(1, &headers);
+        let container = wrap_test_message(1, &request);
+        assert!(validate_preauthorized_authorization_body(&root_from_f1(container)).is_ok());
+        let too_many_headers =
+            repeated_empty_test_messages(8, MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST + 1);
+        let request = wrap_test_message(1, &too_many_headers);
+        let container = wrap_test_message(1, &request);
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            container,
+        )));
+
+        let chunk_references =
+            repeated_empty_test_messages(2, MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES);
+        let reference = wrap_test_message(2, &chunk_references);
+        assert!(validate_preauthorized_authorization_body(&root_from_f1(reference)).is_ok());
+        let too_many_chunk_references =
+            repeated_empty_test_messages(2, MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES + 1);
+        let reference = wrap_test_message(2, &too_many_chunk_references);
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            reference,
+        )));
+
+        let mut aggregate_references = Vec::new();
+        for _ in 0..(MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES
+            / MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES)
+        {
+            append_test_message(&mut aggregate_references, 2, &chunk_references);
+        }
+        assert!(validate_preauthorized_authorization_body(&root_from_f1(
+            aggregate_references.clone(),
+        ))
+        .is_ok());
+        append_test_message(
+            &mut aggregate_references,
+            2,
+            &repeated_empty_test_messages(2, 1),
+        );
+        assert_verification_failed(validate_preauthorized_authorization_body(&root_from_f1(
+            aggregate_references,
+        )));
+    }
+
+    #[test]
+    fn protobuf_wire_preflight_rejects_malformed_and_overlong_nested_varints() {
+        for malformed in [
+            vec![0x80],
+            vec![0x8a, 0x00, 0x00],
+            vec![0x0a, 0x80, 0x00],
+            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+        ] {
+            assert_verification_failed(validate_preauthorized_authorization_body(&malformed));
+        }
+
+        let malformed_chunk_reference = vec![0x08, 0x80, 0x00];
+        let reference = wrap_test_message(2, &malformed_chunk_reference);
+        let f1 = wrap_test_message(2, &reference);
+        assert_verification_failed(validate_preauthorized_authorization_body(
+            &wrap_test_message(1, &f1),
+        ));
+
+        let truncated_chunk_reference = vec![0x08, 0x80];
+        let reference = wrap_test_message(2, &truncated_chunk_reference);
+        let f1 = wrap_test_message(2, &reference);
+        assert_verification_failed(validate_preauthorized_authorization_body(
+            &wrap_test_message(1, &f1),
+        ));
+    }
+
+    #[test]
+    fn decoded_response_enforces_aggregate_chunk_reference_limit() {
+        let (mut response, _) = valid_download_response();
+        response.references.clear();
+        let mut requested = Vec::new();
+        for index in 0..(MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES
+            / MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES)
+        {
+            let checksum = vec![0x40 + index as u8; 21];
+            response.references.push(ChunkReferences {
+                file_checksum: checksum.clone(),
+                chunk_references: vec![
+                    chunk_reference(0, 0);
+                    MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES
+                ],
+                ..Default::default()
+            });
+            requested.push((checksum, None));
+        }
+        assert!(validate_preauthorized_download_response(&response, &requested).is_ok());
+
+        let checksum = vec![0x7f; 21];
+        response.references.push(ChunkReferences {
+            file_checksum: checksum.clone(),
+            chunk_references: vec![chunk_reference(0, 0)],
+            ..Default::default()
+        });
+        requested.push((checksum, None));
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response, &requested,
+        ));
+    }
+
+    #[test]
+    fn preauthorized_container_layout_is_monotonic_nonoverlapping_and_bounded() {
+        let (response, requested) = valid_download_response();
+
+        let mut oversized_end = response.clone();
+        let meta = oversized_end.containers[0].chunks[0].meta.as_mut().unwrap();
+        meta.offset = MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES;
+        meta.size = 1;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &oversized_end,
+            &requested,
+        ));
+
+        let mut overflowing_end = response.clone();
+        let meta = overflowing_end.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap();
+        meta.offset = u64::MAX;
+        meta.size = 1;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &overflowing_end,
+            &requested,
+        ));
+
+        let mut overlap = response.clone();
+        let mut second = overlap.containers[0].chunks[0].clone();
+        second.meta.as_mut().unwrap().offset = 8;
+        overlap.containers[0].chunks.push(second);
+        assert_verification_failed(validate_preauthorized_download_response(
+            &overlap, &requested,
+        ));
+
+        let mut bounded_gap = response;
+        bounded_gap.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .offset = 1024;
+        assert!(validate_preauthorized_download_response(&bounded_gap, &requested).is_ok());
+    }
+
+    #[test]
+    fn requested_protection_key_requires_exact_ford_reference_parity() {
+        let (response_without_ford, mut requested_with_key) = valid_download_response();
+        requested_with_key[0].1 = Some(vec![0x55; 32]);
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response_without_ford,
+            &requested_with_key,
+        ));
+
+        let (response_with_ford, requested_with_key) = valid_ford_download_response();
+        assert!(
+            validate_preauthorized_download_response(&response_with_ford, &requested_with_key,)
+                .is_ok()
+        );
+
+        let mut wrong_key = requested_with_key;
+        wrong_key[0].1.as_mut().unwrap()[0] ^= 0x01;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response_with_ford,
+            &wrong_key,
+        ));
+    }
+
+    #[test]
+    fn malformed_response_checksum_and_encryption_lengths_return_errors() {
+        let (mut bad_checksum, requested) = valid_download_response();
+        bad_checksum.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .checksum = vec![0; 20];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_checksum,
+            &requested,
+        ));
+
+        let (bad_reference, mut bad_requested_checksum) = valid_download_response();
+        bad_requested_checksum[0].0 = vec![0; 20];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_reference,
+            &bad_requested_checksum,
+        ));
+
+        let (mut bad_v1_key, requested) = valid_download_response();
+        bad_v1_key.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .encryption_key = Some(vec![0; 16]);
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_v1_key,
+            &requested,
+        ));
+
+        let (mut bad_ford_checksum, requested) = valid_ford_download_response();
+        bad_ford_checksum.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .for_chunks
+            .as_mut()
+            .unwrap()
+            .keys_container = vec![0; 20];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &bad_ford_checksum,
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn overlarge_data_and_ford_chunks_fail_before_transfer() {
+        let (mut oversized_data, requested) = valid_download_response();
+        oversized_data.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .size = MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES + 1;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &oversized_data,
+            &requested,
+        ));
+
+        let (mut oversized_ford, requested) = valid_ford_download_response();
+        oversized_ford.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .size = (MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES + 1) as u32;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &oversized_ford,
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn aggregate_chunk_limit_counts_ford_referenced_bytes() {
+        let (mut boundary, requested) = valid_download_response();
+        boundary.containers[0].chunks = (0u8..8)
+            .map(|index| ChunkWrapper {
+                meta: Some(ChunkMeta {
+                    checksum: vec![index + 1; 21],
+                    size: MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES,
+                    offset: u64::from(index) * MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES,
+                    ..Default::default()
+                }),
+                encryption: None,
             })
             .collect();
+        assert!(validate_preauthorized_download_response(&boundary, &requested).is_ok());
 
-        let targets = ford_containers
-            .iter_mut()
-            .map(|c| {
-                let container = containers.get(c.1.container_index as usize).unwrap();
-                let chunk = &container.chunks[c.1.chunk_index as usize]
-                    .encryption
-                    .as_ref()
-                    .expect("Ford chunk has no ford meta?");
+        let (ford_response, _) = valid_ford_download_response();
+        let mut ford_chunk = ford_response.containers[0].chunks[1].clone();
+        let encryption = ford_chunk.encryption.as_mut().unwrap();
+        encryption.offset = 0;
+        encryption.size = 1;
+        boundary.containers.push(ProtoContainer {
+            request: Some(chunk_request("GET", "https")),
+            chunks: vec![ford_chunk],
+            ..Default::default()
+        });
+        boundary.references[0].ford_reference = Some(chunk_reference(1, 0));
+        let requested_with_ford_key = vec![(requested[0].0.clone(), Some(vec![0x55; 32]))];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &boundary,
+            &requested_with_ford_key,
+        ));
+    }
 
-                ChunkedContainer::new(
-                    vec![ChunkDesc {
-                        id: chunk
-                            .for_chunks
-                            .as_ref()
-                            .unwrap()
-                            .keys_container
-                            .clone()
-                            .try_into()
-                            .unwrap(),
-                        size: chunk.size as usize,
-                        key: ChunkEncryption::None, // do not re-encrypt for output
-                        offset: None,
-                    }],
-                    FileContainer::new(Cursor::new(&mut c.2)),
-                )
-            })
-            .collect::<Vec<_>>();
+    #[test]
+    fn malformed_response_empty_or_mismatched_targets_return_errors() {
+        let (response, requested) = valid_download_response();
 
-        let mut matcher = MMCSMatcher {
-            sources: ford_sources,
-            targets,
-            reciepts: vec![],
-            total: total_bytes,
+        let mut empty_containers = response.clone();
+        empty_containers.containers.clear();
+        assert_verification_failed(validate_preauthorized_download_response(
+            &empty_containers,
+            &requested,
+        ));
+
+        let mut empty_references = response.clone();
+        empty_references.references.clear();
+        assert_verification_failed(validate_preauthorized_download_response(
+            &empty_references,
+            &requested,
+        ));
+
+        let mut empty_target = response.clone();
+        empty_target.references[0].chunk_references.clear();
+        assert_verification_failed(validate_preauthorized_download_response(
+            &empty_target,
+            &requested,
+        ));
+
+        let mut mismatched_target = response;
+        mismatched_target.references[0].file_checksum = vec![0x99; 21];
+        assert_verification_failed(validate_preauthorized_download_response(
+            &mismatched_target,
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn malformed_ford_ciphertext_returns_errors_instead_of_panicking() {
+        for short_len in [0, 1, 16, 17] {
+            assert_verification_failed(decode_ford_item(&vec![0; short_len], &[0x55; 32]));
+        }
+
+        let mut authentication_failure = vec![0; 33];
+        authentication_failure[0] = 4;
+        assert_verification_failed(decode_ford_item(&authentication_failure, &[0x55; 32]));
+        assert_verification_failed(require_ford_item(FordChunk::default()));
+    }
+
+    #[test]
+    fn malformed_ford_item_lengths_and_reference_counts_return_errors() {
+        let (response, _) = valid_download_response();
+        let references = &response.references[0].chunk_references;
+
+        let mut keymap = HashMap::new();
+        assert_verification_failed(add_ford_item_keys(
+            &mut keymap,
+            FordItem::default(),
+            references,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+
+        let invalid_key = FordItem {
+            chunks: vec![FordChunkItem {
+                key: vec![0; 32],
+                chunk_len: vec![0; 4],
+            }],
+            ..Default::default()
         };
-        matcher.transfer_chunks(config, |a, b| {}).await?;
+        assert_verification_failed(add_ford_item_keys(
+            &mut keymap,
+            invalid_key,
+            references,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
 
-        for (references, _ford_ref, ford, key) in ford_containers {
-            let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), &key);
-            let mut result = [0u8; 64];
-            hk.expand(&[], &mut result).unwrap();
+        let invalid_length = FordItem {
+            chunks: vec![FordChunkItem {
+                key: vec![0; 33],
+                chunk_len: vec![0; 3],
+            }],
+            ..Default::default()
+        };
+        assert_verification_failed(add_ford_item_keys(
+            &mut keymap,
+            invalid_length,
+            references,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
 
-            let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
-            // first byte is 4 if initial key is 256 bit, 3 otherwise
-            let data = cipher
-                .decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..])
-                .unwrap();
-            let chunks = FordChunk::decode(Cursor::new(&data))?;
-            let item = chunks.item.expect("Ford chunks missing?");
-            for (ford, reference) in item.chunks.into_iter().zip(references.iter()) {
-                let container = containers.get(reference.container_index as usize).unwrap();
-                let chunk = &container.chunks[reference.chunk_index as usize];
+        let oversized_plaintext = FordItem {
+            chunks: vec![FordChunkItem {
+                key: vec![0; 33],
+                chunk_len: ((MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES as u32) + 1)
+                    .to_le_bytes()
+                    .to_vec(),
+            }],
+            ..Default::default()
+        };
+        assert_verification_failed(add_ford_item_keys(
+            &mut keymap,
+            oversized_plaintext,
+            references,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+    }
 
-                ford_keymap.insert(
-                    chunk.meta.as_ref().unwrap().checksum.clone(),
-                    (ford.key, ford.chunk_len),
-                );
-            }
+    #[test]
+    fn v1_and_unencrypted_chunks_verify_protocol_signature_before_use() {
+        let plaintext = b"verified MMCS legacy chunk".to_vec();
+        let (id, key) = gen_chunk_sig(&plaintext, 0x81);
+
+        let unencrypted = ChunkDesc {
+            id,
+            size: plaintext.len(),
+            key: ChunkEncryption::None,
+            offset: None,
+        };
+        assert_eq!(unencrypted.decrypt(plaintext.clone()).unwrap(), plaintext);
+        assert_eq!(unencrypted.encrypt(plaintext.clone()).unwrap(), plaintext);
+        let mut corrupted_plaintext = plaintext.clone();
+        corrupted_plaintext[0] ^= 0x01;
+        assert_verification_failed(unencrypted.decrypt(corrupted_plaintext.clone()));
+        assert_verification_failed(unencrypted.encrypt(corrupted_plaintext));
+
+        let encrypted = ChunkDesc {
+            key: ChunkEncryption::V1(key),
+            ..unencrypted
+        };
+        let ciphertext = encrypted.encrypt(plaintext.clone()).unwrap();
+        assert_eq!(encrypted.decrypt(ciphertext.clone()).unwrap(), plaintext);
+        let mut corrupted_ciphertext = ciphertext;
+        corrupted_ciphertext[0] ^= 0x01;
+        assert_verification_failed(encrypted.decrypt(corrupted_ciphertext));
+
+        let wrong_identifier = ChunkDesc {
+            id: [0x99; 21],
+            ..encrypted
+        };
+        assert_verification_failed(
+            wrong_identifier.decrypt(
+                encrypted
+                    .encrypt(b"verified MMCS legacy chunk".to_vec())
+                    .unwrap(),
+            ),
+        );
+    }
+
+    #[test]
+    fn malformed_v2_chunk_integrity_returns_error_instead_of_asserting() {
+        let chunk = ChunkDesc {
+            id: [0; 21],
+            size: 1,
+            key: ChunkEncryption::V2([0; 33], 1u32.to_le_bytes()),
+            offset: None,
+        };
+        assert_verification_failed(chunk.decrypt(vec![0]));
+
+        let oversized_plaintext = ChunkDesc {
+            key: ChunkEncryption::V2([0; 33], 2u32.to_le_bytes()),
+            ..chunk
+        };
+        assert_verification_failed(oversized_plaintext.decrypt(vec![0]));
+    }
+
+    #[test]
+    fn download_only_actual_response_bytes_have_one_shared_hard_ceiling() {
+        let counter = AtomicU64::new(MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES - 1);
+        assert!(record_preauthorized_response_bytes(&counter, 1).is_ok());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES
+        );
+        assert_verification_failed(record_preauthorized_response_bytes(&counter, 1));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES
+        );
+    }
+
+    struct BoundedSkipProbe {
+        remaining: usize,
+        largest_read: usize,
+    }
+
+    #[async_trait]
+    impl Container for BoundedSkipProbe {}
+
+    #[async_trait]
+    impl ReadContainer for BoundedSkipProbe {
+        async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
+            self.largest_read = self.largest_read.max(len);
+            let read = len.min(self.remaining);
+            self.remaining -= read;
+            Ok(vec![0; read])
         }
     }
 
-    let sources: Vec<ChunkedContainer<MMCSGetContainer>> = response
-        .f1
-        .as_ref()
-        .unwrap()
-        .containers
-        .iter()
-        .map(|container| {
-            let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
-            ChunkedContainer::new(container.get_chunks(&ford_keymap), container)
-        })
-        .collect();
-
-    let mut matcher = MMCSMatcher {
-        sources,
-        targets,
-        reciepts: vec![],
-        total: total_bytes,
-    };
-    matcher.transfer_chunks(config, progress).await?;
-
-    // cloudkit doesn't do getComplete
-    if url != "" {
-        let confirmation = mmcsp::ConfirmResponse {
-            inner: matcher
-                .get_confirm_reciepts()
-                .iter()
-                .map(|i| {
-                    let MMCSReceipt::Get(g) = i else {
-                        panic!("Bad receipt type")
-                    };
-                    g.clone()
-                })
-                .collect(),
-            confirm_data: None,
+    #[tokio::test]
+    async fn source_gap_skip_never_buffers_the_attacker_sized_gap() {
+        let gap = MMCS_BOUNDED_SKIP_BYTES * 3 + 1;
+        let mut source = BoundedSkipProbe {
+            remaining: gap,
+            largest_read: 0,
         };
-        let buf: Vec<u8> = confirmation.encode_to_vec();
-        let resp = send_mmcs_req(
-            &REQWEST,
-            config,
-            &url,
-            "getComplete",
-            &format!("{} {}", containers[0].cl_auth_p1, containers[0].cl_auth_p2),
-            &dsid,
-            &buf,
-        )
-        .await?;
-        if !resp.status().is_success() {
-            panic!("confirm failed {}", resp.status())
-        }
+        source.skip(gap).await.unwrap();
+        assert_eq!(source.remaining, 0);
+        assert!(source.largest_read <= MMCS_BOUNDED_SKIP_BYTES);
     }
 
-    Ok(())
+    #[tokio::test]
+    async fn malformed_descending_source_offset_returns_error() {
+        let mut source = ChunkedContainer::new(
+            vec![ChunkDesc {
+                id: [0; 21],
+                size: 1,
+                key: ChunkEncryption::None,
+                offset: Some(0),
+            }],
+            FileContainer::new(Cursor::new(vec![0])),
+        );
+        source.current_offset = 1;
+        assert_verification_failed(source.read_next().await);
+    }
 }

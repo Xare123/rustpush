@@ -28,8 +28,8 @@ use crate::{
     auth::{MobileMeDelegateResponse, TokenProvider},
     keychain::KeychainClient,
     mmcs::{
-        get_headers, get_mmcs, put_authorize_body, put_mmcs, AuthorizedOperation, MMCSConfig,
-        PreparedPut,
+        get_headers, get_mmcs, get_mmcs_pre_authorized_download_only, put_authorize_body, put_mmcs,
+        AuthorizedOperation, MMCSConfig, PreparedPut,
     },
     mmcsp::FordChunk,
     pcs::{
@@ -356,6 +356,66 @@ pub struct FetchedRecords {
 }
 
 impl FetchedRecords {
+    fn record_for_identifier(
+        &self,
+        expected_identifier: &RecordIdentifier,
+    ) -> Result<&Record, PushError> {
+        for response in &self.responses {
+            let record = response
+                .record_retrieve_response
+                .as_ref()
+                .and_then(|response| response.record.as_ref())
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit record response was missing"))?;
+            let response_identifier = record
+                .record_identifier
+                .as_ref()
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit record identity was missing"))?;
+            if response_identifier == expected_identifier {
+                return Ok(record);
+            }
+        }
+        Err(cloudkit_protocol_error(
+            "CloudKit response did not contain the exact requested record",
+        ))
+    }
+
+    /// Returns the exact etag on a fetched record without exposing the record
+    /// itself.  Read-only attachment materialization uses this to ensure an
+    /// MMCS asset is still bound to the protected Cloud Sync source record.
+    pub fn record_etag(&self, expected_identifier: &RecordIdentifier) -> Result<&str, PushError> {
+        self.record_for_identifier(expected_identifier)?
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record etag was missing"))
+    }
+
+    pub fn get_record_exact<R: CloudKitRecord>(
+        &self,
+        expected_identifier: &RecordIdentifier,
+        key: Option<&PCSZoneConfig>,
+    ) -> Result<R, PushError> {
+        let record = self.record_for_identifier(expected_identifier)?;
+        let record_type = record
+            .r#type
+            .as_ref()
+            .and_then(|record_type| record_type.name.as_deref())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record type was missing"))?;
+        if record_type != R::record_type() {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record type did not match the requested type",
+            ));
+        }
+        let decryptor = key
+            .map(|keys| pcs_keys_for_record(record, keys))
+            .transpose()?;
+        Ok(R::from_record_encrypted(
+            &record.record_field,
+            decryptor.as_ref(),
+        ))
+    }
+
     pub fn get_record<R: CloudKitRecord>(
         &self,
         record_id: &str,
@@ -444,6 +504,7 @@ pub struct CloudKitPreparedAsset<'t> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticReadOperation {
     CkAppInit,
+    FetchRecord,
     FetchRecordChanges,
     FetchZone,
     CuttlefishFetchChanges,
@@ -451,8 +512,9 @@ pub enum SemanticReadOperation {
 }
 
 impl SemanticReadOperation {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::CkAppInit,
+        Self::FetchRecord,
         Self::FetchRecordChanges,
         Self::FetchZone,
         Self::CuttlefishFetchChanges,
@@ -589,6 +651,13 @@ fn validate_semantic_read_request_operation(
         {
             Ok("record/sync")
         }
+        SemanticReadOperation::FetchRecord
+            if url.path() == "/ckdatabase/api/client/record/retrieve"
+                && operation.record_retrieve_request.is_some()
+                && operation_type == Some(cloudkit_proto::operation::Type::RecordRetrieveType) =>
+        {
+            Ok("record/retrieve")
+        }
         SemanticReadOperation::FetchZone
             if url.path() == "/ckdatabase/api/client/zone/retrieve"
                 && operation.zone_retrieve_request.is_some()
@@ -631,7 +700,9 @@ fn validate_semantic_read_request_headers(
     const ROUTING_HINT: &str = "x-cloudkit-functionroutinghint";
 
     let expected_routing_hint = match semantic_operation {
-        SemanticReadOperation::FetchRecordChanges | SemanticReadOperation::FetchZone => None,
+        SemanticReadOperation::FetchRecord
+        | SemanticReadOperation::FetchRecordChanges
+        | SemanticReadOperation::FetchZone => None,
         SemanticReadOperation::CuttlefishFetchChanges => Some("Cuttlefish/fetchChanges"),
         SemanticReadOperation::CuttlefishFetchRecoverableTlkShares => {
             Some("Cuttlefish/fetchRecoverableTLKShares")
@@ -1421,8 +1492,26 @@ impl FetchedRecord {
             .ok_or_else(|| cloudkit_protocol_error("CloudKit record identity was missing"))
     }
 
-    /// Proves that a retrieve response belongs to the exact stable record
-    /// requested by the caller before any decoded payload is trusted.
+    pub fn get_identifier(&self) -> Result<&RecordIdentifier, PushError> {
+        self.get_raw_record()?
+            .record_identifier
+            .as_ref()
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit record identity was missing"))
+    }
+
+    pub fn verify_identifier(
+        &self,
+        expected_identifier: &RecordIdentifier,
+    ) -> Result<(), PushError> {
+        if self.get_identifier()? != expected_identifier {
+            return Err(cloudkit_protocol_error(
+                "CloudKit record identity did not match the request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Legacy name-only verification for protocols that do not expose a full identity.
     pub fn verify_id(&self, expected_record_id: &str) -> Result<(), PushError> {
         if self.get_id()?.as_str() != expected_record_id {
             return Err(cloudkit_protocol_error(
@@ -1479,6 +1568,9 @@ impl CloudKitOp for FetchRecordOperation {
     }
     fn retry_safety(&self) -> CloudKitRetrySafety {
         CloudKitRetrySafety::ReadOnly
+    }
+    fn semantic_read_operation(&self) -> Option<SemanticReadOperation> {
+        Some(SemanticReadOperation::FetchRecord)
     }
 }
 impl FetchRecordOperation {
@@ -3220,6 +3312,23 @@ impl<'t, T: AnisetteProvider> Deref for CloudKitOpenContainer<'t, T> {
 }
 
 impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
+    #[cfg(test)]
+    pub(crate) fn new_cached_identity_for_test(
+        container: &'t CloudKitContainer<'t>,
+        client: Arc<CloudKitClient<T>>,
+        user_id: String,
+        account_dsid: String,
+    ) -> Self {
+        Self {
+            container,
+            user_id,
+            client,
+            account_dsid,
+            keys: DebugMutex::new(HashMap::new()),
+            database_type: container.database_type,
+        }
+    }
+
     pub(crate) async fn validate_read_authentication_identity(
         &self,
         expected_client: &Arc<CloudKitClient<T>>,
@@ -3316,6 +3425,23 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         )
         .await?
         .remove(0)
+    }
+
+    /// Returns only an already-warmed PCS configuration for this exact zone.
+    /// This path performs no CloudKit request and does not read or update the
+    /// keychain cache.
+    pub async fn get_cached_zone_encryption_config_exact(
+        &self,
+        zone_id: &cloudkit_proto::RecordZoneIdentifier,
+    ) -> Result<PCSZoneConfig, PushError> {
+        let zone_name = cloudkit_zone_name(zone_id).map_err(|_| PushError::PCSRecordKeyMissing)?;
+        self.keys
+            .lock()
+            .await
+            .get(&zone_name)
+            .filter(|config| config.identifier == *zone_id)
+            .cloned()
+            .ok_or(PushError::PCSRecordKeyMissing)
     }
 
     pub async fn get_zone_encryption_config_share(
@@ -5021,6 +5147,82 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         Ok(())
     }
 
+    /// Materializes CloudKit assets through the preauthorized, download-only
+    /// MMCS transport. This variant cannot call authorizeGet or getComplete;
+    /// every server-described chunk request is validated as an HTTPS GET,
+    /// redirects are disabled, and no application-level retry loop is added.
+    pub async fn get_assets_download_only<V: Write + Send + Sync>(
+        &self,
+        responses: &[AssetGetResponse],
+        assets: Vec<(&cloudkit_proto::Asset, V)>,
+    ) -> Result<(), PushError> {
+        let mut requests: HashMap<&String, Vec<(&cloudkit_proto::Asset, V)>> = HashMap::new();
+        for asset in assets {
+            let request_id = asset
+                .0
+                .bundled_request_id
+                .as_ref()
+                .filter(|request_id| !request_id.is_empty())
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit asset bundle was missing"))?;
+            requests.entry(request_id).or_default().push(asset);
+        }
+
+        let requested_ids = requests
+            .keys()
+            .map(|request_id| request_id.as_str())
+            .collect::<HashSet<_>>();
+        let responses_by_id = index_download_only_asset_responses(&requested_ids, responses)?;
+
+        let mmcs_config = MMCSConfig {
+            mme_client_info: self.client.config.get_mme_clientinfo(
+                "com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)",
+            ),
+            user_agent: self.client.config.get_normal_ua("CloudKit/1970"),
+            dataclass: "com.apple.Dataclass.CloudKit",
+            mini_ua: self.client.config.get_version_ua(),
+            dsid: Some(self.client.state.read().await.dsid.to_string()),
+            cloudkit_headers: Default::default(),
+            extra_1: None,
+            extra_2: None,
+        };
+
+        for (request, asset) in requests {
+            let response = responses_by_id
+                .get(request.as_str())
+                .copied()
+                .ok_or_else(|| cloudkit_protocol_error("CloudKit asset response was missing"))?;
+            let authorization_body = response.body.as_deref().ok_or_else(|| {
+                cloudkit_protocol_error("CloudKit asset authorization was missing")
+            })?;
+            let assets = asset
+                .into_iter()
+                .map(|(asset, writer)| {
+                    Ok((
+                        asset.signature.clone().ok_or_else(|| {
+                            cloudkit_protocol_error("CloudKit asset signature was missing")
+                        })?,
+                        "",
+                        FileContainer::new(writer),
+                        asset
+                            .protection_info
+                            .as_ref()
+                            .and_then(|info| info.protection_info.clone()),
+                    ))
+                })
+                .collect::<Result<Vec<_>, PushError>>()?;
+
+            get_mmcs_pre_authorized_download_only(
+                &mmcs_config,
+                authorization_body,
+                assets,
+                |_, _| {},
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn upload_asset<F: Read + Send + Sync>(
         &self,
         session: &CloudKitSession,
@@ -5134,6 +5336,44 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
         Ok(item)
     }
+}
+
+fn index_download_only_asset_responses<'a>(
+    requested_ids: &HashSet<&str>,
+    responses: &'a [AssetGetResponse],
+) -> Result<HashMap<&'a str, &'a AssetGetResponse>, PushError> {
+    if requested_ids.iter().any(|request_id| request_id.is_empty()) {
+        return Err(cloudkit_protocol_error(
+            "CloudKit asset request identifier was missing",
+        ));
+    }
+    if responses.len() != requested_ids.len() {
+        return Err(cloudkit_protocol_error(
+            "CloudKit asset response correlation was ambiguous",
+        ));
+    }
+
+    let mut indexed = HashMap::with_capacity(responses.len());
+    for response in responses {
+        let response_id = response
+            .asset_id
+            .as_deref()
+            .filter(|response_id| !response_id.is_empty())
+            .ok_or_else(|| {
+                cloudkit_protocol_error("CloudKit asset response identifier was missing")
+            })?;
+        if !requested_ids.contains(response_id) || indexed.insert(response_id, response).is_some() {
+            return Err(cloudkit_protocol_error(
+                "CloudKit asset response correlation was ambiguous",
+            ));
+        }
+    }
+    if indexed.len() != requested_ids.len() {
+        return Err(cloudkit_protocol_error(
+            "CloudKit asset response was missing",
+        ));
+    }
+    Ok(indexed)
 }
 
 #[cfg(test)]
@@ -6767,6 +7007,7 @@ mod cloud_sync_transport_tests {
             SemanticReadOperation::ALL,
             [
                 SemanticReadOperation::CkAppInit,
+                SemanticReadOperation::FetchRecord,
                 SemanticReadOperation::FetchRecordChanges,
                 SemanticReadOperation::FetchZone,
                 SemanticReadOperation::CuttlefishFetchChanges,
@@ -6774,6 +7015,10 @@ mod cloud_sync_transport_tests {
             ]
         );
         assert!(!SemanticReadOperation::CkAppInit.is_warm_semantic_transport());
+        assert_eq!(
+            FetchRecordOperation::link(),
+            "https://gateway.icloud.com/ckdatabase/api/client/record/retrieve"
+        );
         assert_eq!(
             FetchRecordChangesOperation::link(),
             "https://gateway.icloud.com/ckdatabase/api/client/record/sync"
@@ -6783,6 +7028,14 @@ mod cloud_sync_transport_tests {
             "https://gateway.icloud.com/ckdatabase/api/client/zone/retrieve"
         );
 
+        assert_eq!(
+            record_semantic_read_operations(&[FetchRecordOperation::new(
+                &ALL_ASSETS,
+                record_identifier(public_zone(), "attachment-read"),
+            )])
+            .unwrap(),
+            vec![SemanticReadOperation::FetchRecord]
+        );
         assert_eq!(
             record_semantic_read_operations(&[FetchRecordChangesOperation::new(
                 public_zone(),
@@ -6832,12 +7085,6 @@ mod cloud_sync_transport_tests {
             CreateSubscriptionOperation(Default::default())
         ])
         .is_err());
-        assert!(record_semantic_read_operations(&[FetchRecordOperation::new(
-            &NO_ASSETS,
-            record_identifier(public_zone(), "not-allowlisted"),
-        )])
-        .is_err());
-
         for method in ["updateTrust", "reset", "joinWithVoucher"] {
             assert!(
                 record_semantic_read_operations(&[FunctionInvokeOperation::new(
@@ -6943,11 +7190,12 @@ mod cloud_sync_transport_tests {
     }
 
     #[test]
-    fn fetched_record_identity_must_match_the_exact_requested_name() {
+    fn fetched_record_identity_must_match_the_complete_identifier() {
+        let expected_identifier = record_identifier(public_zone(), "returned-record");
         let response = ResponseOperation {
             record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
                 record: Some(Record {
-                    record_identifier: Some(record_identifier(public_zone(), "returned-record")),
+                    record_identifier: Some(expected_identifier.clone()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -6956,8 +7204,146 @@ mod cloud_sync_transport_tests {
         };
         let fetched = FetchRecordOperation::retrieve_response(&response).unwrap();
 
-        fetched.verify_id("returned-record").unwrap();
-        assert!(fetched.verify_id("requested-record").is_err());
+        fetched.verify_identifier(&expected_identifier).unwrap();
+        assert!(fetched
+            .verify_identifier(&record_identifier(public_zone(), "requested-record"))
+            .is_err());
+
+        let mut wrong_zone = public_zone();
+        wrong_zone.value.as_mut().unwrap().name = Some("attachmentManateeZone".to_owned());
+        assert!(fetched
+            .verify_identifier(&record_identifier(wrong_zone, "returned-record"))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_zone_configuration_returns_only_the_exact_warmed_zone() {
+        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let zone = open.private_zone("attachmentManateeZone".to_owned());
+        let warmed = PCSZoneConfig {
+            identifier: zone.clone(),
+            zone_keys: vec![],
+            zone_protection_tag: Some("warmed-zone-tag".to_owned()),
+            default_record_keys: vec![],
+            record_prot_tag: Some("warmed-record-tag".to_owned()),
+            zone_pcs_key: vec![],
+            zone_roll_count: 7,
+            record_roll_count: 11,
+        };
+        open.keys
+            .lock()
+            .await
+            .insert("attachmentManateeZone".to_owned(), warmed);
+
+        let cached = open
+            .get_cached_zone_encryption_config_exact(&zone)
+            .await
+            .expect("the exact warmed zone must be returned");
+        assert_eq!(cached.identifier, zone);
+        assert_eq!(
+            cached.zone_protection_tag.as_deref(),
+            Some("warmed-zone-tag")
+        );
+        assert_eq!(cached.record_prot_tag.as_deref(), Some("warmed-record-tag"));
+        assert_eq!(cached.zone_roll_count, 7);
+        assert_eq!(cached.record_roll_count, 11);
+    }
+
+    #[tokio::test]
+    async fn cached_zone_configuration_fails_closed_when_absent_or_not_exact() {
+        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let zone = open.private_zone("attachmentManateeZone".to_owned());
+        assert!(matches!(
+            open.get_cached_zone_encryption_config_exact(&zone).await,
+            Err(PushError::PCSRecordKeyMissing)
+        ));
+
+        let warmed = PCSZoneConfig {
+            identifier: zone.clone(),
+            zone_keys: vec![],
+            zone_protection_tag: None,
+            default_record_keys: vec![],
+            record_prot_tag: None,
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        };
+        open.keys
+            .lock()
+            .await
+            .insert("attachmentManateeZone".to_owned(), warmed);
+
+        let mut wrong_owner = zone;
+        wrong_owner
+            .owner_identifier
+            .as_mut()
+            .expect("private zone owner")
+            .name = Some("different-owner".to_owned());
+        assert!(matches!(
+            open.get_cached_zone_encryption_config_exact(&wrong_owner)
+                .await,
+            Err(PushError::PCSRecordKeyMissing)
+        ));
+    }
+
+    #[test]
+    fn fetched_record_etag_requires_present_nonempty_exact_record_version() {
+        let attachment_zone = RecordZoneIdentifier {
+            value: Some(Identifier {
+                name: Some("attachmentManateeZone".to_owned()),
+                r#type: Some(identifier::Type::RecordZone.into()),
+            }),
+            owner_identifier: Some(Identifier {
+                name: Some("attachment-owner".to_owned()),
+                r#type: Some(identifier::Type::User.into()),
+            }),
+            environment: None,
+        };
+        let expected_identifier = record_identifier(attachment_zone.clone(), "attachment");
+        let fetched_with_etag = FetchRecordOperation::retrieve_response(&ResponseOperation {
+            record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
+                record: Some(Record {
+                    record_identifier: Some(expected_identifier.clone()),
+                    etag: Some("etag-v1".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let records = FetchedRecords::new(&[Ok(fetched_with_etag)]);
+        assert_eq!(
+            records.record_etag(&expected_identifier).unwrap(),
+            "etag-v1"
+        );
+        assert!(records
+            .record_etag(&record_identifier(
+                attachment_zone.clone(),
+                "different-record"
+            ))
+            .is_err());
+        let mut wrong_owner_zone = attachment_zone.clone();
+        wrong_owner_zone.owner_identifier.as_mut().unwrap().name =
+            Some("different-owner".to_owned());
+        assert!(records
+            .record_etag(&record_identifier(wrong_owner_zone, "attachment"))
+            .is_err());
+
+        let fetched_without_etag = FetchRecordOperation::retrieve_response(&ResponseOperation {
+            record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
+                record: Some(Record {
+                    record_identifier: Some(expected_identifier.clone()),
+                    etag: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let unfenced = FetchedRecords::new(&[Ok(fetched_without_etag)]);
+        assert!(unfenced.record_etag(&expected_identifier).is_err());
     }
 
     #[test]
@@ -7168,6 +7554,57 @@ mod cloud_sync_transport_tests {
 
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].asset_id.as_deref(), Some("asset-fixture"));
+    }
+
+    #[test]
+    fn download_only_asset_responses_have_exact_one_to_one_request_identity() {
+        let responses = vec![
+            AssetGetResponse {
+                asset_id: Some("bundle-b".to_owned()),
+                body: Some(vec![2]),
+                ..Default::default()
+            },
+            AssetGetResponse {
+                asset_id: Some("bundle-a".to_owned()),
+                body: Some(vec![1]),
+                ..Default::default()
+            },
+        ];
+        let requested = HashSet::from(["bundle-a", "bundle-b"]);
+
+        let indexed = index_download_only_asset_responses(&requested, &responses).unwrap();
+
+        assert_eq!(indexed.len(), 2);
+        assert_eq!(indexed["bundle-a"].body.as_deref(), Some(&[1][..]));
+        assert_eq!(indexed["bundle-b"].body.as_deref(), Some(&[2][..]));
+    }
+
+    #[test]
+    fn download_only_asset_responses_reject_empty_missing_duplicate_and_unknown_ids() {
+        let requested = HashSet::from(["bundle-a"]);
+        let response = |asset_id: Option<&str>| AssetGetResponse {
+            asset_id: asset_id.map(str::to_owned),
+            body: Some(vec![1]),
+            ..Default::default()
+        };
+
+        assert!(index_download_only_asset_responses(&HashSet::from([""]), &[]).is_err());
+        assert!(index_download_only_asset_responses(&requested, &[]).is_err());
+        assert!(index_download_only_asset_responses(&requested, &[response(None)]).is_err());
+        assert!(index_download_only_asset_responses(&requested, &[response(Some(""))]).is_err());
+        assert!(index_download_only_asset_responses(
+            &requested,
+            &[response(Some("bundle-a")), response(Some("bundle-a"))],
+        )
+        .is_err());
+        assert!(
+            index_download_only_asset_responses(&requested, &[response(Some("bundle-b"))]).is_err()
+        );
+        assert!(index_download_only_asset_responses(
+            &requested,
+            &[response(Some("bundle-a")), response(Some("bundle-b"))],
+        )
+        .is_err());
     }
 
     #[test]
