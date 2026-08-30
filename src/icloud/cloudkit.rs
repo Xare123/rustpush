@@ -25,7 +25,7 @@ use crate::{
 };
 
 use crate::{
-    auth::{MobileMeDelegateResponse, TokenProvider},
+    auth::{CloudKitReadAuthenticationLease, MobileMeDelegateResponse, TokenProvider},
     keychain::KeychainClient,
     mmcs::{
         get_headers, get_mmcs, get_mmcs_pre_authorized_download_only, put_authorize_body, put_mmcs,
@@ -87,7 +87,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     RequestBuilder, Url,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -122,6 +122,14 @@ impl CloudKitHttpResponse {
             Self::Reqwest(response) => response.headers(),
             #[cfg(test)]
             Self::Buffered(response) => &response.headers,
+        }
+    }
+
+    async fn json<T: DeserializeOwned>(self) -> Result<T, PushError> {
+        match self {
+            Self::Reqwest(response) => Ok(response.json().await?),
+            #[cfg(test)]
+            Self::Buffered(response) => Ok(serde_json::from_slice(&response.body)?),
         }
     }
 }
@@ -855,6 +863,7 @@ pub struct CloudKitPreparedAuthentication<T: AnisetteProvider> {
     database_type: Database,
     cloudkit_token: String,
     anisette_headers: HeaderMap,
+    read_authentication: Option<CloudKitReadAuthenticationLease>,
 }
 
 fn cloudkit_anisette_header_map(
@@ -3078,6 +3087,12 @@ struct CkAppInitRetryBudget {
     refreshes: u8,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CkAppInitAuthentication {
+    Refreshable,
+    CachedSemanticRead,
+}
+
 impl CkAppInitRetryBudget {
     fn begin_attempt(&mut self) -> Result<(), PushError> {
         if self.attempts >= 2 {
@@ -3160,7 +3175,8 @@ impl<'t> CloudKitContainer<'t> {
         } else {
             Some(try_acquire_cloudkit_operation()?)
         };
-        self.init_after_admission(client).await
+        self.init_after_admission(client, CkAppInitAuthentication::Refreshable)
+            .await
     }
 
     pub(crate) async fn init_for_read_authentication<T: AnisetteProvider>(
@@ -3176,7 +3192,9 @@ impl<'t> CloudKitContainer<'t> {
                 "CloudKit container is not allowed for read authentication",
             )));
         }
-        let container = self.init_after_admission(client.clone()).await?;
+        let container = self
+            .init_after_admission(client.clone(), CkAppInitAuthentication::CachedSemanticRead)
+            .await?;
         permit.validate()?;
         container
             .validate_read_authentication_identity(&client, allowed_container)
@@ -3187,6 +3205,7 @@ impl<'t> CloudKitContainer<'t> {
     async fn init_after_admission<T: AnisetteProvider>(
         &'t self,
         client: Arc<CloudKitClient<T>>,
+        authentication: CkAppInitAuthentication,
     ) -> Result<CloudKitOpenContainer<'t, T>, PushError> {
         let session = CloudKitSession::new();
         let account_dsid = client.state.read().await.dsid.clone();
@@ -3200,9 +3219,21 @@ impl<'t> CloudKitContainer<'t> {
         let mut retry_budget = CkAppInitRetryBudget::default();
         let response = loop {
             retry_budget.begin_attempt()?;
-            let mme_token = client.token_provider.get_mme_token("mmeAuthToken").await?;
+            let (mme_token, read_authentication) = match authentication {
+                CkAppInitAuthentication::Refreshable => (
+                    client.token_provider.get_mme_token("mmeAuthToken").await?,
+                    None,
+                ),
+                CkAppInitAuthentication::CachedSemanticRead => {
+                    let lease = client
+                        .token_provider
+                        .cloudkit_read_authentication_lease()
+                        .await?;
+                    (lease.mme_auth_token().to_owned(), Some(lease))
+                }
+            };
             let init_request_uuid = Uuid::new_v4().to_string().to_uppercase();
-            let response = self
+            let request = self
                 .headers(
                     &client,
                     REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"),
@@ -3213,12 +3244,26 @@ impl<'t> CloudKitContainer<'t> {
                 )
                 .await?
                 .query(&[("container", &self.containerid)])
-                .basic_auth(&account_dsid, Some(&mme_token))
-                .send()
-                .await?;
+                .basic_auth(&account_dsid, Some(&mme_token));
+            let read_authentication_admission = match read_authentication.as_ref() {
+                Some(lease) => Some(lease.admit().await?),
+                None => None,
+            };
+            let response = send_cloudkit_http_request(request).await?;
+            drop(read_authentication_admission);
 
-            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            if !matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
                 break response;
+            }
+            if authentication == CkAppInitAuthentication::CachedSemanticRead {
+                client
+                    .token_provider
+                    .invalidate_cloudkit_read_authentication()
+                    .await;
+                return Err(PushError::UnauthorizedAccountError);
             }
             retry_budget.authorize_refresh()?;
             client.token_provider.refresh_mme().await?;
@@ -4620,6 +4665,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             database_type: self.database_type,
             cloudkit_token,
             anisette_headers,
+            read_authentication: None,
         })
     }
 
@@ -4635,6 +4681,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     ) -> Result<CloudKitPreparedAuthentication<T>, PushError> {
         #[cfg(test)]
         if CLOUDKIT_TEST_WARM_AUTHENTICATION.try_with(|_| ()).is_ok() {
+            let read_authentication = CloudKitReadAuthenticationLease::new_for_test(
+                "semantic-test-mme-token",
+                "semantic-test-warm-token",
+            );
             return Ok(CloudKitPreparedAuthentication {
                 client: self.client.clone(),
                 user_id: self.user_id.clone(),
@@ -4643,14 +4693,16 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 database_type: self.database_type,
                 cloudkit_token: "semantic-test-warm-token".to_owned(),
                 anisette_headers: HeaderMap::new(),
+                read_authentication: Some(read_authentication),
             });
         }
 
-        let cloudkit_token = self
+        let read_authentication = self
             .client
             .token_provider
-            .get_mme_token_cached("cloudKitToken")
+            .cloudkit_read_authentication_lease()
             .await?;
+        let cloudkit_token = read_authentication.cloudkit_token().to_owned();
         let anisette_headers = {
             let mut locked = self.client.anisette.lock().await;
             cloudkit_anisette_header_map(locked.get_headers().await?)?
@@ -4663,6 +4715,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             database_type: self.database_type,
             cloudkit_token,
             anisette_headers,
+            read_authentication: Some(read_authentication),
         })
     }
 
@@ -4686,8 +4739,8 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 max_attempts: 1,
                 ..CloudKitRetryPolicy::default()
             };
-            responses.extend(
-                self.perform_operations_detailed_once_with_identity(
+            let batch_response = match self
+                .perform_operations_detailed_once_with_identity(
                     session,
                     batch,
                     isolation_level,
@@ -4696,10 +4749,33 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     prepared_authentication,
                 )
                 .await
-                .map_err(|failure| failure.error)?
+            {
+                Ok(response) => response,
+                Err(failure) => {
+                    if failure.failure_class == Some(CloudKitFailureClass::Authentication) {
+                        self.client
+                            .token_provider
+                            .invalidate_cloudkit_read_authentication()
+                            .await;
+                    }
+                    return Err(failure.error);
+                }
+            };
+            if batch_response
                 .outcomes
-                .into_iter()
-                .map(|outcome| outcome.result),
+                .iter()
+                .any(|outcome| outcome.failure_class == Some(CloudKitFailureClass::Authentication))
+            {
+                self.client
+                    .token_provider
+                    .invalidate_cloudkit_read_authentication()
+                    .await;
+            }
+            responses.extend(
+                batch_response
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.result),
             );
         }
         Ok(responses)
@@ -4883,6 +4959,13 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 ))
                 .into());
             }
+            let _read_authentication_admission = match prepared_authentication
+                .as_ref()
+                .and_then(|prepared| prepared.read_authentication.as_ref())
+            {
+                Some(lease) => Some(lease.admit().await?),
+                None => None,
+            };
             // Conservatively cross the ambiguity boundary before entering
             // reqwest. A transport error after this point cannot prove that no
             // request bytes reached Apple.
@@ -5388,7 +5471,10 @@ mod cloud_sync_transport_tests {
     };
     use icloud_auth::AppleAccount;
     use omnisette::{AnisetteClient, AnisetteError, LoginClientInfo};
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex as StdMutex, OnceLock,
+    };
 
     const HTTP_REQUEST_UUID: &str = "11111111-2222-4ABC-8DEF-555555555555";
     const OPERATION_UUID_A: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
@@ -5598,6 +5684,7 @@ mod cloud_sync_transport_tests {
             database_type: open.database_type,
             cloudkit_token: "test-cloudkit-token".to_owned(),
             anisette_headers: HeaderMap::new(),
+            read_authentication: None,
         }
     }
 
@@ -5607,6 +5694,275 @@ mod cloud_sync_transport_tests {
             bundleid: "com.example.cloudkit-deadline-test",
             containerid: "com.example.cloudkit-deadline-test",
             env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_semantic_read_authentication_isolated_from_general_token_cache() {
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let invalidation_marker = invalidated.clone();
+
+        let revoker = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                move || invalidation_marker.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("current read authentication should restore");
+
+        assert!(matches!(
+            open.client
+                .token_provider
+                .get_mme_token_cached("cloudKitToken")
+                .await,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        let prepared = open
+            .prepare_semantic_read_authentication()
+            .await
+            .expect("restored read authentication must prepare without refresh");
+        assert_eq!(prepared.cloudkit_token, "read-cloudkit-token");
+
+        revoker.revoke().await;
+        assert!(!invalidated.load(Ordering::SeqCst));
+        assert!(matches!(
+            open.prepare_semantic_read_authentication().await,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(invalidated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn revoked_prepared_semantic_authentication_cannot_start_a_request() {
+        let container = one_shot_test_container();
+        let open = one_shot_test_open_container(&container);
+        let revoker = open
+            .client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "read-mme-token".to_owned(),
+                "read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || {},
+            )
+            .await
+            .expect("current read authentication should restore");
+        let prepared = open
+            .prepare_semantic_read_authentication()
+            .await
+            .expect("semantic authentication should prepare before revocation");
+        revoker.revoke().await;
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let invocation_counter = invocations.clone();
+        let transport: Arc<dyn CloudKitTestHttpTransport> = Arc::new(move |_request| {
+            let invocation_counter = invocation_counter.clone();
+            Box::pin(async move {
+                invocation_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(CloudKitBufferedResponse {
+                    status: reqwest::StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: Vec::new(),
+                })
+            }) as CloudKitTestTransportFuture
+        });
+        let operation = FetchZoneOperation::new(open.private_zone("chatManateeZone".to_owned()));
+        let result = with_cloudkit_test_transport(transport, async {
+            open.perform_operations_detailed_once_with_identity(
+                &CloudKitSession::new(),
+                &[operation],
+                IsolationLevel::Zone,
+                &CloudKitRetryPolicy {
+                    max_attempts: 1,
+                    ..CloudKitRetryPolicy::default()
+                },
+                CloudKitRequestIdentity::generated(1),
+                prepared,
+            )
+            .await
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CloudKitRequestFailure {
+                error: PushError::CloudKitWarmAuthenticationRequired,
+                ..
+            })
+        ));
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn semantic_read_authentication_failure_invalidates_restored_cache_without_retry() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let container = one_shot_test_container();
+            let open = one_shot_test_open_container(&container);
+            let invalidated = Arc::new(AtomicBool::new(false));
+            let invalidation_marker = invalidated.clone();
+            open.client
+                .token_provider
+                .restore_cloudkit_read_authentication(
+                    "read-mme-token".to_owned(),
+                    "read-cloudkit-token".to_owned(),
+                    SystemTime::now(),
+                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                )
+                .await
+                .expect("current read authentication should restore");
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let invocation_counter = invocations.clone();
+            let transport: Arc<dyn CloudKitTestHttpTransport> = Arc::new(move |_request| {
+                let invocation_counter = invocation_counter.clone();
+                Box::pin(async move {
+                    invocation_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(CloudKitBufferedResponse {
+                        status,
+                        headers: HeaderMap::new(),
+                        body: Vec::new(),
+                    })
+                }) as CloudKitTestTransportFuture
+            });
+
+            let result = with_cloudkit_test_transport(transport, async {
+                open.perform_semantic_read_only(
+                    &CloudKitSession::new(),
+                    FetchZoneOperation::new(open.private_zone("chatManateeZone".to_owned())),
+                )
+                .await
+            })
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(PushError::CloudKitHttpError {
+                    status: actual,
+                    ..
+                }) if actual == status.as_u16()
+            ));
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert!(invalidated.load(Ordering::SeqCst));
+            assert!(
+                !open
+                    .client
+                    .token_provider
+                    .cloudkit_read_authentication_is_warm()
+                    .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_ck_app_init_authentication_failure_invalidates_without_retry() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let container = one_shot_test_container();
+            let open = one_shot_test_open_container(&container);
+            let invalidated = Arc::new(AtomicBool::new(false));
+            let invalidation_marker = invalidated.clone();
+            open.client
+                .token_provider
+                .restore_cloudkit_read_authentication(
+                    "read-mme-token".to_owned(),
+                    "read-cloudkit-token".to_owned(),
+                    SystemTime::now(),
+                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                )
+                .await
+                .expect("current read authentication should restore");
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let invocation_counter = invocations.clone();
+            let transport: Arc<dyn CloudKitTestHttpTransport> = Arc::new(move |_request| {
+                let invocation_counter = invocation_counter.clone();
+                Box::pin(async move {
+                    invocation_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(CloudKitBufferedResponse {
+                        status,
+                        headers: HeaderMap::new(),
+                        body: Vec::new(),
+                    })
+                }) as CloudKitTestTransportFuture
+            });
+
+            let result = with_cloudkit_test_transport(transport, async {
+                container
+                    .init_after_admission(
+                        open.client.clone(),
+                        CkAppInitAuthentication::CachedSemanticRead,
+                    )
+                    .await
+            })
+            .await;
+
+            assert!(matches!(result, Err(PushError::UnauthorizedAccountError)));
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert!(invalidated.load(Ordering::SeqCst));
+            assert!(
+                !open
+                    .client
+                    .token_provider
+                    .cloudkit_read_authentication_is_warm()
+                    .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_operation_authentication_failure_invalidates_restored_cache() {
+        use cloudkit_proto::response_operation::result::error::client::Code;
+
+        for client_error in [Code::BadAuthToken, Code::NeedsAuthentication] {
+            let container = one_shot_test_container();
+            let open = one_shot_test_open_container(&container);
+            let invalidated = Arc::new(AtomicBool::new(false));
+            let invalidation_marker = invalidated.clone();
+            open.client
+                .token_provider
+                .restore_cloudkit_read_authentication(
+                    "read-mme-token".to_owned(),
+                    "read-cloudkit-token".to_owned(),
+                    SystemTime::now(),
+                    move || invalidation_marker.store(true, Ordering::SeqCst),
+                )
+                .await
+                .expect("current read authentication should restore");
+            let transport = FaithfulSemanticTransport::default();
+
+            let result = with_cloudkit_test_transport(
+                transport.authentication_failure_transport(client_error),
+                async {
+                    open.perform_semantic_read_only(
+                        &CloudKitSession::new(),
+                        FetchZoneOperation::new(open.private_zone("chatManateeZone".to_owned())),
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            assert!(matches!(result, Err(PushError::CloudKitError(_))));
+            assert_eq!(transport.invocations(), 1);
+            assert!(invalidated.load(Ordering::SeqCst));
+            assert!(
+                !open
+                    .client
+                    .token_provider
+                    .cloudkit_read_authentication_is_warm()
+                    .await
+            );
         }
     }
 
@@ -5792,6 +6148,44 @@ mod cloud_sync_transport_tests {
                 Box::pin(async move {
                     transport.invocations.fetch_add(1, Ordering::SeqCst);
                     transport.handle(request)
+                }) as CloudKitTestTransportFuture
+            })
+        }
+
+        fn authentication_failure_transport(
+            &self,
+            client_error: cloudkit_proto::response_operation::result::error::client::Code,
+        ) -> Arc<dyn CloudKitTestHttpTransport> {
+            let transport = self.clone();
+            Arc::new(move |request| {
+                let transport = transport.clone();
+                Box::pin(async move {
+                    transport.invocations.fetch_add(1, Ordering::SeqCst);
+                    let mut response = transport.handle(request)?;
+                    let frames = undelimit_response(&response.body)?;
+                    let mut body = Vec::new();
+                    for frame in frames {
+                        let mut operation = ResponseOperation::decode(frame.as_slice())?;
+                        operation.result = Some(cloudkit_proto::response_operation::Result {
+                            code: Some(
+                                cloudkit_proto::response_operation::result::Code::Failure as i32,
+                            ),
+                            error: Some(cloudkit_proto::response_operation::result::Error {
+                                client_error: Some(
+                                    cloudkit_proto::response_operation::result::error::Client {
+                                        r#type: Some(client_error as i32),
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                        let encoded = operation.encode_to_vec();
+                        body.extend(encode_uleb128(encoded.len() as u64));
+                        body.extend(encoded);
+                    }
+                    response.body = body;
+                    Ok(response)
                 }) as CloudKitTestTransportFuture
             })
         }

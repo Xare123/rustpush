@@ -3,7 +3,10 @@ use std::{
     io::Cursor,
     marker::PhantomData,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -123,10 +126,92 @@ impl LoginDelegate {
     }
 }
 
+struct CloudKitReadAuthenticationGeneration {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    revoked: AtomicBool,
+}
+
+type CloudKitReadAuthenticationInvalidator = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct CloudKitReadAuthenticationLease {
+    mme_auth_token: Arc<str>,
+    cloudkit_token: Arc<str>,
+    generation: Arc<CloudKitReadAuthenticationGeneration>,
+}
+
+impl CloudKitReadAuthenticationLease {
+    fn new(mme_auth_token: String, cloudkit_token: String) -> Self {
+        Self {
+            mme_auth_token: mme_auth_token.into(),
+            cloudkit_token: cloudkit_token.into(),
+            generation: Arc::new(CloudKitReadAuthenticationGeneration {
+                gate: Arc::new(tokio::sync::RwLock::new(())),
+                revoked: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(mme_auth_token: &str, cloudkit_token: &str) -> Self {
+        Self::new(mme_auth_token.to_owned(), cloudkit_token.to_owned())
+    }
+
+    pub(crate) fn mme_auth_token(&self) -> &str {
+        &self.mme_auth_token
+    }
+
+    pub(crate) fn cloudkit_token(&self) -> &str {
+        &self.cloudkit_token
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.generation.revoked.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn admit(&self) -> Result<CloudKitReadAuthenticationAdmission, PushError> {
+        let guard = self.generation.gate.clone().read_owned().await;
+        if self.generation.revoked.load(Ordering::Acquire) {
+            drop(guard);
+            return Err(PushError::CloudKitWarmAuthenticationRequired);
+        }
+        Ok(CloudKitReadAuthenticationAdmission { _guard: guard })
+    }
+
+    fn revoker(&self) -> CloudKitReadAuthenticationRevoker {
+        CloudKitReadAuthenticationRevoker {
+            generation: self.generation.clone(),
+        }
+    }
+}
+
+pub(crate) struct CloudKitReadAuthenticationAdmission {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Clone)]
+pub struct CloudKitReadAuthenticationRevoker {
+    generation: Arc<CloudKitReadAuthenticationGeneration>,
+}
+
+impl CloudKitReadAuthenticationRevoker {
+    pub async fn revoke(&self) {
+        let _guard = self.generation.gate.clone().write_owned().await;
+        self.generation.revoked.store(true, Ordering::Release);
+    }
+}
+
+struct CloudKitReadAuthenticationCache {
+    lease: CloudKitReadAuthenticationLease,
+    refreshed: SystemTime,
+    invalidator: CloudKitReadAuthenticationInvalidator,
+}
+
 pub struct TokenProvider<T: AnisetteProvider> {
     account: Arc<DebugMutex<AppleAccount<T>>>,
     mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
     mme_refreshed: DebugMutex<SystemTime>,
+    cloudkit_read_authentication: DebugMutex<Option<CloudKitReadAuthenticationCache>>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -192,7 +277,56 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             os_config,
             mme_delegate: DebugMutex::new(None),
             mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
+            cloudkit_read_authentication: DebugMutex::new(None),
         })
+    }
+
+    /// Restores only the two bearer tokens required by the admitted semantic
+    /// CloudKit read path. The cache is deliberately separate from the live
+    /// MobileMe delegate used by refreshable and write-capable operations.
+    pub async fn restore_cloudkit_read_authentication<F>(
+        &self,
+        mme_auth_token: String,
+        cloudkit_token: String,
+        refreshed: SystemTime,
+        invalidator: F,
+    ) -> Option<CloudKitReadAuthenticationRevoker>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        if mme_auth_token.is_empty()
+            || cloudkit_token.is_empty()
+            || !mme_delegate_is_warm(true, refreshed, SystemTime::now())
+        {
+            return None;
+        }
+
+        let mut cache = self.cloudkit_read_authentication.lock().await;
+        if let Some(existing) = cache.as_ref() {
+            if existing.refreshed >= refreshed && !existing.lease.is_revoked() {
+                return Some(existing.lease.revoker());
+            }
+        }
+        if let Some(existing) = cache.take() {
+            existing.lease.revoker().revoke().await;
+        }
+        let lease = CloudKitReadAuthenticationLease::new(mme_auth_token, cloudkit_token);
+        let revoker = lease.revoker();
+        *cache = Some(CloudKitReadAuthenticationCache {
+            lease,
+            refreshed,
+            invalidator: Arc::new(invalidator),
+        });
+        Some(revoker)
+    }
+
+    pub async fn invalidate_cloudkit_read_authentication(&self) {
+        let mut cache = self.cloudkit_read_authentication.lock().await;
+        let cached = cache.take();
+        if let Some(cached) = cached {
+            cached.lease.revoker().revoke().await;
+            (cached.invalidator)();
+        }
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
@@ -380,11 +514,42 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             .cloned()
             .ok_or(PushError::CloudKitWarmAuthenticationRequired)
     }
+
+    /// Returns an already-authenticated token only for the admitted semantic
+    /// CloudKit read path. It never logs in, refreshes MobileMe, or exposes the
+    /// restored cache through the general token accessor.
+    pub async fn cloudkit_read_authentication_is_warm(&self) -> bool {
+        self.cloudkit_read_authentication_lease().await.is_ok()
+    }
+
+    pub(crate) async fn cloudkit_read_authentication_lease(
+        &self,
+    ) -> Result<CloudKitReadAuthenticationLease, PushError> {
+        let mut cache = self.cloudkit_read_authentication.lock().await;
+        let refreshed = cache
+            .as_ref()
+            .map_or(SystemTime::UNIX_EPOCH, |cache| cache.refreshed);
+        if mme_delegate_is_warm(cache.is_some(), refreshed, SystemTime::now())
+            && cache
+                .as_ref()
+                .is_some_and(|cache| !cache.lease.is_revoked())
+        {
+            return Ok(cache.as_ref().expect("validated cache").lease.clone());
+        }
+        let stale = cache.take();
+        if let Some(stale) = stale {
+            stale.lease.revoker().revoke().await;
+            (stale.invalidator)();
+        }
+        Err(PushError::CloudKitWarmAuthenticationRequired)
+    }
 }
 
 #[cfg(test)]
 mod token_provider_tests {
-    use super::{mme_delegate_is_warm, MME_DELEGATE_MAX_AGE};
+    use super::{
+        mme_delegate_is_warm, CloudKitReadAuthenticationLease, PushError, MME_DELEGATE_MAX_AGE,
+    };
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -396,6 +561,34 @@ mod token_provider_tests {
             true,
             now - MME_DELEGATE_MAX_AGE - Duration::from_secs(1),
             now
+        ));
+        assert!(!mme_delegate_is_warm(
+            true,
+            now + Duration::from_secs(1),
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_authentication_revocation_waits_for_active_request_and_blocks_future_use() {
+        let lease = CloudKitReadAuthenticationLease::new_for_test("mme-token", "cloudkit-token");
+        let admission = lease.admit().await.expect("initial admission");
+        let revoker = lease.revoker();
+        let mut revoke = tokio::spawn(async move {
+            revoker.revoke().await;
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut revoke)
+            .await
+            .is_err());
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(1), revoke)
+            .await
+            .expect("revocation should finish after the active request exits")
+            .expect("revocation task");
+        assert!(matches!(
+            lease.admit().await,
+            Err(PushError::CloudKitWarmAuthenticationRequired)
         ));
     }
 }

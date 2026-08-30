@@ -45,7 +45,7 @@ pub use aps::{APSConnection, APSConnectionResource, APSMessage, APSState};
 use async_trait::async_trait;
 pub use auth::{
     authenticate_apple, authenticate_phone, authenticate_smsless, login_apple_delegates, AuthPhone,
-    CircleClientSession, LoginDelegate, TokenProvider,
+    CircleClientSession, CloudKitReadAuthenticationRevoker, LoginDelegate, TokenProvider,
 };
 pub use auth::{request_update_account, UpdateAccountFinish};
 pub use cloudkit_derive;
