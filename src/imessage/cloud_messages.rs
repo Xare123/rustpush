@@ -3053,21 +3053,17 @@ mod cloud_message_identity_tests {
     #[test]
     fn write_paths_require_general_container_and_already_cached_pcs_configuration() {
         let source = include_str!("cloud_messages.rs");
-        for (method_name, following_method_name) in [
-            (
-                "pub async fn lookup_message_record",
-                "pub async fn prepare_message_save_submission",
-            ),
-            (
-                "pub async fn prepare_message_save_submission",
-                "pub async fn execute_message_save_submission",
-            ),
+        for method_name in [
+            "pub async fn lookup_message_record",
+            "pub async fn prepare_message_save_submission",
         ] {
             let method_start = source.find(method_name).expect("write-path method");
-            let following_method = source[method_start..]
-                .find(following_method_name)
-                .expect("following write-path method");
-            let method = &source[method_start..method_start + following_method];
+            let method_body_start = method_start + method_name.len();
+            let following_method = source[method_body_start..]
+                .find("pub async fn ")
+                .map(|offset| method_body_start + offset)
+                .unwrap_or(source.len());
+            let method = &source[method_start..following_method];
 
             assert!(method.contains("self.get_container_lookup_only().await?"));
             assert!(method.contains(".get_cached_zone_encryption_config_exact(&zone)"));
