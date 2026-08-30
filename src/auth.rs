@@ -289,6 +289,40 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         self.account.lock().await.username.clone()
     }
 
+    /// Returns the account identifiers already present in the authenticated
+    /// AppleAccount SPD. This is deliberately a cached-only accessor: it only
+    /// takes the account lock and never refreshes authentication, generates
+    /// Anisette data, or performs network I/O.
+    ///
+    /// The identifiers are native-boundary data and must not be logged or
+    /// exposed through FFI. Malformed or incomplete SPD data fails closed.
+    pub(crate) async fn get_gsa_account_identifiers_cached(
+        &self,
+    ) -> Result<(String, String), PushError> {
+        let account = self.account.lock().await;
+        let Some(spd) = account.spd.as_ref() else {
+            return Err(PushError::UnauthorizedAccountError);
+        };
+
+        let Some(dsid) = spd
+            .get("DsPrsId")
+            .and_then(Value::as_unsigned_integer)
+            .filter(|value| *value != 0)
+        else {
+            return Err(PushError::UnauthorizedAccountError);
+        };
+
+        let Some(adsid) = spd
+            .get("adsid")
+            .and_then(Value::as_string)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Err(PushError::UnauthorizedAccountError);
+        };
+
+        Ok((dsid.to_string(), adsid.to_owned()))
+    }
+
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
 

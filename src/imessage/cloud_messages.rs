@@ -1949,16 +1949,51 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
     }
 
-    /// Returns the active account identifier inside the native boundary.
-    /// Callers must immediately transform it with an application-secret keyed
-    /// function and must never expose it over FFI or logs.
-    pub async fn native_account_identifier(&self) -> String {
-        self.client
+    /// Returns the CloudKit DSID only after the native account composition has
+    /// been validated. This path is cached and network-free: it reads the
+    /// current GSA SPD and local client state, and never initializes a
+    /// container, refreshes authentication, or performs a CloudKit operation.
+    /// The returned identifier is for native Rust use only.
+    pub async fn validated_native_account_identifier(&self) -> Result<String, PushError> {
+        let composition_is_exact = Arc::ptr_eq(&self.keychain.client, &self.client)
+            && Arc::ptr_eq(&self.keychain.token_provider, &self.client.token_provider)
+            && Arc::ptr_eq(&self.keychain.anisette, &self.client.anisette)
+            && Arc::ptr_eq(&self.keychain.config, &self.client.config);
+        if !composition_is_exact {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+
+        let (gsa_dsid, gsa_adsid) = self
+            .client
+            .token_provider
+            .get_gsa_account_identifiers_cached()
+            .await?;
+        let cloudkit_dsid = self
+            .client
             .state
             .read()
             .await
             .account_identifier()
-            .to_owned()
+            .to_owned();
+        let (keychain_dsid, keychain_adsid) = {
+            let state = self.keychain.state.read().await;
+            let (dsid, adsid) = state.native_account_identifiers();
+            (dsid.to_owned(), adsid.to_owned())
+        };
+
+        if gsa_dsid.is_empty()
+            || gsa_adsid.is_empty()
+            || cloudkit_dsid.is_empty()
+            || keychain_dsid.is_empty()
+            || keychain_adsid.is_empty()
+            || gsa_dsid != cloudkit_dsid
+            || cloudkit_dsid != keychain_dsid
+            || gsa_adsid != keychain_adsid
+        {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+
+        Ok(cloudkit_dsid)
     }
 
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
@@ -2775,5 +2810,389 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 .unwrap_or_default())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod cloud_message_identity_tests {
+    use super::*;
+    use crate::{
+        cloudkit::{CloudKitClient, CloudKitState},
+        keychain::{KeychainClient, KeychainClientState},
+        DebugMeta, DebugRwLock, OSConfig, RegisterMeta, TokenProvider,
+    };
+    use icloud_auth::{AppleAccount, LoginClientInfo};
+    use omnisette::{AnisetteClient, AnisetteError, ArcAnisetteClient};
+    use std::{collections::HashMap, future::Future};
+
+    struct NoBootstrapAnisette;
+
+    impl AnisetteProvider for NoBootstrapAnisette {
+        fn get_anisette_headers(
+            &mut self,
+        ) -> impl Future<Output = Result<HashMap<String, String>, AnisetteError>> + Send {
+            async { panic!("identity validation must not generate Anisette data") }
+        }
+    }
+
+    struct NoBootstrapConfig;
+
+    #[async_trait::async_trait]
+    impl OSConfig for NoBootstrapConfig {
+        fn build_activation_info(&self, _csr: Vec<u8>) -> crate::activation::ActivationInfo {
+            unreachable!("identity validation must not activate")
+        }
+
+        fn get_activation_device(&self) -> String {
+            "identity-test-device".to_owned()
+        }
+
+        async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
+            unreachable!("identity validation must not bootstrap")
+        }
+
+        fn get_protocol_version(&self) -> u32 {
+            1
+        }
+
+        fn get_register_meta(&self) -> RegisterMeta {
+            RegisterMeta {
+                hardware_version: "identity-test-hardware".to_owned(),
+                os_version: "identity-test-os".to_owned(),
+                software_version: "identity-test-software".to_owned(),
+            }
+        }
+
+        fn get_normal_ua(&self, item: &str) -> String {
+            item.to_owned()
+        }
+
+        fn get_mme_clientinfo(&self, item: &str) -> String {
+            item.to_owned()
+        }
+
+        fn get_version_ua(&self) -> String {
+            "identity-test-version".to_owned()
+        }
+
+        fn get_device_name(&self) -> String {
+            "identity-test-device".to_owned()
+        }
+
+        fn get_device_uuid(&self) -> String {
+            "identity-test-device-uuid".to_owned()
+        }
+
+        fn get_private_data(&self) -> plist::Dictionary {
+            plist::Dictionary::new()
+        }
+
+        fn get_debug_meta(&self) -> DebugMeta {
+            DebugMeta {
+                user_version: "identity-test-user-version".to_owned(),
+                hardware_version: "identity-test-hardware".to_owned(),
+                serial_number: "identity-test-serial".to_owned(),
+            }
+        }
+
+        fn get_login_url(&self) -> &'static str {
+            "http://127.0.0.1/identity-test-unused"
+        }
+
+        fn get_serial_number(&self) -> String {
+            "identity-test-serial".to_owned()
+        }
+
+        fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+
+        fn get_aoskit_version(&self) -> String {
+            "identity-test-aoskit".to_owned()
+        }
+
+        fn get_udid(&self) -> String {
+            "identity-test-udid".to_owned()
+        }
+    }
+
+    type TestTokenProvider = TokenProvider<NoBootstrapAnisette>;
+    type TestCloudKitClient = CloudKitClient<NoBootstrapAnisette>;
+    type TestKeychainClient = KeychainClient<NoBootstrapAnisette>;
+
+    struct Fixture {
+        messages: CloudMessagesClient<NoBootstrapAnisette>,
+        client: Arc<TestCloudKitClient>,
+        token_provider: Arc<TestTokenProvider>,
+        anisette: ArcAnisetteClient<NoBootstrapAnisette>,
+        config: Arc<dyn OSConfig>,
+    }
+
+    fn spd(dsid: Option<Value>, adsid: Option<Value>) -> Option<plist::Dictionary> {
+        let mut values = plist::Dictionary::new();
+        if let Some(dsid) = dsid {
+            values.insert("DsPrsId".to_owned(), dsid);
+        }
+        if let Some(adsid) = adsid {
+            values.insert("adsid".to_owned(), adsid);
+        }
+        Some(values)
+    }
+
+    fn token_provider(
+        spd: Option<plist::Dictionary>,
+        anisette: ArcAnisetteClient<NoBootstrapAnisette>,
+        config: Arc<dyn OSConfig>,
+    ) -> Arc<TestTokenProvider> {
+        let mut account = AppleAccount::new_with_anisette(LoginClientInfo::default(), anisette)
+            .expect("test Apple account must initialize");
+        account.spd = spd;
+        TokenProvider::new(Arc::new(DebugMutex::new(account)), config)
+    }
+
+    fn cloudkit_client(
+        dsid: &str,
+        anisette: ArcAnisetteClient<NoBootstrapAnisette>,
+        config: Arc<dyn OSConfig>,
+        token_provider: Arc<TestTokenProvider>,
+    ) -> Arc<TestCloudKitClient> {
+        Arc::new(CloudKitClient {
+            anisette,
+            state: DebugRwLock::new(
+                CloudKitState::new(dsid.to_owned()).expect("test CloudKit state"),
+            ),
+            config,
+            token_provider,
+        })
+    }
+
+    fn keychain_state(dsid: &str, adsid: &str) -> KeychainClientState {
+        let mut keychain_sync = plist::Dictionary::new();
+        keychain_sync.insert(
+            "escrowProxyUrl".to_owned(),
+            Value::String("https://127.0.0.1/identity-test-unused".to_owned()),
+        );
+        let mut delegate_config = plist::Dictionary::new();
+        delegate_config.insert(
+            "com.apple.Dataclass.KeychainSync".to_owned(),
+            Value::Dictionary(keychain_sync),
+        );
+        let delegate = crate::auth::MobileMeDelegateResponse {
+            tokens: HashMap::new(),
+            config: delegate_config,
+        };
+        KeychainClientState::new(dsid.to_owned(), adsid.to_owned(), &delegate)
+            .expect("test keychain state")
+    }
+
+    fn keychain_client(
+        client: Arc<TestCloudKitClient>,
+        token_provider: Arc<TestTokenProvider>,
+        anisette: ArcAnisetteClient<NoBootstrapAnisette>,
+        config: Arc<dyn OSConfig>,
+        dsid: &str,
+        adsid: &str,
+    ) -> Arc<TestKeychainClient> {
+        Arc::new(KeychainClient {
+            anisette,
+            token_provider,
+            state: DebugRwLock::new(keychain_state(dsid, adsid)),
+            config,
+            update_state: Box::new(|_| {}),
+            container: tokio::sync::Mutex::new(None),
+            container_initialization: tokio::sync::Mutex::new(()),
+            security_container: tokio::sync::Mutex::new(None),
+            security_container_initialization: tokio::sync::Mutex::new(()),
+            client,
+        })
+    }
+
+    fn fixture(
+        gsa_spd: Option<plist::Dictionary>,
+        cloudkit_dsid: &str,
+        keychain_dsid: &str,
+        keychain_adsid: &str,
+    ) -> Fixture {
+        let anisette = Arc::new(tokio::sync::Mutex::new(AnisetteClient::new(
+            NoBootstrapAnisette,
+        )));
+        let config: Arc<dyn OSConfig> = Arc::new(NoBootstrapConfig);
+        let token_provider = token_provider(gsa_spd, anisette.clone(), config.clone());
+        let client = cloudkit_client(
+            cloudkit_dsid,
+            anisette.clone(),
+            config.clone(),
+            token_provider.clone(),
+        );
+        let keychain = keychain_client(
+            client.clone(),
+            token_provider.clone(),
+            anisette.clone(),
+            config.clone(),
+            keychain_dsid,
+            keychain_adsid,
+        );
+
+        Fixture {
+            messages: CloudMessagesClient::new(client.clone(), keychain),
+            client,
+            token_provider,
+            anisette,
+            config,
+        }
+    }
+
+    fn valid_fixture() -> Fixture {
+        fixture(
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::String("adsid-123".to_owned())),
+            ),
+            "123",
+            "123",
+            "adsid-123",
+        )
+    }
+
+    #[tokio::test]
+    async fn validated_identifier_accepts_exact_match_without_bootstrap_or_network() {
+        let fixture = valid_fixture();
+
+        assert_eq!(
+            fixture
+                .messages
+                .validated_native_account_identifier()
+                .await
+                .expect("exact account composition must validate"),
+            "123"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_identifier_rejects_missing_gsa_spd() {
+        let fixture = fixture(None, "123", "123", "adsid-123");
+
+        assert!(matches!(
+            fixture.messages.validated_native_account_identifier().await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_gsa_identifiers_reject_malformed_and_empty_spd_values() {
+        for malformed_spd in [
+            spd(
+                Some(Value::String("123".to_owned())),
+                Some(Value::String("adsid-123".to_owned())),
+            ),
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::Integer(123.into())),
+            ),
+            spd(
+                Some(Value::Integer(0.into())),
+                Some(Value::String("adsid-123".to_owned())),
+            ),
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::String("   ".to_owned())),
+            ),
+        ] {
+            let fixture = fixture(malformed_spd, "123", "123", "adsid-123");
+            assert!(matches!(
+                fixture
+                    .token_provider
+                    .get_gsa_account_identifiers_cached()
+                    .await,
+                Err(PushError::UnauthorizedAccountError)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_identifier_rejects_dsid_mismatch() {
+        let fixture = fixture(
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::String("adsid-123".to_owned())),
+            ),
+            "456",
+            "123",
+            "adsid-123",
+        );
+
+        assert!(matches!(
+            fixture.messages.validated_native_account_identifier().await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_identifier_rejects_adsid_mismatch() {
+        let fixture = fixture(
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::String("adsid-a".to_owned())),
+            ),
+            "123",
+            "123",
+            "adsid-b",
+        );
+
+        assert!(matches!(
+            fixture.messages.validated_native_account_identifier().await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_identifier_rejects_mismatched_client_and_token_provider_arcs() {
+        let fixture = valid_fixture();
+        let wrong_client = cloudkit_client(
+            "123",
+            fixture.anisette.clone(),
+            fixture.config.clone(),
+            fixture.token_provider.clone(),
+        );
+        let wrong_client_keychain = keychain_client(
+            wrong_client,
+            fixture.token_provider.clone(),
+            fixture.anisette.clone(),
+            fixture.config.clone(),
+            "123",
+            "adsid-123",
+        );
+        let wrong_client_messages =
+            CloudMessagesClient::new(fixture.client.clone(), wrong_client_keychain);
+        assert!(matches!(
+            wrong_client_messages
+                .validated_native_account_identifier()
+                .await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
+
+        let wrong_token_provider = token_provider(
+            spd(
+                Some(Value::Integer(123.into())),
+                Some(Value::String("adsid-123".to_owned())),
+            ),
+            fixture.anisette.clone(),
+            fixture.config.clone(),
+        );
+        let wrong_token_keychain = keychain_client(
+            fixture.client.clone(),
+            wrong_token_provider,
+            fixture.anisette.clone(),
+            fixture.config.clone(),
+            "123",
+            "adsid-123",
+        );
+        let wrong_token_messages = CloudMessagesClient::new(fixture.client, wrong_token_keychain);
+        assert!(matches!(
+            wrong_token_messages
+                .validated_native_account_identifier()
+                .await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
     }
 }

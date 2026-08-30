@@ -1397,6 +1397,13 @@ impl KeychainClientState {
         })
     }
 
+    /// Returns the keychain account identifiers to native Rust callers.
+    /// These values must be validated against the GSA and CloudKit clients
+    /// before use and must never cross the FFI boundary or enter diagnostics.
+    pub(crate) fn native_account_identifiers(&self) -> (&str, &str) {
+        (&self.dsid, &self.adsid)
+    }
+
     // filter out custodian recovery keys
     pub fn peers(&self) -> impl Iterator<Item = &EncodedPeer> {
         self.state.values().filter(|v| v.0.dynamic_info.is_some())
