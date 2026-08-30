@@ -5825,8 +5825,8 @@ mod cloud_sync_transport_tests {
     fn one_shot_test_container() -> CloudKitContainer<'static> {
         CloudKitContainer {
             database_type: Database::PrivateDb,
-            bundleid: "com.example.cloudkit-deadline-test",
-            containerid: "com.example.cloudkit-deadline-test",
+            bundleid: "com.apple.imagent",
+            containerid: "com.apple.messages.cloud",
             env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
         }
     }
@@ -6061,7 +6061,7 @@ mod cloud_sync_transport_tests {
             reqwest::StatusCode::FORBIDDEN,
         ] {
             let container = one_shot_test_container();
-            let open = one_shot_test_open_container(&container);
+            let mut open = one_shot_test_open_container(&container);
             let invalidated = Arc::new(AtomicBool::new(false));
             let invalidation_marker = invalidated.clone();
             open.client
@@ -6077,7 +6077,14 @@ mod cloud_sync_transport_tests {
                 )
                 .await
                 .expect("current read authentication should restore");
-
+            let read_authentication = open
+                .client
+                .token_provider
+                .cloudkit_read_authentication_lease()
+                .await
+                .expect("current read authentication lease");
+            open.read_authentication_generation = Some(read_authentication.revoker());
+            open.test_read_authentication_lease = Some(read_authentication);
             let invocations = Arc::new(AtomicUsize::new(0));
             let invocation_counter = invocations.clone();
             let transport: Arc<dyn CloudKitTestHttpTransport> = Arc::new(move |_request| {
@@ -6143,7 +6150,6 @@ mod cloud_sync_transport_tests {
                 )
                 .await
                 .expect("current read authentication should restore");
-
             let invocations = Arc::new(AtomicUsize::new(0));
             let invocation_counter = invocations.clone();
             let transport: Arc<dyn CloudKitTestHttpTransport> = Arc::new(move |_request| {
@@ -6187,7 +6193,7 @@ mod cloud_sync_transport_tests {
 
         for client_error in [Code::BadAuthToken, Code::NeedsAuthentication] {
             let container = one_shot_test_container();
-            let open = one_shot_test_open_container(&container);
+            let mut open = one_shot_test_open_container(&container);
             let invalidated = Arc::new(AtomicBool::new(false));
             let invalidation_marker = invalidated.clone();
             open.client
@@ -6203,6 +6209,14 @@ mod cloud_sync_transport_tests {
                 )
                 .await
                 .expect("current read authentication should restore");
+            let read_authentication = open
+                .client
+                .token_provider
+                .cloudkit_read_authentication_lease()
+                .await
+                .expect("current read authentication lease");
+            open.read_authentication_generation = Some(read_authentication.revoker());
+            open.test_read_authentication_lease = Some(read_authentication);
             let transport = FaithfulSemanticTransport::default();
 
             let result = with_cloudkit_test_transport(
@@ -6314,7 +6328,7 @@ mod cloud_sync_transport_tests {
         .await
         .unwrap();
 
-        let wrong_container = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let wrong_container = one_shot_test_open_container(&WRONG_MESSAGES_CONTAINER);
         let wrong_generation = wrong_container
             .client
             .token_provider
@@ -6339,6 +6353,16 @@ mod cloud_sync_transport_tests {
         ));
 
         let other_client = one_shot_test_open_container(&messages_container).client;
+        other_client
+            .token_provider
+            .restore_cloudkit_read_authentication(
+                "other-read-mme-token".to_owned(),
+                "other-read-cloudkit-token".to_owned(),
+                SystemTime::now(),
+                || Ok(()),
+            )
+            .await
+            .expect("other-client read generation");
         assert!(matches!(
             open.validate_read_authentication_identity(
                 &other_client,
@@ -6434,9 +6458,16 @@ mod cloud_sync_transport_tests {
         ));
     }
 
-    static SEMANTIC_FAKE_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
+    static WRONG_MESSAGES_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
         database_type: Database::PrivateDb,
         bundleid: "com.apple.MobileSMS",
+        containerid: "com.apple.messages.cloud",
+        env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
+    };
+
+    static SEMANTIC_MESSAGES_CONTAINER: CloudKitContainer<'static> = CloudKitContainer {
+        database_type: Database::PrivateDb,
+        bundleid: "com.apple.imagent",
         containerid: "com.apple.messages.cloud",
         env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
     };
@@ -7069,7 +7100,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn cold_v2_prepare_and_reconcile_never_implicitly_warm_or_mutate() {
-        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER));
+        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER));
         let keychain = semantic_test_keychain(&open);
         let cloud_messages = CloudMessagesClient::new(open.client.clone(), keychain);
         let transport = FaithfulSemanticTransport::default();
@@ -7114,7 +7145,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn faithful_fake_transport_exercises_real_warm_semantic_fetch_allowlist() {
-        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER));
+        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER));
         let keychain = semantic_test_keychain(&open);
         let cloud_messages =
             CloudMessagesClient::new_warm_for_test(open.client.clone(), keychain, open.clone());
@@ -7187,7 +7218,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn faithful_fake_transport_rejects_spoofed_write_inside_allowed_endpoint() {
-        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let open = one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER);
         let transport = FaithfulSemanticTransport::default();
         let result = with_cloudkit_test_transport(transport.transport(), async {
             open.perform_semantic_read_only(&CloudKitSession::new(), SpoofedSemanticWriteOperation)
@@ -7205,7 +7236,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn faithful_fake_transport_rejects_spoofed_function_route_before_http() {
-        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let open = one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER);
         let transport = FaithfulSemanticTransport::default();
         let result = with_cloudkit_test_transport(transport.transport(), async {
             open.perform_semantic_read_only(
@@ -7966,7 +7997,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn cached_zone_configuration_returns_only_the_exact_warmed_zone() {
-        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let open = one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER);
         let zone = open.private_zone("attachmentManateeZone".to_owned());
         let warmed = PCSZoneConfig {
             identifier: zone.clone(),
@@ -7999,7 +8030,7 @@ mod cloud_sync_transport_tests {
 
     #[tokio::test]
     async fn cached_zone_configuration_fails_closed_when_absent_or_not_exact() {
-        let open = one_shot_test_open_container(&SEMANTIC_FAKE_CONTAINER);
+        let open = one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER);
         let zone = open.private_zone("attachmentManateeZone".to_owned());
         assert!(matches!(
             open.get_cached_zone_encryption_config_exact(&zone).await,
