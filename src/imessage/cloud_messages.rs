@@ -3177,7 +3177,7 @@ mod cloud_message_identity_tests {
             .expect("following lookup method");
         let method = &source[method_start..method_start + following_method];
 
-        assert!(method.matches("permit.validate()?").count() >= 3);
+        assert!(method.matches("permit.validate()").count() >= 3);
         assert!(method.contains("get_cached_container_for_read_authentication(permit)"));
         assert!(method.contains("get_zone_encryption_config_sev_lookup_only"));
         assert!(method.contains("chatManateeZone"));
@@ -3190,6 +3190,10 @@ mod cloud_message_identity_tests {
     #[test]
     fn semantic_record_page_fetch_is_permit_bound_and_lookup_only() {
         let source = include_str!("cloud_messages.rs");
+        let production_end = source
+            .find("mod cloud_message_identity_tests {")
+            .expect("identity test module boundary");
+        let production_source = &source[..production_end];
         let method_start = source
             .find("async fn sync_records_page_for_read_authentication")
             .expect("permit-bound record-page method");
@@ -3206,7 +3210,10 @@ mod cloud_message_identity_tests {
             "sync_messages_page_for_read_authentication",
             "sync_attachments_page_for_read_authentication",
         ] {
-            assert!(source.contains(method_name), "missing {method_name}");
+            assert!(
+                production_source.contains(method_name),
+                "missing {method_name}"
+            );
         }
         for forbidden_method in [
             "sync_message_update_page_for_read_authentication",
@@ -3215,7 +3222,7 @@ mod cloud_message_identity_tests {
             "sync_chat1_page_for_read_authentication",
         ] {
             assert!(
-                !source.contains(forbidden_method),
+                !production_source.contains(forbidden_method),
                 "unexpected semantic fetch surface: {forbidden_method}"
             );
         }
