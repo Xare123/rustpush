@@ -2374,9 +2374,53 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
         let container = self.get_read_authentication_container_lookup_only().await?;
+        self.sync_records_page_with_container(
+            &container,
+            zone_name,
+            expected_record_type,
+            continuation_token,
+            max_changes,
+        )
+        .await
+    }
+
+    async fn sync_records_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        permit.validate()?;
+        let container = self
+            .get_cached_container_for_read_authentication(permit)
+            .await?;
+        permit.validate()?;
+        let result = self
+            .sync_records_page_with_container(
+                &container,
+                zone_name,
+                expected_record_type,
+                continuation_token,
+                max_changes,
+            )
+            .await;
+        permit.validate()?;
+        result
+    }
+
+    async fn sync_records_page_with_container(
+        &self,
+        container: &Arc<CloudKitOpenContainer<'static, P>>,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+    ) -> Result<CloudMessageRecordPage, PushError> {
         let zone = container.private_zone(zone_name.to_string());
         let page = FetchRecordChangesOperation::fetch_page_with_limit_lookup_only(
-            &container,
+            container,
             zone,
             continuation_token,
             &NO_ASSETS,
@@ -2694,6 +2738,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    pub async fn sync_chats_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication(
+            permit,
+            "chatManateeZone",
+            CloudChat::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
     pub async fn save_chats(
         &self,
         chats: HashMap<String, CloudChat>,
@@ -2719,6 +2779,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         max_changes: Option<u32>,
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_records_page(
+            "messageManateeZone",
+            CloudMessage::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn sync_messages_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication(
+            permit,
             "messageManateeZone",
             CloudMessage::record_type(),
             continuation_token,
@@ -2760,6 +2836,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    pub async fn sync_attachments_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication(
+            permit,
+            "attachmentManateeZone",
+            CloudAttachment::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
     async fn sync_raw_only_records_page(
         &self,
         zone: &str,
@@ -2767,6 +2859,23 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         max_changes: Option<u32>,
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_records_page(
+            zone,
+            RAW_ONLY_RECORD_TYPE,
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    async fn sync_raw_only_records_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication(
+            permit,
             zone,
             RAW_ONLY_RECORD_TYPE,
             continuation_token,
@@ -2784,12 +2893,42 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .await
     }
 
+    pub async fn sync_message_update_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page_for_read_authentication(
+            permit,
+            "messageUpdateZone",
+            continuation_token,
+            max_changes,
+        )
+        .await
+    }
+
     pub async fn sync_recoverable_message_delete_page(
         &self,
         continuation_token: Option<Vec<u8>>,
         max_changes: Option<u32>,
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_raw_only_records_page(
+            "recoverableMessageDeleteZone",
+            continuation_token,
+            max_changes,
+        )
+        .await
+    }
+
+    pub async fn sync_recoverable_message_delete_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page_for_read_authentication(
+            permit,
             "recoverableMessageDeleteZone",
             continuation_token,
             max_changes,
@@ -2806,6 +2945,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .await
     }
 
+    pub async fn sync_scheduled_message_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page_for_read_authentication(
+            permit,
+            "scheduledMessageZone",
+            continuation_token,
+            max_changes,
+        )
+        .await
+    }
+
     pub async fn sync_chat1_page(
         &self,
         continuation_token: Option<Vec<u8>>,
@@ -2813,6 +2967,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_raw_only_records_page("chat1ManateeZone", continuation_token, max_changes)
             .await
+    }
+
+    pub async fn sync_chat1_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_raw_only_records_page_for_read_authentication(
+            permit,
+            "chat1ManateeZone",
+            continuation_token,
+            max_changes,
+        )
+        .await
     }
 
     pub async fn save_attachments(
@@ -3093,6 +3262,33 @@ mod cloud_message_identity_tests {
         assert!(method.contains("attachmentManateeZone"));
         assert!(!method.contains("get_zone_encryption_config_sev("));
         assert!(!method.contains("get_zone_encryption_config("));
+    }
+
+    #[test]
+    fn semantic_record_page_fetch_is_permit_bound_and_lookup_only() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("async fn sync_records_page_for_read_authentication")
+            .expect("permit-bound record-page method");
+        let following_method = source[method_start..]
+            .find("async fn sync_records_page_with_container")
+            .expect("shared lookup-only page helper");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.matches("permit.validate()?").count() >= 3);
+        assert!(method.contains("get_cached_container_for_read_authentication(permit)"));
+        assert!(!method.contains("get_read_authentication_container_lookup_only"));
+        for method_name in [
+            "sync_chats_page_for_read_authentication",
+            "sync_messages_page_for_read_authentication",
+            "sync_attachments_page_for_read_authentication",
+            "sync_message_update_page_for_read_authentication",
+            "sync_recoverable_message_delete_page_for_read_authentication",
+            "sync_scheduled_message_page_for_read_authentication",
+            "sync_chat1_page_for_read_authentication",
+        ] {
+            assert!(source.contains(method_name), "missing {method_name}");
+        }
     }
 
     #[test]
