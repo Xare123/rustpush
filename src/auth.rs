@@ -516,6 +516,22 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         Ok(())
     }
 
+    /// Refreshes MobileMe explicitly and returns only the two tokens required
+    /// to seed the isolated CloudKit semantic-read authentication cache.
+    ///
+    /// This method performs authentication network I/O, but it does not open a
+    /// CloudKit container or issue record, zone, subscription, save, or delete
+    /// operations. Callers must persist and install the returned material under
+    /// their account-lifecycle lock before admitting semantic reads.
+    pub async fn refresh_cloudkit_read_authentication_material(
+        &self,
+    ) -> Result<(String, String, SystemTime), PushError> {
+        self.refresh_mme().await?;
+        let delegate = self.mme_delegate.lock().await;
+        let refreshed = *self.mme_refreshed.lock().await;
+        cloudkit_read_authentication_material(delegate.as_ref(), refreshed, SystemTime::now())
+    }
+
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
         // refresh every week
         if !mme_delegate_is_warm(
@@ -601,12 +617,40 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     }
 }
 
+fn cloudkit_read_authentication_material(
+    delegate: Option<&MobileMeDelegateResponse>,
+    refreshed: SystemTime,
+    now: SystemTime,
+) -> Result<(String, String, SystemTime), PushError> {
+    if !mme_delegate_is_warm(delegate.is_some(), refreshed, now) {
+        return Err(PushError::CloudKitWarmAuthenticationRequired);
+    }
+    let delegate = delegate.ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+    let mme_auth_token = delegate
+        .tokens
+        .get("mmeAuthToken")
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+    let cloudkit_token = delegate
+        .tokens
+        .get("cloudKitToken")
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .ok_or(PushError::CloudKitWarmAuthenticationRequired)?;
+    Ok((mme_auth_token, cloudkit_token, refreshed))
+}
+
 #[cfg(test)]
 mod token_provider_tests {
     use super::{
-        mme_delegate_is_warm, CloudKitReadAuthenticationLease, PushError, MME_DELEGATE_MAX_AGE,
+        cloudkit_read_authentication_material, mme_delegate_is_warm,
+        CloudKitReadAuthenticationLease, MobileMeDelegateResponse, PushError, MME_DELEGATE_MAX_AGE,
     };
-    use std::time::{Duration, SystemTime};
+    use std::{
+        collections::HashMap,
+        time::{Duration, SystemTime},
+    };
 
     #[test]
     fn semantic_auth_preflight_requires_a_current_existing_delegate() {
@@ -655,6 +699,42 @@ mod token_provider_tests {
 
         assert!(first.revoker().is_same_generation(&first.revoker()));
         assert!(!first.revoker().is_same_generation(&second.revoker()));
+    }
+
+    #[test]
+    fn refreshed_semantic_material_requires_both_current_nonempty_tokens() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let mut tokens = HashMap::from([
+            ("mmeAuthToken".to_owned(), "mme-token".to_owned()),
+            ("cloudKitToken".to_owned(), "cloudkit-token".to_owned()),
+        ]);
+        let delegate = MobileMeDelegateResponse {
+            tokens: tokens.clone(),
+            config: Default::default(),
+        };
+        let material = cloudkit_read_authentication_material(Some(&delegate), now, now)
+            .expect("current complete delegate");
+        assert_eq!(material.0, "mme-token");
+        assert_eq!(material.1, "cloudkit-token");
+        assert_eq!(material.2, now);
+
+        tokens.remove("cloudKitToken");
+        let incomplete = MobileMeDelegateResponse {
+            tokens,
+            config: Default::default(),
+        };
+        assert!(matches!(
+            cloudkit_read_authentication_material(Some(&incomplete), now, now),
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
+        assert!(matches!(
+            cloudkit_read_authentication_material(
+                Some(&delegate),
+                now - MME_DELEGATE_MAX_AGE - Duration::from_secs(1),
+                now,
+            ),
+            Err(PushError::CloudKitWarmAuthenticationRequired)
+        ));
     }
 }
 
