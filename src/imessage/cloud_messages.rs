@@ -2867,23 +2867,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
-    async fn sync_raw_only_records_page_for_read_authentication(
-        &self,
-        permit: &CloudKitReadAuthenticationPermit<'_>,
-        zone: &str,
-        continuation_token: Option<Vec<u8>>,
-        max_changes: Option<u32>,
-    ) -> Result<CloudMessageRecordPage, PushError> {
-        self.sync_records_page_for_read_authentication(
-            permit,
-            zone,
-            RAW_ONLY_RECORD_TYPE,
-            continuation_token,
-            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
-        )
-        .await
-    }
-
     pub async fn sync_message_update_page(
         &self,
         continuation_token: Option<Vec<u8>>,
@@ -2893,42 +2876,12 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .await
     }
 
-    pub async fn sync_message_update_page_for_read_authentication(
-        &self,
-        permit: &CloudKitReadAuthenticationPermit<'_>,
-        continuation_token: Option<Vec<u8>>,
-        max_changes: Option<u32>,
-    ) -> Result<CloudMessageRecordPage, PushError> {
-        self.sync_raw_only_records_page_for_read_authentication(
-            permit,
-            "messageUpdateZone",
-            continuation_token,
-            max_changes,
-        )
-        .await
-    }
-
     pub async fn sync_recoverable_message_delete_page(
         &self,
         continuation_token: Option<Vec<u8>>,
         max_changes: Option<u32>,
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_raw_only_records_page(
-            "recoverableMessageDeleteZone",
-            continuation_token,
-            max_changes,
-        )
-        .await
-    }
-
-    pub async fn sync_recoverable_message_delete_page_for_read_authentication(
-        &self,
-        permit: &CloudKitReadAuthenticationPermit<'_>,
-        continuation_token: Option<Vec<u8>>,
-        max_changes: Option<u32>,
-    ) -> Result<CloudMessageRecordPage, PushError> {
-        self.sync_raw_only_records_page_for_read_authentication(
-            permit,
             "recoverableMessageDeleteZone",
             continuation_token,
             max_changes,
@@ -2945,21 +2898,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .await
     }
 
-    pub async fn sync_scheduled_message_page_for_read_authentication(
-        &self,
-        permit: &CloudKitReadAuthenticationPermit<'_>,
-        continuation_token: Option<Vec<u8>>,
-        max_changes: Option<u32>,
-    ) -> Result<CloudMessageRecordPage, PushError> {
-        self.sync_raw_only_records_page_for_read_authentication(
-            permit,
-            "scheduledMessageZone",
-            continuation_token,
-            max_changes,
-        )
-        .await
-    }
-
     pub async fn sync_chat1_page(
         &self,
         continuation_token: Option<Vec<u8>>,
@@ -2967,21 +2905,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     ) -> Result<CloudMessageRecordPage, PushError> {
         self.sync_raw_only_records_page("chat1ManateeZone", continuation_token, max_changes)
             .await
-    }
-
-    pub async fn sync_chat1_page_for_read_authentication(
-        &self,
-        permit: &CloudKitReadAuthenticationPermit<'_>,
-        continuation_token: Option<Vec<u8>>,
-        max_changes: Option<u32>,
-    ) -> Result<CloudMessageRecordPage, PushError> {
-        self.sync_raw_only_records_page_for_read_authentication(
-            permit,
-            "chat1ManateeZone",
-            continuation_token,
-            max_changes,
-        )
-        .await
     }
 
     pub async fn save_attachments(
@@ -3282,12 +3205,19 @@ mod cloud_message_identity_tests {
             "sync_chats_page_for_read_authentication",
             "sync_messages_page_for_read_authentication",
             "sync_attachments_page_for_read_authentication",
+        ] {
+            assert!(source.contains(method_name), "missing {method_name}");
+        }
+        for forbidden_method in [
             "sync_message_update_page_for_read_authentication",
             "sync_recoverable_message_delete_page_for_read_authentication",
             "sync_scheduled_message_page_for_read_authentication",
             "sync_chat1_page_for_read_authentication",
         ] {
-            assert!(source.contains(method_name), "missing {method_name}");
+            assert!(
+                !source.contains(forbidden_method),
+                "unexpected semantic fetch surface: {forbidden_method}"
+            );
         }
     }
 
