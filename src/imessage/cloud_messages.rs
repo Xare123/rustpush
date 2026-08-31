@@ -1981,12 +1981,16 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
     }
 
-    /// Returns the CloudKit DSID only after the native account composition has
-    /// been validated. This path is cached and network-free: it reads the
-    /// current GSA SPD and local client state, and never initializes a
-    /// container, refreshes authentication, or performs a CloudKit operation.
-    /// The returned identifier is for native Rust use only.
-    pub async fn validated_native_account_identifier(&self) -> Result<String, PushError> {
+    /// Returns the persisted CloudKit and keychain account identifiers only
+    /// after their native client composition has been validated.
+    ///
+    /// This restore-time path is cached and network-free. It deliberately does
+    /// not require GSA SPD metadata because that metadata is populated only by
+    /// an explicit authentication refresh after process restart. The returned
+    /// identifiers are for native Rust use only and must never cross FFI.
+    pub async fn validated_persisted_native_account_identifiers(
+        &self,
+    ) -> Result<(String, String), PushError> {
         let composition_is_exact = Arc::ptr_eq(&self.keychain.client, &self.client)
             && Arc::ptr_eq(&self.keychain.token_provider, &self.client.token_provider)
             && Arc::ptr_eq(&self.keychain.anisette, &self.client.anisette)
@@ -1995,11 +1999,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             return Err(PushError::UnauthorizedAccountError);
         }
 
-        let (gsa_dsid, gsa_adsid) = self
-            .client
-            .token_provider
-            .get_gsa_account_identifiers_cached()
-            .await?;
         let cloudkit_dsid = self
             .client
             .state
@@ -2013,19 +2012,38 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             (dsid.to_owned(), adsid.to_owned())
         };
 
-        if gsa_dsid.is_empty()
-            || gsa_adsid.is_empty()
-            || cloudkit_dsid.is_empty()
+        if cloudkit_dsid.is_empty()
             || keychain_dsid.is_empty()
             || keychain_adsid.is_empty()
-            || gsa_dsid != cloudkit_dsid
             || cloudkit_dsid != keychain_dsid
-            || gsa_adsid != keychain_adsid
         {
             return Err(PushError::UnauthorizedAccountError);
         }
 
-        Ok(cloudkit_dsid)
+        Ok((cloudkit_dsid, keychain_adsid))
+    }
+
+    /// Returns the CloudKit DSID only after the complete native account
+    /// composition, including the current GSA SPD, has been validated.
+    ///
+    /// This path is cached and network-free. A caller restoring a cold process
+    /// must explicitly refresh authentication before invoking it. The returned
+    /// identifier is for native Rust use only.
+    pub async fn validated_native_account_identifier(&self) -> Result<String, PushError> {
+        let (persisted_dsid, persisted_adsid) = self
+            .validated_persisted_native_account_identifiers()
+            .await?;
+        let (gsa_dsid, gsa_adsid) = self
+            .client
+            .token_provider
+            .get_gsa_account_identifiers_cached()
+            .await?;
+
+        if gsa_dsid != persisted_dsid || gsa_adsid != persisted_adsid {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+
+        Ok(persisted_dsid)
     }
 
     pub async fn get_container(&self) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
@@ -3752,6 +3770,33 @@ mod cloud_message_identity_tests {
 
         assert!(matches!(
             fixture.messages.validated_native_account_identifier().await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_identifier_accepts_missing_gsa_spd() {
+        let fixture = fixture(None, "123", "123", "adsid-123");
+
+        assert_eq!(
+            fixture
+                .messages
+                .validated_persisted_native_account_identifiers()
+                .await
+                .expect("matching persisted account composition must validate"),
+            ("123".to_owned(), "adsid-123".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_identifier_rejects_cloudkit_keychain_mismatch() {
+        let fixture = fixture(None, "456", "123", "adsid-123");
+
+        assert!(matches!(
+            fixture
+                .messages
+                .validated_persisted_native_account_identifiers()
+                .await,
             Err(PushError::UnauthorizedAccountError)
         ));
     }

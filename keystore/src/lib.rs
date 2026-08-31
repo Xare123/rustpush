@@ -65,8 +65,14 @@ pub enum KeystoreError {
 
 static KEYSTORE: OnceLock<Box<dyn Keystore>> = OnceLock::new();
 
+pub fn try_init_keystore(store: impl Keystore) -> Result<(), KeystoreError> {
+    KEYSTORE
+        .set(Box::new(store))
+        .map_err(|_| KeystoreError::KeystoreError("global keystore already initialized".to_owned()))
+}
+
 pub fn init_keystore(store: impl Keystore) {
-    let _ = KEYSTORE.set(Box::new(store));
+    let _ = try_init_keystore(store);
 }
 
 pub fn keystore() -> &'static dyn Keystore {
