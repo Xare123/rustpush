@@ -2193,6 +2193,47 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(container)
     }
 
+    /// Warms the exact Messages PCS zones needed by the semantic reader while
+    /// the caller's native writer-pause permit remains active. Every remote
+    /// operation is lookup-only: missing zones fail instead of being created,
+    /// and the resulting PCS configurations stay on the restored read-auth
+    /// container rather than the general/write-capable container.
+    pub async fn warm_semantic_read_zone_encryption_configs(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+    ) -> Result<(), PushError> {
+        const SEMANTIC_ZONES: [&str; 3] = [
+            "chatManateeZone",
+            "messageManateeZone",
+            "attachmentManateeZone",
+        ];
+
+        permit.validate()?;
+        let container = self
+            .get_cached_container_for_read_authentication(permit)
+            .await?;
+        let zones = SEMANTIC_ZONES
+            .iter()
+            .map(|name| (container.private_zone((*name).to_owned()), None))
+            .collect::<Vec<_>>();
+        let configs = container
+            .get_zone_encryption_config_sev_lookup_only(
+                &zones,
+                &self.keychain,
+                &MESSAGES_SERVICE,
+                true,
+            )
+            .await?;
+        if configs.len() != zones.len() {
+            return Err(PushError::BadMsg);
+        }
+        for config in configs {
+            permit.validate()?;
+            config?;
+        }
+        permit.validate()
+    }
+
     /// Fetches one stable MessageEncryptedV3 record for ambiguous-write
     /// reconciliation. The read-only CloudKit primitive may retry safely, but
     /// only an explicit per-record NOT_FOUND is evidence that create replay is
@@ -3032,6 +3073,27 @@ mod cloud_message_identity_tests {
     use icloud_auth::{AppleAccount, LoginClientInfo};
     use omnisette::{AnisetteClient, AnisetteError, ArcAnisetteClient};
     use std::{collections::HashMap, future::Future};
+
+    #[test]
+    fn semantic_pcs_warmup_is_permit_bound_and_lookup_only() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("pub async fn warm_semantic_read_zone_encryption_configs")
+            .expect("semantic PCS warmup method");
+        let following_method = source[method_start..]
+            .find("pub async fn lookup_message_record")
+            .expect("following lookup method");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.matches("permit.validate()?").count() >= 3);
+        assert!(method.contains("get_cached_container_for_read_authentication(permit)"));
+        assert!(method.contains("get_zone_encryption_config_sev_lookup_only"));
+        assert!(method.contains("chatManateeZone"));
+        assert!(method.contains("messageManateeZone"));
+        assert!(method.contains("attachmentManateeZone"));
+        assert!(!method.contains("get_zone_encryption_config_sev("));
+        assert!(!method.contains("get_zone_encryption_config("));
+    }
 
     #[test]
     fn attachment_download_structurally_uses_cached_container_and_pcs_configuration() {

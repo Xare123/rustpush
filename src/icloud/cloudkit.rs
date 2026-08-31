@@ -3625,6 +3625,26 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         .await
     }
 
+    /// Resolves several existing PCS zone configurations using read-only
+    /// CloudKit and keychain operations. Missing zones are returned as errors;
+    /// this path can never create or save a zone.
+    pub async fn get_zone_encryption_config_sev_lookup_only(
+        &self,
+        zone_ids: &[(cloudkit_proto::RecordZoneIdentifier, Option<ShareInfo>)],
+        client: &KeychainClient<T>,
+        pcs_service: &PCSService<'_>,
+        sync_keychain: bool,
+    ) -> Result<Vec<Result<PCSZoneConfig, PushError>>, PushError> {
+        self.get_zone_encryption_config_sev_with_policy(
+            zone_ids,
+            client,
+            pcs_service,
+            sync_keychain,
+            ZoneEncryptionConfigAccess::LookupOnly,
+        )
+        .await
+    }
+
     async fn get_zone_encryption_config_sev_with_policy(
         &self,
         zone_ids: &[(cloudkit_proto::RecordZoneIdentifier, Option<ShareInfo>)],
