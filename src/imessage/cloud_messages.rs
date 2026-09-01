@@ -1291,6 +1291,25 @@ pub struct CloudMessageSaveInput {
     pub message: CloudMessage,
 }
 
+/// Non-forgeable native binding to the exact general Messages container that
+/// completed writer preparation. User-ID equality is insufficient because a
+/// same-account container replacement can carry different prepared
+/// authentication or PCS cache state.
+pub struct CloudMessagesWriterPreparationBinding<P: AnisetteProvider> {
+    container: Arc<CloudKitOpenContainer<'static, P>>,
+}
+
+impl<P: AnisetteProvider> CloudMessagesWriterPreparationBinding<P> {
+    pub fn container_scoped_user_id(&self) -> &str {
+        &self.container.user_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(container: Arc<CloudKitOpenContainer<'static, P>>) -> Self {
+        Self { container }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloudMessagesSaveConsumeError {
     CorrelationMismatch,
@@ -2189,6 +2208,52 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(container)
     }
 
+    async fn get_writer_container_for_binding(
+        &self,
+        binding: &CloudMessagesWriterPreparationBinding<P>,
+    ) -> Result<Arc<CloudKitOpenContainer<'static, P>>, PushError> {
+        let current = self.get_container_lookup_only().await?;
+        if !Arc::ptr_eq(&current, &binding.container) || current.user_id.is_empty() {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        Ok(current)
+    }
+
+    /// Revalidates that a retained preparation binding still owns the exact
+    /// cached writer container. Callers must check this immediately before and
+    /// after crossing the remote submission boundary.
+    pub async fn validate_writer_preparation_binding(
+        &self,
+        binding: &CloudMessagesWriterPreparationBinding<P>,
+    ) -> Result<(), PushError> {
+        self.get_writer_container_for_binding(binding).await?;
+        Ok(())
+    }
+
+    /// Warms the exact general Messages container and existing message-zone
+    /// PCS configuration needed before create-only writer admission.
+    ///
+    /// This preflight may initialize CloudKit authentication, but its zone and
+    /// keychain operations are lookup-only. A missing zone fails instead of
+    /// being created, and the container-scoped user ID never leaves native
+    /// Rust.
+    pub async fn warm_message_writer_preparation_lookup_only(
+        &self,
+    ) -> Result<CloudMessagesWriterPreparationBinding<P>, PushError> {
+        let container = self.get_container().await?;
+        let zone = container.private_zone("messageManateeZone".to_string());
+        container
+            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
+        container
+            .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
+            .await?;
+        if container.user_id.is_empty() {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        Ok(CloudMessagesWriterPreparationBinding { container })
+    }
+
     /// Returns only a container initialized under the restored read-auth
     /// lease. Semantic fetch and decode must not fall back to a general or
     /// write-capable container cache.
@@ -2260,12 +2325,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     /// creates a zone, or mutates Cuttlefish trust.
     pub async fn lookup_message_record(
         &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
         server_record_name: &str,
     ) -> Result<CloudMessageRecordLookup, PushError> {
         if server_record_name.is_empty() || server_record_name.len() > 4096 {
             return Err(PushError::BadMsg);
         }
-        let container = self.get_container_lookup_only().await?;
+        let container = self
+            .get_writer_container_for_binding(writer_binding)
+            .await?;
         let zone = container.private_zone("messageManateeZone".to_string());
         let key = container
             .get_cached_zone_encryption_config_exact(&zone)
@@ -2275,14 +2343,16 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             &NO_ASSETS,
             expected_record_identifier.clone(),
         )];
-        let response = match container
+        let response = container
             .perform_operations_detailed(
                 &CloudKitSession::new(),
                 &operations,
                 IsolationLevel::Operation,
             )
-            .await
-        {
+            .await;
+        self.get_writer_container_for_binding(writer_binding)
+            .await?;
+        let response = match response {
             Ok(response) => response,
             Err(failure) => {
                 return Ok(CloudMessageRecordLookup::Unresolved {
@@ -2335,6 +2405,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     /// operation is built.
     pub async fn prepare_message_save_submission(
         &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
         messages: Vec<CloudMessageSaveInput>,
         request_identity: CloudKitRequestIdentity,
         request_timeout: Duration,
@@ -2344,7 +2415,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 return Err(PushError::BadMsg);
             }
             let ordered_pairs = ordered_message_save_pairs(&messages, &request_identity)?;
-            let container = self.get_container_lookup_only().await?;
+            let container = self
+                .get_writer_container_for_binding(writer_binding)
+                .await?;
             let zone = container.private_zone("messageManateeZone".to_string());
             let key = container
                 .get_cached_zone_encryption_config_exact(&zone)
@@ -2366,6 +2439,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             }
 
             let prepared_authentication = container.prepare_operations_authentication().await?;
+            self.get_writer_container_for_binding(writer_binding)
+                .await?;
 
             Ok(CloudMessagesPreparedSaveSubmission {
                 container,
@@ -3278,11 +3353,68 @@ mod cloud_message_identity_tests {
                 .unwrap_or(source.len());
             let method = &source[method_start..following_method];
 
-            assert!(method.contains("self.get_container_lookup_only().await?"));
+            assert!(method.contains("get_writer_container_for_binding"));
+            assert!(method.contains("writer_binding"));
             assert!(method.contains(".get_cached_zone_encryption_config_exact(&zone)"));
             assert!(!method.contains("get_zone_encryption_config_lookup_only"));
             assert!(!method.contains("get_container_for_read_authentication"));
         }
+    }
+
+    #[test]
+    fn writer_preparation_warms_only_the_existing_message_zone() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("pub async fn warm_message_writer_preparation_lookup_only")
+            .expect("writer preparation method");
+        let following_method = source[method_start..]
+            .find("async fn get_read_authentication_container_lookup_only")
+            .expect("following read-authentication accessor");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.contains("self.get_container().await?"));
+        assert!(method.contains("messageManateeZone"));
+        assert!(method.contains("get_zone_encryption_config_lookup_only"));
+        assert!(method.contains("validate_general_identity"));
+        assert!(!method.contains("get_zone_encryption_config("));
+        assert!(!method.contains("get_zone_encryption_config_sev("));
+        assert!(!method.contains("SaveRecordOperation"));
+        assert!(!method.contains("DeleteRecordOperation"));
+    }
+
+    #[tokio::test]
+    async fn writer_binding_rejects_same_user_container_replacement() {
+        let fixture = valid_fixture();
+        let original = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+            &MESSAGES_CONTAINER,
+            fixture.client.clone(),
+            "writer-original".to_owned(),
+            "123".to_owned(),
+        ));
+        let replacement = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+            &MESSAGES_CONTAINER,
+            fixture.client.clone(),
+            "writer-replacement".to_owned(),
+            "123".to_owned(),
+        ));
+        *fixture.messages.container.lock().await = Some(original.clone());
+        let binding = CloudMessagesWriterPreparationBinding::new_for_test(original);
+
+        fixture
+            .messages
+            .validate_writer_preparation_binding(&binding)
+            .await
+            .expect("the exact prepared container must remain valid");
+
+        *fixture.messages.container.lock().await = Some(replacement);
+
+        assert!(matches!(
+            fixture
+                .messages
+                .validate_writer_preparation_binding(&binding)
+                .await,
+            Err(PushError::UnauthorizedAccountError)
+        ));
     }
 
     #[test]

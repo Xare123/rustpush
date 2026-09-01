@@ -23,6 +23,25 @@ pub struct CloudKitWriterOperationPermit {
     _permit: OwnedRwLockReadGuard<()>,
 }
 
+impl CloudKitWriterOperationPermit {
+    /// Runs a future under the task-local writer scope owned by this exact
+    /// non-cloneable permit.
+    ///
+    /// Prepared CloudKit submissions retain this permit across the native
+    /// bridge. Their later consume step must re-enter through this method, so
+    /// a raw prepared request is never sufficient authority to submit.
+    pub async fn run<F, T>(&self, operation: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if cloudkit_writer_operation_is_held() {
+            operation.await
+        } else {
+            CLOUDKIT_WRITER_OPERATION_SCOPE.scope((), operation).await
+        }
+    }
+}
+
 struct CloudKitWriterPause {
     token: u64,
     generation: u64,
@@ -570,6 +589,42 @@ mod tests {
             assert_eq!(gate.pause_state().active_read_authentication_scopes, 0);
         }
 
+        gate.resume(token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_retained_permit_spans_prepare_and_later_consume_scopes() {
+        let gate = test_gate();
+        let permit = gate.acquire_operation().await.unwrap();
+
+        permit
+            .run(async {
+                assert!(cloudkit_writer_operation_is_held());
+            })
+            .await;
+
+        let pause_gate = gate.clone();
+        let mut pause_task = tokio::spawn(async move { pause_gate.pause(116).await });
+        wait_until_pause_pending(&gate).await;
+        assert!(tokio::time::timeout(TEST_WAIT, &mut pause_task)
+            .await
+            .is_err());
+
+        permit
+            .run(async {
+                assert!(cloudkit_writer_operation_is_held());
+            })
+            .await;
+        assert!(tokio::time::timeout(TEST_WAIT, &mut pause_task)
+            .await
+            .is_err());
+
+        drop(permit);
+        let token = tokio::time::timeout(TEST_TIMEOUT, pause_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         gate.resume(token).await.unwrap();
     }
 

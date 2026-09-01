@@ -5612,6 +5612,7 @@ mod cloud_sync_transport_tests {
     use crate::{
         cloud_messages::{
             CloudMessage, CloudMessageRecordKind, CloudMessageSaveInput, CloudMessagesClient,
+            CloudMessagesWriterPreparationBinding,
         },
         keychain::KeychainClientState,
         util::ungzip,
@@ -7136,13 +7137,15 @@ mod cloud_sync_transport_tests {
             apple_operation_uuid: operation_uuid.to_owned(),
             message: CloudMessage::default(),
         };
+        let writer_binding = CloudMessagesWriterPreparationBinding::new_for_test(open.clone());
 
         let (lookup, prepare) = with_cloudkit_test_transport(transport.transport(), async {
             let lookup = cloud_messages
-                .lookup_message_record("stable-server-record")
+                .lookup_message_record(&writer_binding, "stable-server-record")
                 .await;
             let prepare = cloud_messages
                 .prepare_message_save_submission(
+                    &writer_binding,
                     vec![input],
                     request_identity,
                     Duration::from_secs(30),
