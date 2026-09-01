@@ -555,6 +555,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_read_authentication_permits_have_no_eight_pass_limit() {
+        let gate = test_gate();
+        let token = gate.pause(115).await.unwrap();
+
+        for _ in 0..16 {
+            let permit = gate
+                .begin_read_authentication(token)
+                .expect("active pause must admit each sequential read");
+            permit
+                .validate()
+                .expect("sequential permit must remain valid");
+            drop(permit);
+            assert_eq!(gate.pause_state().active_read_authentication_scopes, 0);
+        }
+
+        gate.resume(token).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn canceled_read_authentication_future_releases_its_permit() {
         let gate = test_gate();
         let token = gate.pause(113).await.unwrap();
