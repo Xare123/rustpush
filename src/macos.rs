@@ -4,15 +4,18 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
 use open_absinthe::nac::ValidationCtx;
-use plist::{Data, Dictionary, Value};
+#[cfg(target_os = "macos")]
+use plist::Data;
+use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use crate::util::{get_bag, plist_to_buf, IDS_BAG, REQWEST};
 use crate::{
-    activation::ActivationInfo,
-    util::{encode_hex, get_bag, plist_to_buf, IDS_BAG, REQWEST},
-    DebugMeta, OSConfig, PushError, RegisterMeta,
+    activation::ActivationInfo, util::encode_hex, DebugMeta, OSConfig, PushError, RegisterMeta,
 };
 
 pub use open_absinthe::nac::HardwareConfig;
@@ -30,18 +33,21 @@ pub struct MacOSConfig {
     pub udid: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct SessionInfoRequest {
     session_info_request: Data,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct SessionInfoResponse {
     session_info: Data,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 struct CertsResponse {
     cert: Data,
@@ -103,33 +109,41 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        let url = get_bag(IDS_BAG, "id-validation-cert")
-            .await?
-            .into_string()
-            .unwrap();
-        let key = REQWEST.get(url).send().await?;
-        let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
-        let certs: Vec<u8> = response.cert.into();
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(PushError::MacValidationUnavailable);
+        }
 
-        let mut output_req = vec![];
-        let mut ctx = ValidationCtx::new(&certs, &mut output_req, &self.inner)?;
+        #[cfg(target_os = "macos")]
+        {
+            let url = get_bag(IDS_BAG, "id-validation-cert")
+                .await?
+                .into_string()
+                .unwrap();
+            let key = REQWEST.get(url).send().await?;
+            let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
+            let certs: Vec<u8> = response.cert.into();
 
-        let init = SessionInfoRequest {
-            session_info_request: output_req.into(),
-        };
+            let mut output_req = vec![];
+            let mut ctx = ValidationCtx::new(&certs, &mut output_req, &self.inner)?;
 
-        let info = plist_to_buf(&init)?;
-        let url = get_bag(IDS_BAG, "id-initialize-validation")
-            .await?
-            .into_string()
-            .unwrap();
-        let activation = REQWEST.post(url).body(info).send().await?;
+            let init = SessionInfoRequest {
+                session_info_request: output_req.into(),
+            };
 
-        let response: SessionInfoResponse = plist::from_bytes(&activation.bytes().await?)?;
-        let output: Vec<u8> = response.session_info.into();
-        ctx.key_establishment(&output)?;
+            let info = plist_to_buf(&init)?;
+            let url = get_bag(IDS_BAG, "id-initialize-validation")
+                .await?
+                .into_string()
+                .unwrap();
+            let activation = REQWEST.post(url).body(info).send().await?;
 
-        Ok(ctx.sign()?)
+            let response: SessionInfoResponse = plist::from_bytes(&activation.bytes().await?)?;
+            let output: Vec<u8> = response.session_info.into();
+            ctx.key_establishment(&output)?;
+
+            Ok(ctx.sign()?)
+        }
     }
 
     fn get_protocol_version(&self) -> u32 {
@@ -195,5 +209,48 @@ impl OSConfig for MacOSConfig {
             ("u", Value::String(self.device_id.clone().to_uppercase())),
             ("v", Value::String("1".to_string())),
         ])
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    fn synthetic_mac_config() -> MacOSConfig {
+        MacOSConfig {
+            inner: HardwareConfig {
+                product_name: "Macmini9,1".to_owned(),
+                io_mac_address: [0; 6],
+                platform_serial_number: "TESTSERIAL".to_owned(),
+                platform_uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+                root_disk_uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+                board_id: "Mac-TEST".to_owned(),
+                os_build_num: "TEST".to_owned(),
+                platform_serial_number_enc: vec![],
+                platform_uuid_enc: vec![],
+                root_disk_uuid_enc: vec![],
+                rom: vec![],
+                rom_enc: vec![],
+                mlb: "TESTMLB".to_owned(),
+                mlb_enc: vec![],
+            },
+            version: "0.0".to_owned(),
+            protocol_version: 0,
+            device_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+            icloud_ua: "test/0".to_owned(),
+            aoskit_version: "test/0".to_owned(),
+            udid: Some("TEST".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn mac_validation_fails_cleanly_when_provider_is_unavailable() {
+        let error = synthetic_mac_config()
+            .generate_validation_data()
+            .await
+            .expect_err("public non-macOS builds must reject Mac validation");
+
+        assert!(matches!(error, PushError::MacValidationUnavailable));
+        assert!(error.to_string().contains("Use a relay identity"));
     }
 }
