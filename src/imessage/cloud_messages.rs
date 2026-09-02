@@ -33,7 +33,7 @@ use cloudkit_proto::{
     Date, Record, RecordZoneIdentifier,
 };
 use hkdf::Hkdf;
-use log::{info, warn};
+use log::{debug, info, warn};
 use omnisette::AnisetteProvider;
 use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::PKey;
@@ -3080,28 +3080,44 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         expected_record_etag: String,
         file: T,
     ) -> Result<(), PushError> {
+        debug!("Starting closed CloudKit attachment lookup");
         if expected_native_account_identifier.is_empty() || expected_record_etag.is_empty() {
+            warn!("Rejected closed CloudKit attachment lookup at source preflight");
             return Err(PushError::VerificationFailed);
         }
         permit.validate()?;
         if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            warn!("Rejected closed CloudKit attachment lookup at initial account validation");
             return Err(PushError::UnauthorizedAccountError);
         }
+        debug!("Validated closed CloudKit attachment lookup identity");
         let container = self
             .get_cached_container_for_read_authentication(permit)
-            .await?;
+            .await
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup failed at cached container");
+                error
+            })?;
+        debug!("Loaded cached CloudKit attachment container");
         let zone = container.private_zone("attachmentManateeZone".to_string());
         let expected_record_identifier = record_identifier(zone.clone(), &record_id);
         let key = container
             .get_cached_zone_encryption_config_exact(&zone)
-            .await?;
+            .await
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup failed at cached zone key");
+                error
+            })?;
+        debug!("Loaded cached CloudKit attachment zone key");
 
         // Revalidate the non-cloneable pause and exact native account as close
         // as possible to the first remote read.
         permit.validate()?;
         if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            warn!("Rejected closed CloudKit attachment lookup at pre-fetch account validation");
             return Err(PushError::UnauthorizedAccountError);
         }
+        debug!("Starting exact CloudKit attachment record fetch");
         let invoke = container
             .perform_semantic_read_only_operations(
                 &CloudKitSession::new(),
@@ -3111,31 +3127,65 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 )],
                 IsolationLevel::Operation,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup failed during exact record fetch");
+                log::logger().flush();
+                error
+            })?;
         if invoke.len() != 1 {
+            warn!("Rejected closed CloudKit attachment lookup at record cardinality validation");
             return Err(PushError::BadMsg);
         }
-        let fetched = invoke.into_iter().next().ok_or(PushError::BadMsg)??;
+        let fetched = invoke
+            .into_iter()
+            .next()
+            .ok_or(PushError::BadMsg)?
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup returned a record failure");
+                log::logger().flush();
+                error
+            })?;
+        debug!("Fetched exact CloudKit attachment record");
         let records = FetchedRecords::new(&[Ok(fetched)]);
         if records.record_etag(&expected_record_identifier)? != expected_record_etag {
+            warn!("Rejected closed CloudKit attachment lookup at record etag validation");
+            log::logger().flush();
             return Err(PushError::VerificationFailed);
         }
-        let record: CloudAttachment =
-            records.get_record_exact(&expected_record_identifier, Some(&key))?;
+        debug!("Validated exact CloudKit attachment record etag");
+        let record: CloudAttachment = records
+            .get_record_exact(&expected_record_identifier, Some(&key))
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup failed at record decryption");
+                log::logger().flush();
+                error
+            })?;
+        debug!("Decrypted exact CloudKit attachment record");
         // MMCS is another remote read. Do not let it start after a pause or
         // account transition, and reject a transition before reporting
         // completion to the native cache.
         permit.validate()?;
         if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            warn!("Rejected closed CloudKit attachment lookup at pre-MMCS account validation");
             return Err(PushError::UnauthorizedAccountError);
         }
+        debug!("Starting preauthorized MMCS attachment download");
         container
             .get_assets_download_only(&records.assets, vec![(&record.lqa, file)])
-            .await?;
+            .await
+            .map_err(|error| {
+                warn!("Closed CloudKit attachment lookup failed during MMCS download");
+                log::logger().flush();
+                error
+            })?;
+        debug!("Completed preauthorized MMCS attachment download");
         permit.validate()?;
         if self.validated_native_account_identifier().await? != expected_native_account_identifier {
+            warn!("Rejected closed CloudKit attachment lookup at final account validation");
             return Err(PushError::UnauthorizedAccountError);
         }
+        debug!("Completed closed CloudKit attachment lookup");
         Ok(())
     }
 
@@ -3336,6 +3386,18 @@ mod cloud_message_identity_tests {
         assert!(!method.contains("get_container_for_read_authentication(permit)"));
         assert!(method.contains(".get_cached_zone_encryption_config_exact(&zone)"));
         assert!(!method.contains("get_zone_encryption_config_lookup_only"));
+        assert!(method.contains("FetchRecordOperation::new("));
+        assert!(method.contains("&ALL_ASSETS"));
+        assert!(method.contains("expected_record_identifier.clone()"));
+        assert!(method.contains("records.record_etag(&expected_record_identifier)?"));
+        assert!(method.contains("get_assets_download_only"));
+        assert!(method.matches("permit.validate()?").count() >= 4);
+        assert!(
+            method
+                .matches("validated_native_account_identifier().await?")
+                .count()
+                >= 4
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ impl MMCSGetNetworkPolicy {
 fn validate_download_only_chunk_request(request: &HttpRequest) -> Result<(), PushError> {
     let domain = request.domain.as_str();
     if domain.is_empty() || !domain.is_ascii() || domain.len() > 253 {
+        warn!("Rejected preauthorized MMCS request at domain-shape validation");
         return Err(PushError::VerificationFailed);
     }
 
@@ -131,6 +132,7 @@ fn validate_download_only_chunk_request(request: &HttpRequest) -> Result<(), Pus
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         {
+            warn!("Rejected preauthorized MMCS request at domain-label validation");
             return Err(PushError::VerificationFailed);
         }
         final_label = Some(label);
@@ -153,6 +155,7 @@ fn validate_download_only_chunk_request(request: &HttpRequest) -> Result<(), Pus
             .chars()
             .any(|character| character.is_ascii_control() || character == '\\')
     {
+        warn!("Rejected preauthorized MMCS request at closed-GET-shape validation");
         return Err(PushError::VerificationFailed);
     }
 
@@ -161,15 +164,42 @@ fn validate_download_only_chunk_request(request: &HttpRequest) -> Result<(), Pus
     // method-tunnelling, hop-by-hop, authority, and framing control that could
     // change the closed GET request shape.
     if request.headers.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADERS_PER_REQUEST {
+        warn!("Rejected preauthorized MMCS request at header-count validation");
         return Err(PushError::VerificationFailed);
     }
+    let mut saw_redundant_host = false;
     for header in &request.headers {
         if header.name.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADER_NAME_BYTES
             || header.value.len() > MAX_PREAUTHORIZED_DOWNLOAD_HEADER_VALUE_BYTES
-            || download_only_header_changes_request_shape(&header.name)
-            || HeaderName::from_bytes(header.name.as_bytes()).is_err()
+        {
+            warn!("Rejected preauthorized MMCS request at header-size validation");
+            return Err(PushError::VerificationFailed);
+        }
+        // Apple includes a redundant Host header in some preauthorized MMCS
+        // GET descriptors. Never forward that server-supplied authority. It
+        // is admissible only once, only when it exactly names the already
+        // validated URL authority, and reqwest reconstructs it from that URL.
+        if header.name.eq_ignore_ascii_case("host") {
+            let exact_domain = header.value.eq_ignore_ascii_case(domain);
+            let exact_domain_and_port = header
+                .value
+                .strip_suffix(":443")
+                .is_some_and(|host| host.eq_ignore_ascii_case(domain));
+            if saw_redundant_host || (!exact_domain && !exact_domain_and_port) {
+                warn!("Rejected preauthorized MMCS request at header-control validation");
+                return Err(PushError::VerificationFailed);
+            }
+            saw_redundant_host = true;
+            continue;
+        }
+        if download_only_header_changes_request_shape(&header.name) {
+            warn!("Rejected preauthorized MMCS request at header-control validation");
+            return Err(PushError::VerificationFailed);
+        }
+        if HeaderName::from_bytes(header.name.as_bytes()).is_err()
             || HeaderValue::from_str(&header.value).is_err()
         {
+            warn!("Rejected preauthorized MMCS request at header-syntax validation");
             return Err(PushError::VerificationFailed);
         }
     }
@@ -712,6 +742,7 @@ fn validate_preauthorized_download_response(
         || response.references.len() > MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES
         || requested_files.len() > MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES
     {
+        warn!("Rejected preauthorized MMCS response at cardinality validation");
         return Err(PushError::VerificationFailed);
     }
     if requested_files
@@ -722,6 +753,7 @@ fn validate_preauthorized_download_response(
             .iter()
             .any(|reference| reference.file_checksum.len() != 21)
     {
+        warn!("Rejected preauthorized MMCS response at file-checksum-shape validation");
         return Err(PushError::VerificationFailed);
     }
 
@@ -737,6 +769,7 @@ fn validate_preauthorized_download_response(
         if container.chunks.is_empty()
             || container.chunks.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER
         {
+            warn!("Rejected preauthorized MMCS response at container-chunk-count validation");
             return Err(PushError::VerificationFailed);
         }
         total_chunks = total_chunks
@@ -749,6 +782,7 @@ fn validate_preauthorized_download_response(
                 (Some(meta), None) => {
                     fixed_bytes::<21>(&meta.checksum)?;
                     if meta.size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES {
+                        warn!("Rejected preauthorized MMCS response at chunk-size validation");
                         return Err(PushError::VerificationFailed);
                     }
                     validate_preauthorized_container_segment(
@@ -769,6 +803,7 @@ fn validate_preauthorized_download_response(
                 (None, Some(encryption)) => {
                     let encryption_size = u64::from(encryption.size);
                     if encryption_size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES {
+                        warn!("Rejected preauthorized MMCS response at Ford-size validation");
                         return Err(PushError::VerificationFailed);
                     }
                     validate_preauthorized_container_segment(
@@ -788,6 +823,7 @@ fn validate_preauthorized_download_response(
                     fixed_bytes::<21>(&for_chunks.keys_container)?;
                 }
                 _ => {
+                    warn!("Rejected preauthorized MMCS response at chunk-kind validation");
                     return Err(PushError::VerificationFailed);
                 }
             }
@@ -800,6 +836,7 @@ fn validate_preauthorized_download_response(
         if reference.chunk_references.is_empty()
             || reference.chunk_references.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES
         {
+            warn!("Rejected preauthorized MMCS response at chunk-reference-count validation");
             return Err(PushError::VerificationFailed);
         }
         aggregate_chunk_references = aggregate_chunk_references
@@ -811,6 +848,7 @@ fn validate_preauthorized_download_response(
             .iter()
             .position(|(checksum, _)| checksum == &reference.file_checksum)
         else {
+            warn!("Rejected preauthorized MMCS response at requested-file-match validation");
             return Err(PushError::VerificationFailed);
         };
         if matched
@@ -818,6 +856,7 @@ fn validate_preauthorized_download_response(
             .copied()
             .ok_or(PushError::VerificationFailed)?
         {
+            warn!("Rejected preauthorized MMCS response at duplicate-file-reference validation");
             return Err(PushError::VerificationFailed);
         }
         for chunk_reference in &reference.chunk_references {
@@ -832,7 +871,12 @@ fn validate_preauthorized_download_response(
         let requested_key = requested_files
             .get(requested_index)
             .and_then(|(_, key)| key.as_deref());
-        if requested_key.is_some() != reference.ford_reference.is_some() {
+        // CloudKit may carry a protection key on an asset whose current MMCS
+        // response uses only ordinary checksum-authenticated chunks. The
+        // standard reader ignores that unused key. A Ford reference, however,
+        // is never admissible without the exact requested protection key.
+        if reference.ford_reference.is_some() && requested_key.is_none() {
+            warn!("Rejected preauthorized MMCS response at Ford-key-presence validation");
             return Err(PushError::VerificationFailed);
         }
         if let (Some(key), Some(ford_reference)) = (requested_key, &reference.ford_reference) {
@@ -851,6 +895,7 @@ fn validate_preauthorized_download_response(
                 .as_ref()
                 .ok_or(PushError::VerificationFailed)?;
             if fixed_bytes::<21>(&for_chunks.keys_container)? != expected_ford_reference {
+                warn!("Rejected preauthorized MMCS response at Ford-key-binding validation");
                 return Err(PushError::VerificationFailed);
             }
         }
@@ -860,6 +905,7 @@ fn validate_preauthorized_download_response(
     }
 
     if matched.iter().any(|matched| !matched) {
+        warn!("Rejected preauthorized MMCS response at complete-file-match validation");
         return Err(PushError::VerificationFailed);
     }
     Ok(())
@@ -1744,6 +1790,9 @@ async fn transfer_mmcs_download_only_container(
 
     let mut headers = HeaderMap::new();
     for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         let name = HeaderName::from_bytes(header.name.as_bytes())
             .map_err(|_| PushError::VerificationFailed)?;
         let value =
@@ -1868,7 +1917,9 @@ impl ChunkDesc {
                 self.verify_legacy_integrity(&data)?;
                 data
             }
-            ChunkEncryption::TrustedLocal | ChunkEncryption::FordEnvelope => data,
+            ChunkEncryption::TrustedLocal
+            | ChunkEncryption::VerifiedRemotePlaintext
+            | ChunkEncryption::FordEnvelope => data,
         })
     }
 
@@ -1924,6 +1975,10 @@ impl ChunkDesc {
                 data
             }
             ChunkEncryption::TrustedLocal | ChunkEncryption::FordEnvelope => data,
+            // This mode is destination-only. A network source must authenticate
+            // its own V1, V2, or legacy checksum before the matcher exposes
+            // plaintext to a file target.
+            ChunkEncryption::VerifiedRemotePlaintext => return Err(PushError::VerificationFailed),
         })
     }
 }
@@ -1936,6 +1991,10 @@ pub enum ChunkEncryption {
     /// Locally prepared upload plaintext whose target performs the protocol
     /// integrity check before network I/O.
     TrustedLocal,
+    /// Download plaintext already authenticated by the matching remote source.
+    /// File targets must not reinterpret a Ford V2 HMAC identifier as a legacy
+    /// double-SHA identifier and verify it a second time.
+    VerifiedRemotePlaintext,
     /// Encrypted FORD metadata. Its requested key-derived reference is fenced
     /// before transfer and its ciphertext is authenticated by AES-SIV before
     /// any contained chunk keys are used.
@@ -2474,13 +2533,74 @@ async fn get_mmcs_with_network_policy(
             .map(|error| error.reason.clone());
         return Err(PushError::MMCSGetFailed(reason));
     };
+    debug!(
+        "Decoded MMCS authorize-get response (containers={}, references={})",
+        response_data.containers.len(),
+        response_data.references.len()
+    );
 
     if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
         let requested_files = files
             .iter()
             .map(|(checksum, _, _, key)| (checksum.clone(), key.clone()))
             .collect::<Vec<_>>();
-        validate_preauthorized_download_response(response_data, &requested_files)?;
+        let total_chunks = response_data
+            .containers
+            .iter()
+            .map(|container| container.chunks.len())
+            .sum::<usize>();
+        let metadata_chunks = response_data
+            .containers
+            .iter()
+            .flat_map(|container| &container.chunks)
+            .filter(|chunk| chunk.meta.is_some())
+            .count();
+        let encrypted_chunks = response_data
+            .containers
+            .iter()
+            .flat_map(|container| &container.chunks)
+            .filter(|chunk| chunk.encryption.is_some())
+            .count();
+        let total_headers = response_data
+            .containers
+            .iter()
+            .filter_map(|container| container.request.as_ref())
+            .map(|request| request.headers.len())
+            .sum::<usize>();
+        let referenced_chunks = response_data
+            .references
+            .iter()
+            .map(|reference| reference.chunk_references.len())
+            .sum::<usize>();
+        let ford_references = response_data
+            .references
+            .iter()
+            .filter(|reference| reference.ford_reference.is_some())
+            .count();
+        let requested_keys = requested_files
+            .iter()
+            .filter(|(_, key)| key.is_some())
+            .count();
+        debug!(
+            "Inspecting preauthorized MMCS shape (chunks={}, metadata_chunks={}, encrypted_chunks={}, headers={}, referenced_chunks={}, ford_references={}, requested_keys={})",
+            total_chunks,
+            metadata_chunks,
+            encrypted_chunks,
+            total_headers,
+            referenced_chunks,
+            ford_references,
+            requested_keys
+        );
+        if let Err(error) =
+            validate_preauthorized_download_response(response_data, &requested_files)
+        {
+            warn!("Rejected preauthorized MMCS response at decoded-response validation");
+            return Err(error);
+        }
+        debug!(
+            "Validated preauthorized MMCS response (requested_files={})",
+            requested_files.len()
+        );
     }
 
     let mut total_bytes = 0usize;
@@ -2530,7 +2650,12 @@ async fn get_mmcs_with_network_policy(
             target_chunks.push(ChunkDesc {
                 id: fixed_bytes::<21>(&meta.checksum)?,
                 size: usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?,
-                key: ChunkEncryption::None,
+                // `MMCSGetContainer::read_next` authenticates each remote
+                // source chunk according to its actual wire format before the
+                // matcher exposes plaintext. The file target only orders and
+                // writes those verified bytes. Reapplying the legacy checksum
+                // here rejects valid Ford V2 HMAC identifiers.
+                key: ChunkEncryption::VerifiedRemotePlaintext,
                 offset: None,
             });
         }
@@ -2545,6 +2670,11 @@ async fn get_mmcs_with_network_policy(
             .ok_or(PushError::VerificationFailed)?;
         targets.push(ChunkedContainer::new(target_chunks, writer));
     }
+    debug!(
+        "Prepared MMCS download targets (targets={}, ford_containers={})",
+        targets.len(),
+        ford_containers.len()
+    );
 
     if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
         && (targets.len() != files.len() || files.iter().any(|file| file.2.is_some()))
@@ -2649,6 +2779,11 @@ async fn get_mmcs_with_network_policy(
         .into_iter()
         .flatten()
         .collect();
+    debug!(
+        "Prepared MMCS download sources (sources={}, required_chunks={})",
+        sources.len(),
+        required_chunk_ids.len()
+    );
 
     let mut matcher = MMCSMatcher {
         sources,
@@ -2657,6 +2792,7 @@ async fn get_mmcs_with_network_policy(
         total: total_bytes,
     };
     matcher.transfer_chunks(config, progress).await?;
+    debug!("Completed MMCS chunk transfer");
     if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
         && matcher.targets.iter().any(|target| !target.complete())
     {
@@ -2744,7 +2880,15 @@ pub async fn get_mmcs_pre_authorized_download_only(
 ) -> Result<(), PushError> {
     // Preflight before cloning so an oversized or malformed CloudKit body
     // cannot cause a second attacker-sized allocation before Prost sees it.
-    validate_preauthorized_authorization_body(authorization_body)?;
+    debug!(
+        "Validating preauthorized MMCS authorization body (bytes={})",
+        authorization_body.len()
+    );
+    if let Err(error) = validate_preauthorized_authorization_body(authorization_body) {
+        warn!("Rejected preauthorized MMCS response at authorization-body preflight");
+        return Err(error);
+    }
+    debug!("Validated preauthorized MMCS authorization body");
     get_mmcs_with_network_policy(
         config,
         AuthorizedOperation {
@@ -2902,6 +3046,28 @@ mod download_only_tests {
             value: "elsewhere.invalid".to_owned(),
         });
         assert!(validate_download_only_chunk_request(&authority_override).is_err());
+
+        for value in ["cvws.icloud-content.com", "cvws.icloud-content.com:443"] {
+            let mut redundant_authority = chunk_request("GET", "https");
+            redundant_authority.headers.push(Header {
+                name: "Host".to_owned(),
+                value: value.to_owned(),
+            });
+            assert!(validate_download_only_chunk_request(&redundant_authority).is_ok());
+        }
+
+        let mut duplicate_authority = chunk_request("GET", "https");
+        duplicate_authority.headers.extend([
+            Header {
+                name: "Host".to_owned(),
+                value: "cvws.icloud-content.com".to_owned(),
+            },
+            Header {
+                name: "host".to_owned(),
+                value: "cvws.icloud-content.com".to_owned(),
+            },
+        ]);
+        assert!(validate_download_only_chunk_request(&duplicate_authority).is_err());
 
         let mut method_override = chunk_request("GET", "https");
         method_override.headers.push(Header {
@@ -3447,19 +3613,27 @@ mod download_only_tests {
     }
 
     #[test]
-    fn requested_protection_key_requires_exact_ford_reference_parity() {
+    fn requested_protection_key_is_optional_without_ford_reference() {
         let (response_without_ford, mut requested_with_key) = valid_download_response();
         requested_with_key[0].1 = Some(vec![0x55; 32]);
-        assert_verification_failed(validate_preauthorized_download_response(
+        assert!(validate_preauthorized_download_response(
             &response_without_ford,
             &requested_with_key,
-        ));
+        )
+        .is_ok());
 
         let (response_with_ford, requested_with_key) = valid_ford_download_response();
         assert!(
             validate_preauthorized_download_response(&response_with_ford, &requested_with_key,)
                 .is_ok()
         );
+
+        let mut missing_key = requested_with_key.clone();
+        missing_key[0].1 = None;
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response_with_ford,
+            &missing_key,
+        ));
 
         let mut wrong_key = requested_with_key;
         wrong_key[0].1.as_mut().unwrap()[0] ^= 0x01;
@@ -3719,6 +3893,72 @@ mod download_only_tests {
                     .encrypt(b"verified MMCS legacy chunk".to_vec())
                     .unwrap(),
             ),
+        );
+    }
+
+    #[tokio::test]
+    async fn ford_v2_source_authenticates_before_plaintext_target_write() {
+        let plaintext = b"verified MMCS Ford V2 chunk".to_vec();
+        let prepared = prepare_put_v2(
+            FileContainer::new(Cursor::new(plaintext.clone())),
+            &[0x42; 32],
+        )
+        .await
+        .unwrap();
+        let source_desc = prepared.chunk_sigs[0];
+        let ciphertext = source_desc.encrypt(plaintext.clone()).unwrap();
+
+        // A Ford V2 identifier is HMAC-derived and intentionally is not a
+        // legacy double-SHA chunk signature.
+        let legacy_target = ChunkDesc {
+            key: ChunkEncryption::None,
+            ..source_desc
+        };
+        assert_verification_failed(legacy_target.encrypt(plaintext.clone()));
+
+        let mut source = ChunkedContainer::new(
+            vec![ChunkDesc {
+                size: ciphertext.len(),
+                ..source_desc
+            }],
+            FileContainer::new(Cursor::new(ciphertext.clone())),
+        );
+        let mut target = ChunkedContainer::new(
+            vec![ChunkDesc {
+                key: ChunkEncryption::VerifiedRemotePlaintext,
+                ..source_desc
+            }],
+            FileContainer::new(Cursor::new(Vec::new())),
+        );
+        let verified_chunk = source.read_next().await.unwrap();
+        target.write_chunk(&verified_chunk).await.unwrap();
+        assert!(source.complete());
+        assert!(target.complete());
+        assert_eq!(target.container.inner.get_ref(), &plaintext);
+
+        // Destination-only mode must never become a source-side bypass.
+        assert_verification_failed(
+            ChunkDesc {
+                key: ChunkEncryption::VerifiedRemotePlaintext,
+                ..source_desc
+            }
+            .decrypt(plaintext.clone()),
+        );
+
+        let mut corrupted_ciphertext = ciphertext.clone();
+        corrupted_ciphertext[0] ^= 0x01;
+        assert_verification_failed(source_desc.decrypt(corrupted_ciphertext));
+
+        let ChunkEncryption::V2(mut wrong_key, plaintext_len) = source_desc.key else {
+            panic!("Ford fixture did not create a V2 chunk");
+        };
+        wrong_key[1] ^= 0x01;
+        assert_verification_failed(
+            ChunkDesc {
+                key: ChunkEncryption::V2(wrong_key, plaintext_len),
+                ..source_desc
+            }
+            .decrypt(ciphertext),
         );
     }
 
