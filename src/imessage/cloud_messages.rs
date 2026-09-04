@@ -1225,9 +1225,81 @@ pub enum CloudMessagesSaveFailureScope {
     Operation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Native-only proof of exactly which server record a CloudKit save committed.
+///
+/// This preserves the full `RecordIdentifier` Apple returned alongside the
+/// present, nonempty record etag from that same response. Both values stay
+/// inside Rust: the `Debug` implementation redacts them, and this type is
+/// never serialized across the native bridge.
+#[derive(Clone, PartialEq)]
+pub struct CloudMessagesSaveReceipt {
+    record_identifier: RecordIdentifier,
+    etag: String,
+}
+
+impl CloudMessagesSaveReceipt {
+    pub fn record_identifier(&self) -> &RecordIdentifier {
+        &self.record_identifier
+    }
+
+    /// Returns the validated nonempty CloudKit record name.
+    ///
+    /// The constructor below is the only way to create this type, so the
+    /// invariant is internal and callers never need to traverse protobuf
+    /// fields or handle an untrusted optional value.
+    pub fn record_name(&self) -> &str {
+        record_identifier_name(Some(&self.record_identifier))
+            .expect("CloudMessagesSaveReceipt requires a nonempty record name")
+    }
+
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
+
+    /// Returns the validated receipt only when `returned` proves the exact
+    /// submitted record was committed: the full returned identifier must equal
+    /// the submitted identifier (name, type, zone, owner, and environment) and
+    /// the returned record etag must be present and nonempty. Every other
+    /// shape (`None` record, missing/blank etag, identifier mismatch) yields
+    /// `None` so the caller fails closed instead of reporting success.
+    pub(crate) fn validate(
+        submitted: Option<&RecordIdentifier>,
+        returned: Option<&Record>,
+    ) -> Option<Self> {
+        let submitted = submitted?;
+        let returned = returned?;
+        let returned_identifier = returned.record_identifier.as_ref()?;
+        record_identifier_name(Some(submitted))?;
+        record_identifier_name(Some(returned_identifier))?;
+        if returned_identifier != submitted {
+            return None;
+        }
+        let etag = returned
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.trim().is_empty())?;
+        Some(Self {
+            record_identifier: returned_identifier.clone(),
+            etag: etag.to_owned(),
+        })
+    }
+}
+
+impl Debug for CloudMessagesSaveReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudMessagesSaveReceipt")
+            .field("record_identifier", &"[redacted]")
+            .field("etag", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum CloudMessagesSaveResult {
-    Succeeded,
+    /// Apple returned a record whose full identifier exactly matches the
+    /// submitted identifier with a present, nonempty etag. The receipt proves
+    /// the exact server record committed.
+    Succeeded(CloudMessagesSaveReceipt),
     /// The request crossed the remote-submission ambiguity boundary but no
     /// trustworthy per-operation response proved what Apple committed. A
     /// durable caller must reconcile this stable record name and payload; it
@@ -1246,9 +1318,12 @@ pub enum CloudMessagesSaveResult {
 /// Protected reconciliation result for one stable message record name.
 /// Message contents never cross the native bridge; the caller compares them
 /// inside Rust and receives only the disposition and retry classification.
+/// A confirmed find carries the validated native-only save receipt alongside
+/// the decrypted message so unknown-outcome reconciliation can prove the
+/// exact server record without trusting an unvalidated fetch.
 #[derive(Debug)]
 pub enum CloudMessageRecordLookup {
-    Found(CloudMessage),
+    Found(CloudMessage, CloudMessagesSaveReceipt),
     NotFound,
     Unresolved {
         failure_class: Option<CloudKitFailureClass>,
@@ -1271,7 +1346,7 @@ fn is_cloudkit_record_not_found(error: &PushError) -> bool {
         == Some(cloudkit_proto::response_operation::result::error::server::Code::NotFound)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CloudMessagesSaveOutcome {
     pub local_operation_id: String,
     pub apple_operation_uuid: String,
@@ -1381,6 +1456,20 @@ impl<P: AnisetteProvider> CloudMessagesPreparedSaveSubmission<P> {
             .cloned()
             .zip(operation_uuids.iter().cloned())
             .collect::<Vec<_>>();
+        // Capture the exact submitted record identifiers before the operations
+        // are moved into the no-replay primitive. A save is only Succeeded
+        // when Apple's returned record echoes one of these identifiers
+        // exactly with a present, nonempty etag.
+        let submitted_identifiers = operations
+            .iter()
+            .map(|operation| {
+                operation
+                    .0
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.record_identifier.clone())
+            })
+            .collect::<Vec<_>>();
         let response = container
             .perform_operations_detailed_once_with_identity(
                 &session,
@@ -1396,6 +1485,7 @@ impl<P: AnisetteProvider> CloudMessagesPreparedSaveSubmission<P> {
             Ok(response) => redacted_batch_response_outcomes(
                 local_operation_ids,
                 &expected_request_identity,
+                &submitted_identifiers,
                 response,
             ),
             Err(failure) => redacted_request_failure_outcomes(
@@ -1426,6 +1516,7 @@ impl<P: AnisetteProvider> CloudMessagesPreparedSaveSubmission<P> {
 fn redacted_batch_response_outcomes(
     local_operation_ids: Vec<String>,
     expected_request_identity: &CloudKitRequestIdentity,
+    submitted_identifiers: &[Option<RecordIdentifier>],
     response: CloudKitBatchResponse<Option<Record>>,
 ) -> Result<Vec<CloudMessagesSaveOutcome>, CloudMessagesSaveConsumeError> {
     if response.request_identity != *expected_request_identity {
@@ -1435,6 +1526,7 @@ fn redacted_batch_response_outcomes(
     let operation_uuids = expected_request_identity.operation_uuids().to_vec();
     if local_operation_ids.len() != operation_uuids.len()
         || response.outcomes.len() != local_operation_ids.len()
+        || submitted_identifiers.len() != local_operation_ids.len()
     {
         return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
     }
@@ -1462,28 +1554,46 @@ fn redacted_batch_response_outcomes(
                 if outcome.operation_uuid != apple_operation_uuid {
                     return Err(CloudMessagesSaveConsumeError::CorrelationMismatch);
                 }
+                let submitted_identifier = submitted_identifiers
+                    .get(request_index)
+                    .and_then(|identifier| identifier.as_ref());
+                let result = match outcome.result {
+                    Ok(ref returned) => {
+                        match CloudMessagesSaveReceipt::validate(
+                            submitted_identifier,
+                            returned.as_ref(),
+                        ) {
+                            Some(receipt) => CloudMessagesSaveResult::Succeeded(receipt),
+                            None => CloudMessagesSaveResult::UnknownOutcome {
+                                failure_class: Some(CloudKitFailureClass::Unknown),
+                                retry_after: None,
+                            },
+                        }
+                    }
+                    Err(_) => {
+                        if outcome.failure_class.is_none()
+                            || outcome.failure_class == Some(CloudKitFailureClass::Unknown)
+                        {
+                            // An unclassified operation response is not proof of
+                            // rejection. Preserve the stable record mapping and
+                            // force reconciliation rather than replaying it.
+                            CloudMessagesSaveResult::UnknownOutcome {
+                                failure_class: outcome.failure_class,
+                                retry_after: outcome.retry_after,
+                            }
+                        } else {
+                            CloudMessagesSaveResult::Failed {
+                                scope: CloudMessagesSaveFailureScope::Operation,
+                                failure_class: outcome.failure_class,
+                                retry_after: outcome.retry_after,
+                            }
+                        }
+                    }
+                };
                 Ok(CloudMessagesSaveOutcome {
                     local_operation_id,
                     apple_operation_uuid,
-                    result: if outcome.result.is_ok() {
-                        CloudMessagesSaveResult::Succeeded
-                    } else if outcome.failure_class.is_none()
-                        || outcome.failure_class == Some(CloudKitFailureClass::Unknown)
-                    {
-                        // An unclassified operation response is not proof of
-                        // rejection. Preserve the stable record mapping and
-                        // force reconciliation rather than replaying it.
-                        CloudMessagesSaveResult::UnknownOutcome {
-                            failure_class: outcome.failure_class,
-                            retry_after: outcome.retry_after,
-                        }
-                    } else {
-                        CloudMessagesSaveResult::Failed {
-                            scope: CloudMessagesSaveFailureScope::Operation,
-                            failure_class: outcome.failure_class,
-                            retry_after: outcome.retry_after,
-                        }
-                    },
+                    result,
                 })
             },
         )
@@ -1522,7 +1632,10 @@ fn redacted_request_failure_outcomes(
             |(local_operation_id, apple_operation_uuid)| CloudMessagesSaveOutcome {
                 local_operation_id,
                 apple_operation_uuid,
-                result: failure_result,
+                // CloudMessagesSaveResult is intentionally not Copy (a success
+                // carries the validated server receipt), so the shared
+                // request-level result is cloned per outcome.
+                result: failure_result.clone(),
             },
         )
         .collect())
@@ -1640,6 +1753,34 @@ mod cloud_message_save_tests {
 
     fn identity(operation_uuids: &[&str]) -> CloudKitRequestIdentity {
         identity_with_http("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", operation_uuids)
+    }
+
+    fn fixture_full_identifier(name: &str) -> RecordIdentifier {
+        RecordIdentifier {
+            value: Some(cloudkit_proto::Identifier {
+                name: Some(name.to_string()),
+                r#type: Some(cloudkit_proto::identifier::Type::Record as i32),
+            }),
+            zone_identifier: Some(cloudkit_proto::RecordZoneIdentifier {
+                value: Some(cloudkit_proto::Identifier {
+                    name: Some("messageManateeZone".to_string()),
+                    r#type: Some(cloudkit_proto::identifier::Type::RecordZone as i32),
+                }),
+                owner_identifier: Some(cloudkit_proto::Identifier {
+                    name: Some("fixture-owner".to_string()),
+                    r#type: Some(cloudkit_proto::identifier::Type::User as i32),
+                }),
+                environment: None,
+            }),
+        }
+    }
+
+    fn fixture_saved_record(identifier: &RecordIdentifier, etag: Option<&str>) -> Record {
+        Record {
+            etag: etag.map(ToOwned::to_owned),
+            record_identifier: Some(identifier.clone()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1766,13 +1907,15 @@ mod cloud_message_save_tests {
     fn save_outcomes_follow_request_index_and_reject_mismatches() {
         let operation_a = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB".to_string();
         let operation_b = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC".to_string();
+        let submitted_a = fixture_full_identifier("fixture-record-a");
+        let submitted_b = fixture_full_identifier("fixture-record-b");
         let response = CloudKitBatchResponse {
             request_identity: identity(&[operation_a.as_str(), operation_b.as_str()]),
             outcomes: vec![
                 CloudKitOperationOutcome {
                     request_index: 1,
                     operation_uuid: operation_b.clone(),
-                    result: Ok(None),
+                    result: Ok(Some(fixture_saved_record(&submitted_b, Some("etag-b")))),
                     retry_after: None,
                     failure_class: None,
                 },
@@ -1789,6 +1932,7 @@ mod cloud_message_save_tests {
         let outcomes = redacted_batch_response_outcomes(
             vec!["local-a".to_string(), "local-b".to_string()],
             &identity(&[operation_a.as_str(), operation_b.as_str()]),
+            &[Some(submitted_a), Some(submitted_b.clone())],
             response,
         )
         .unwrap();
@@ -1803,10 +1947,11 @@ mod cloud_message_save_tests {
             }
         ));
         assert_eq!(outcomes[1].local_operation_id, "local-b");
-        assert!(matches!(
-            outcomes[1].result,
-            CloudMessagesSaveResult::Succeeded
-        ));
+        let CloudMessagesSaveResult::Succeeded(receipt) = &outcomes[1].result else {
+            panic!("validated save response must be Succeeded");
+        };
+        assert_eq!(receipt.etag(), "etag-b");
+        assert_eq!(receipt.record_identifier(), &submitted_b);
 
         let mismatched = CloudKitBatchResponse {
             request_identity: identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
@@ -1816,6 +1961,7 @@ mod cloud_message_save_tests {
             redacted_batch_response_outcomes(
                 vec!["local-a".to_string()],
                 &identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
+                &[],
                 mismatched,
             ),
             Err(CloudMessagesSaveConsumeError::CorrelationMismatch)
@@ -1838,6 +1984,7 @@ mod cloud_message_save_tests {
             redacted_batch_response_outcomes(
                 vec!["local-a".to_string()],
                 &identity(&["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]),
+                &[],
                 wrong_request_identity,
             ),
             Err(CloudMessagesSaveConsumeError::CorrelationMismatch)
@@ -1861,6 +2008,7 @@ mod cloud_message_save_tests {
             let outcomes = redacted_batch_response_outcomes(
                 vec!["local-a".to_owned()],
                 &identity(&[operation_uuid]),
+                &[Some(fixture_full_identifier("fixture-record"))],
                 response,
             )
             .expect("unclassified response should retain correlation");
@@ -1934,6 +2082,178 @@ mod cloud_message_save_tests {
                 ..
             }
         ));
+    }
+
+    fn save_outcome_for_returned(
+        submitted: &RecordIdentifier,
+        returned: Option<Record>,
+    ) -> CloudMessagesSaveOutcome {
+        let operation_uuid = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB";
+        let response = CloudKitBatchResponse {
+            request_identity: identity(&[operation_uuid]),
+            outcomes: vec![CloudKitOperationOutcome {
+                request_index: 0,
+                operation_uuid: operation_uuid.to_owned(),
+                result: Ok(returned),
+                retry_after: None,
+                failure_class: None,
+            }],
+        };
+        redacted_batch_response_outcomes(
+            vec!["local-a".to_owned()],
+            &identity(&[operation_uuid]),
+            &[Some(submitted.clone())],
+            response,
+        )
+        .expect("correlated save response should retain correlation")
+        .into_iter()
+        .next()
+        .expect("correlated save response should yield one outcome")
+    }
+
+    #[test]
+    fn save_receipt_validates_exact_identifier_and_nonempty_etag() {
+        let submitted = fixture_full_identifier("fixture-record");
+        let outcome = save_outcome_for_returned(
+            &submitted,
+            Some(fixture_saved_record(&submitted, Some("fixture-etag"))),
+        );
+        let CloudMessagesSaveResult::Succeeded(receipt) = &outcome.result else {
+            panic!("validated save response must be Succeeded");
+        };
+        assert_eq!(receipt.etag(), "fixture-etag");
+        assert_eq!(receipt.record_name(), "fixture-record");
+        assert_eq!(receipt.record_identifier(), &submitted);
+    }
+
+    #[test]
+    fn save_receipt_rejects_missing_or_empty_record_name() {
+        for name in [None, Some(String::new())] {
+            let mut identifier = fixture_full_identifier("fixture-record");
+            identifier
+                .value
+                .as_mut()
+                .expect("fixture identifier value must be present")
+                .name = name;
+            let returned = fixture_saved_record(&identifier, Some("fixture-etag"));
+            assert!(
+                CloudMessagesSaveReceipt::validate(Some(&identifier), Some(&returned)).is_none(),
+                "missing or empty record names must fail closed",
+            );
+        }
+    }
+
+    #[test]
+    fn save_without_proven_record_fails_closed_as_unknown() {
+        let submitted = fixture_full_identifier("fixture-record");
+        let mut zone_mismatch = submitted.clone();
+        zone_mismatch
+            .zone_identifier
+            .as_mut()
+            .expect("fixture zone must be present")
+            .value
+            .as_mut()
+            .expect("fixture zone name must be present")
+            .name = Some("other-zone".to_owned());
+        let mut owner_mismatch = submitted.clone();
+        owner_mismatch
+            .zone_identifier
+            .as_mut()
+            .expect("fixture zone must be present")
+            .owner_identifier
+            .as_mut()
+            .expect("fixture zone owner must be present")
+            .name = Some("other-owner".to_owned());
+        let mut type_mismatch = submitted.clone();
+        type_mismatch
+            .value
+            .as_mut()
+            .expect("fixture identifier value must be present")
+            .r#type = Some(cloudkit_proto::identifier::Type::Device as i32);
+        let cases: Vec<(&str, Option<Record>)> = vec![
+            ("none", None),
+            ("missing-etag", Some(fixture_saved_record(&submitted, None))),
+            (
+                "empty-etag",
+                Some(fixture_saved_record(&submitted, Some(""))),
+            ),
+            (
+                "blank-etag",
+                Some(fixture_saved_record(&submitted, Some("   "))),
+            ),
+            (
+                "record-name-mismatch",
+                Some(fixture_saved_record(
+                    &fixture_full_identifier("other-record"),
+                    Some("fixture-etag"),
+                )),
+            ),
+            (
+                "zone-mismatch",
+                Some(fixture_saved_record(&zone_mismatch, Some("fixture-etag"))),
+            ),
+            (
+                "owner-mismatch",
+                Some(fixture_saved_record(&owner_mismatch, Some("fixture-etag"))),
+            ),
+            (
+                "identifier-type-mismatch",
+                Some(fixture_saved_record(&type_mismatch, Some("fixture-etag"))),
+            ),
+        ];
+        for (label, returned) in cases {
+            let outcome = save_outcome_for_returned(&submitted, returned);
+            assert!(
+                matches!(
+                    outcome.result,
+                    CloudMessagesSaveResult::UnknownOutcome {
+                        failure_class: Some(CloudKitFailureClass::Unknown),
+                        retry_after: None,
+                    }
+                ),
+                "case {label} must fail closed as UnknownOutcome",
+            );
+        }
+    }
+
+    #[test]
+    fn save_receipt_debug_redacts_raw_values() {
+        let submitted = fixture_full_identifier("super-secret-record");
+        let receipt = CloudMessagesSaveReceipt::validate(
+            Some(&submitted),
+            Some(&fixture_saved_record(&submitted, Some("super-secret-etag"))),
+        )
+        .expect("fixture save response must validate");
+        let rendered = format!("{receipt:?}");
+        assert!(rendered.contains("CloudMessagesSaveReceipt"));
+        assert!(
+            !rendered.contains("super-secret-record"),
+            "redacted Debug must not leak the record identifier: {rendered}",
+        );
+        assert!(
+            !rendered.contains("super-secret-etag"),
+            "redacted Debug must not leak the etag: {rendered}",
+        );
+    }
+
+    #[test]
+    fn lookup_found_preserves_validated_receipt() {
+        let expected = fixture_full_identifier("fixture-record");
+        let raw = fixture_saved_record(&expected, Some("lookup-etag"));
+        let receipt = CloudMessagesSaveReceipt::validate(Some(&expected), Some(&raw))
+            .expect("fixture lookup response must validate");
+        let lookup = CloudMessageRecordLookup::Found(CloudMessage::default(), receipt);
+        let CloudMessageRecordLookup::Found(_, preserved) = &lookup else {
+            panic!("validated lookup must be a confirmed find");
+        };
+        assert_eq!(preserved.etag(), "lookup-etag");
+        assert_eq!(preserved.record_identifier(), &expected);
+        assert!(CloudMessagesSaveReceipt::validate(Some(&expected), None).is_none());
+        assert!(CloudMessagesSaveReceipt::validate(
+            Some(&expected),
+            Some(&fixture_saved_record(&expected, None)),
+        )
+        .is_none());
     }
 }
 
@@ -2375,8 +2695,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         match outcome.result {
             Ok(record) => {
                 record.verify_identifier(&expected_record_identifier)?;
+                // A confirmed find must also prove etag freshness: the
+                // validated native-only receipt binds the exact returned
+                // identifier to its present, nonempty etag. Anything less
+                // stays unresolved so reconciliation retries instead of
+                // trusting an unproven fetch.
+                let raw_record = record.get_raw_record()?;
+                let Some(receipt) = CloudMessagesSaveReceipt::validate(
+                    Some(&expected_record_identifier),
+                    Some(raw_record),
+                ) else {
+                    return Ok(CloudMessageRecordLookup::Unresolved {
+                        failure_class: Some(CloudKitFailureClass::Unknown),
+                        retry_after: None,
+                    });
+                };
                 Ok(CloudMessageRecordLookup::Found(
                     record.get_record(Some(&key))?,
+                    receipt,
                 ))
             }
             Err(error) if is_cloudkit_record_not_found(&error) => {
