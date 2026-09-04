@@ -234,6 +234,55 @@ fn mme_delegate_is_warm(delegate_present: bool, refreshed: SystemTime, now: Syst
             .unwrap_or(false)
 }
 
+fn storage_quota_url(delegate: Option<&MobileMeDelegateResponse>) -> Result<String, PushError> {
+    let delegate = delegate.ok_or(PushError::TokenMissing)?;
+    let url = delegate
+        .config
+        .get("com.apple.Dataclass.Quota")
+        .and_then(|value| value.as_dictionary())
+        .and_then(|quota| quota.get("storageInfoURL"))
+        .and_then(|value| value.as_string())
+        .filter(|url| !url.trim().is_empty())
+        .ok_or(PushError::BagKeyNotFound)?;
+    Ok(url.trim().to_string())
+}
+
+fn storage_account_identifiers(spd: Option<&Value>) -> Result<(String, String), PushError> {
+    let spd = spd.ok_or(PushError::TokenMissing)?;
+    let dsid = spd
+        .get("DsPrsId")
+        .and_then(|value| {
+            value.as_unsigned_integer().or_else(|| {
+                value
+                    .as_signed_integer()
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+        })
+        .filter(|value| *value != 0)
+        .ok_or(PushError::BagKeyNotFound)?;
+    let adsid = spd
+        .get("adsid")
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(PushError::BagKeyNotFound)?;
+    Ok((dsid.to_string(), adsid.trim().to_owned()))
+}
+
+fn storage_anisette_headers(headers: &HashMap<String, String>) -> Result<HeaderMap, PushError> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name = HeaderName::from_str(name.as_str()).map_err(|_| {
+                PushError::KeyedArchiveError("invalid anisette header name".to_string())
+            })?;
+            let value: HeaderValue = value.parse().map_err(|_| {
+                PushError::KeyedArchiveError("invalid anisette header value".to_string())
+            })?;
+            Ok((name, value))
+        })
+        .collect()
+}
+
 #[derive(Deserialize, Debug)]
 pub struct StorageInfoBytes {
     pub total_storage: u64,
@@ -371,54 +420,21 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
         let token = self.get_mme_token("mmeAuthToken").await?;
 
-        let quota_url = self
-            .mme_delegate
-            .lock()
-            .await
-            .as_ref()
-            .expect("no MMe?")
-            .config
-            .get("com.apple.Dataclass.Quota")
-            .expect("No Quota?")
-            .as_dictionary()
-            .unwrap()
-            .get("storageInfoURL")
-            .expect("no storage info url?")
-            .as_string()
-            .unwrap()
-            .to_string();
+        let quota_url = {
+            let delegate = self.mme_delegate.lock().await;
+            storage_quota_url(delegate.as_ref())?
+        };
 
-        let account = self.account.lock().await;
-        let dsid = account
-            .spd
-            .as_ref()
-            .unwrap()
-            .get("DsPrsId")
-            .expect("no dsid???s")
-            .as_unsigned_integer()
-            .unwrap()
-            .to_string();
-        let adsid = account
-            .spd
-            .as_ref()
-            .unwrap()
-            .get("adsid")
-            .expect("No adsid!")
-            .as_string()
-            .unwrap()
-            .to_string();
+        let (dsid, adsid, anisette) = {
+            let account = self.account.lock().await;
+            let (dsid, adsid) = storage_account_identifiers(account.spd.as_ref())?;
+            (dsid, adsid, account.anisette.clone())
+        };
 
-        let anisette = account.anisette.clone();
-        drop(account);
-
-        let anisette_headers: HeaderMap = anisette
-            .lock()
-            .await
-            .get_headers()
-            .await?
-            .into_iter()
-            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
-            .collect();
+        let anisette_headers = {
+            let headers = anisette.lock().await.get_headers().await?.clone();
+            storage_anisette_headers(&headers)?
+        };
 
         let data = REQWEST
             .get(quota_url)
@@ -644,9 +660,11 @@ fn cloudkit_read_authentication_material(
 #[cfg(test)]
 mod token_provider_tests {
     use super::{
-        cloudkit_read_authentication_material, mme_delegate_is_warm,
-        CloudKitReadAuthenticationLease, MobileMeDelegateResponse, PushError, MME_DELEGATE_MAX_AGE,
+        cloudkit_read_authentication_material, mme_delegate_is_warm, storage_account_identifiers,
+        storage_anisette_headers, storage_quota_url, CloudKitReadAuthenticationLease,
+        MobileMeDelegateResponse, PushError, MME_DELEGATE_MAX_AGE,
     };
+    use plist::{Dictionary, Value};
     use std::{
         collections::HashMap,
         time::{Duration, SystemTime},
@@ -735,6 +753,165 @@ mod token_provider_tests {
             ),
             Err(PushError::CloudKitWarmAuthenticationRequired)
         ));
+    }
+
+    fn quota_delegate_with_url(url: Option<Value>) -> MobileMeDelegateResponse {
+        let mut quota = Dictionary::new();
+        if let Some(url) = url {
+            quota.insert("storageInfoURL".to_string(), url);
+        }
+        let mut config = Dictionary::new();
+        config.insert(
+            "com.apple.Dataclass.Quota".to_string(),
+            Value::Dictionary(quota),
+        );
+        MobileMeDelegateResponse {
+            tokens: HashMap::new(),
+            config,
+        }
+    }
+
+    #[test]
+    fn storage_quota_url_accepts_only_a_nonempty_string_url() {
+        assert!(matches!(
+            storage_quota_url(None),
+            Err(PushError::TokenMissing)
+        ));
+        assert!(matches!(
+            storage_quota_url(Some(&MobileMeDelegateResponse {
+                tokens: HashMap::new(),
+                config: Dictionary::new(),
+            })),
+            Err(PushError::BagKeyNotFound)
+        ));
+        assert!(matches!(
+            storage_quota_url(Some(&quota_delegate_with_url(None))),
+            Err(PushError::BagKeyNotFound)
+        ));
+        assert!(matches!(
+            storage_quota_url(Some(&quota_delegate_with_url(Some(Value::from(123u64))))),
+            Err(PushError::BagKeyNotFound)
+        ));
+        assert!(matches!(
+            storage_quota_url(Some(&quota_delegate_with_url(Some(Value::String(
+                "   ".to_string()
+            ))))),
+            Err(PushError::BagKeyNotFound)
+        ));
+        let delegate =
+            quota_delegate_with_url(Some(Value::String("https://example.com/quota".to_string())));
+        assert_eq!(
+            storage_quota_url(Some(&delegate)).expect("valid quota url"),
+            "https://example.com/quota"
+        );
+        let padded = quota_delegate_with_url(Some(Value::String(
+            "  https://example.com/quota  ".to_string(),
+        )));
+        assert_eq!(
+            storage_quota_url(Some(&padded)).expect("trimmed quota url"),
+            "https://example.com/quota"
+        );
+    }
+
+    #[test]
+    fn storage_account_identifiers_rejects_missing_or_malformed_spd() {
+        assert!(matches!(
+            storage_account_identifiers(None),
+            Err(PushError::TokenMissing)
+        ));
+        let empty = Value::Dictionary(Dictionary::new());
+        assert!(matches!(
+            storage_account_identifiers(Some(&empty)),
+            Err(PushError::BagKeyNotFound)
+        ));
+        let zero_dsid = Value::Dictionary(Dictionary::from_iter(
+            [
+                ("DsPrsId".to_string(), Value::from(0u64)),
+                ("adsid".to_string(), Value::String("a".to_string())),
+            ]
+            .into_iter(),
+        ));
+        assert!(matches!(
+            storage_account_identifiers(Some(&zero_dsid)),
+            Err(PushError::BagKeyNotFound)
+        ));
+        let wrong_dsid_type = Value::Dictionary(Dictionary::from_iter(
+            [
+                ("DsPrsId".to_string(), Value::String("123".to_string())),
+                ("adsid".to_string(), Value::String("a".to_string())),
+            ]
+            .into_iter(),
+        ));
+        assert!(matches!(
+            storage_account_identifiers(Some(&wrong_dsid_type)),
+            Err(PushError::BagKeyNotFound)
+        ));
+        let blank_adsid = Value::Dictionary(Dictionary::from_iter(
+            [
+                ("DsPrsId".to_string(), Value::from(12345u64)),
+                ("adsid".to_string(), Value::String("   ".to_string())),
+            ]
+            .into_iter(),
+        ));
+        assert!(matches!(
+            storage_account_identifiers(Some(&blank_adsid)),
+            Err(PushError::BagKeyNotFound)
+        ));
+        let signed_dsid = Value::Dictionary(Dictionary::from_iter(
+            [
+                ("DsPrsId".to_string(), Value::Integer(12345i64.into())),
+                ("adsid".to_string(), Value::String(" abc ".to_string())),
+            ]
+            .into_iter(),
+        ));
+        assert_eq!(
+            storage_account_identifiers(Some(&signed_dsid)).expect("signed positive dsid"),
+            ("12345".to_string(), "abc".to_string())
+        );
+        let valid = Value::Dictionary(Dictionary::from_iter(
+            [
+                ("DsPrsId".to_string(), Value::from(12345u64)),
+                ("adsid".to_string(), Value::String("abc".to_string())),
+            ]
+            .into_iter(),
+        ));
+        assert_eq!(
+            storage_account_identifiers(Some(&valid)).expect("valid identifiers"),
+            ("12345".to_string(), "abc".to_string())
+        );
+    }
+
+    #[test]
+    fn storage_anisette_headers_rejects_invalid_names_and_values() {
+        let valid = HashMap::from([("X-Apple-Test".to_string(), "ok".to_string())]);
+        let headers = storage_anisette_headers(&valid).expect("valid headers");
+        assert_eq!(
+            headers
+                .get("X-Apple-Test")
+                .expect("header present")
+                .to_str()
+                .expect("header value is visible ASCII"),
+            "ok"
+        );
+        let bad_name = HashMap::from([("not a valid header name".to_string(), "ok".to_string())]);
+        assert!(matches!(
+            storage_anisette_headers(&bad_name),
+            Err(PushError::KeyedArchiveError(_))
+        ));
+        let bad_value = HashMap::from([("X-Apple-Test".to_string(), "bad\nvalue".to_string())]);
+        assert!(matches!(
+            storage_anisette_headers(&bad_value),
+            Err(PushError::KeyedArchiveError(_))
+        ));
+
+        let bad_name_error = storage_anisette_headers(&bad_name)
+            .expect_err("invalid header name must fail")
+            .to_string();
+        assert!(!bad_name_error.contains("not a valid header name"));
+        let bad_value_error = storage_anisette_headers(&bad_value)
+            .expect_err("invalid header value must fail")
+            .to_string();
+        assert!(!bad_value_error.contains("bad"));
     }
 }
 
