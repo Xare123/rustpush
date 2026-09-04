@@ -247,7 +247,7 @@ fn storage_quota_url(delegate: Option<&MobileMeDelegateResponse>) -> Result<Stri
     Ok(url.trim().to_string())
 }
 
-fn storage_account_identifiers(spd: Option<&Value>) -> Result<(String, String), PushError> {
+fn storage_account_identifiers(spd: Option<&Dictionary>) -> Result<(String, String), PushError> {
     let spd = spd.ok_or(PushError::TokenMissing)?;
     let dsid = spd
         .get("DsPrsId")
@@ -819,62 +819,62 @@ mod token_provider_tests {
             storage_account_identifiers(None),
             Err(PushError::TokenMissing)
         ));
-        let empty = Value::Dictionary(Dictionary::new());
+        let empty = Dictionary::new();
         assert!(matches!(
             storage_account_identifiers(Some(&empty)),
             Err(PushError::BagKeyNotFound)
         ));
-        let zero_dsid = Value::Dictionary(Dictionary::from_iter(
+        let zero_dsid = Dictionary::from_iter(
             [
                 ("DsPrsId".to_string(), Value::from(0u64)),
                 ("adsid".to_string(), Value::String("a".to_string())),
             ]
             .into_iter(),
-        ));
+        );
         assert!(matches!(
             storage_account_identifiers(Some(&zero_dsid)),
             Err(PushError::BagKeyNotFound)
         ));
-        let wrong_dsid_type = Value::Dictionary(Dictionary::from_iter(
+        let wrong_dsid_type = Dictionary::from_iter(
             [
                 ("DsPrsId".to_string(), Value::String("123".to_string())),
                 ("adsid".to_string(), Value::String("a".to_string())),
             ]
             .into_iter(),
-        ));
+        );
         assert!(matches!(
             storage_account_identifiers(Some(&wrong_dsid_type)),
             Err(PushError::BagKeyNotFound)
         ));
-        let blank_adsid = Value::Dictionary(Dictionary::from_iter(
+        let blank_adsid = Dictionary::from_iter(
             [
                 ("DsPrsId".to_string(), Value::from(12345u64)),
                 ("adsid".to_string(), Value::String("   ".to_string())),
             ]
             .into_iter(),
-        ));
+        );
         assert!(matches!(
             storage_account_identifiers(Some(&blank_adsid)),
             Err(PushError::BagKeyNotFound)
         ));
-        let signed_dsid = Value::Dictionary(Dictionary::from_iter(
+        let signed_dsid = Dictionary::from_iter(
             [
                 ("DsPrsId".to_string(), Value::Integer(12345i64.into())),
                 ("adsid".to_string(), Value::String(" abc ".to_string())),
             ]
             .into_iter(),
-        ));
+        );
         assert_eq!(
             storage_account_identifiers(Some(&signed_dsid)).expect("signed positive dsid"),
             ("12345".to_string(), "abc".to_string())
         );
-        let valid = Value::Dictionary(Dictionary::from_iter(
+        let valid = Dictionary::from_iter(
             [
                 ("DsPrsId".to_string(), Value::from(12345u64)),
                 ("adsid".to_string(), Value::String("abc".to_string())),
             ]
             .into_iter(),
-        ));
+        );
         assert_eq!(
             storage_account_identifiers(Some(&valid)).expect("valid identifiers"),
             ("12345".to_string(), "abc".to_string())
