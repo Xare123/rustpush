@@ -844,21 +844,6 @@ fn validate_preauthorized_download_response(
             .and_then(|count| count.checked_add(usize::from(reference.ford_reference.is_some())))
             .filter(|count| *count <= MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES)
             .ok_or(PushError::VerificationFailed)?;
-        let Some(requested_index) = requested_files
-            .iter()
-            .position(|(checksum, _)| checksum == &reference.file_checksum)
-        else {
-            warn!("Rejected preauthorized MMCS response at requested-file-match validation");
-            return Err(PushError::VerificationFailed);
-        };
-        if matched
-            .get(requested_index)
-            .copied()
-            .ok_or(PushError::VerificationFailed)?
-        {
-            warn!("Rejected preauthorized MMCS response at duplicate-file-reference validation");
-            return Err(PushError::VerificationFailed);
-        }
         for chunk_reference in &reference.chunk_references {
             let chunk = response_chunk(
                 &response.containers,
@@ -867,6 +852,42 @@ fn validate_preauthorized_download_response(
             )?;
             let meta = chunk.meta.as_ref().ok_or(PushError::VerificationFailed)?;
             fixed_bytes::<21>(&meta.checksum)?;
+        }
+        if let Some(ford_reference) = &reference.ford_reference {
+            let chunk = response_chunk(
+                &response.containers,
+                ford_reference.container_index,
+                ford_reference.chunk_index,
+            )?;
+            let encryption = chunk
+                .encryption
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            let for_chunks = encryption
+                .for_chunks
+                .as_ref()
+                .ok_or(PushError::VerificationFailed)?;
+            fixed_bytes::<21>(&for_chunks.container)?;
+            fixed_bytes::<21>(&for_chunks.keys_container)?;
+        }
+        let Some(requested_index) = requested_files
+            .iter()
+            .position(|(checksum, _)| checksum == &reference.file_checksum)
+        else {
+            // CloudKit can bundle authorization references for sibling assets
+            // in the same response. They remain fully shape-validated above,
+            // but the download-only matcher later selects chunks solely for
+            // the explicitly requested checksum. Requiring every bundled
+            // reference to be requested rejected valid multi-asset responses.
+            continue;
+        };
+        if matched
+            .get(requested_index)
+            .copied()
+            .ok_or(PushError::VerificationFailed)?
+        {
+            warn!("Rejected preauthorized MMCS response at duplicate-file-reference validation");
+            return Err(PushError::VerificationFailed);
         }
         let requested_key = requested_files
             .get(requested_index)
@@ -3778,6 +3799,41 @@ mod download_only_tests {
         assert_verification_failed(validate_preauthorized_download_response(
             &mismatched_target,
             &requested,
+        ));
+    }
+
+    #[test]
+    fn extra_bundled_file_reference_is_ignored_when_requested_file_is_present() {
+        let (mut response, requested) = valid_download_response();
+        let mut sibling = response.references[0].clone();
+        sibling.file_checksum = vec![0x99; 21];
+        response.containers[0].chunks.push(ChunkWrapper {
+            meta: Some(ChunkMeta {
+                checksum: vec![0x44; 21],
+                size: 8,
+                offset: 16,
+                ..Default::default()
+            }),
+            encryption: None,
+        });
+        sibling.chunk_references = vec![chunk_reference(0, 1)];
+        // Put the unrequested sibling first to pin the live CloudKit ordering
+        // that previously failed before reaching the requested reference.
+        response.references.insert(0, sibling);
+
+        assert!(validate_preauthorized_download_response(&response, &requested).is_ok());
+    }
+
+    #[test]
+    fn malformed_bundled_sibling_ford_reference_is_rejected() {
+        let (mut response, requested) = valid_download_response();
+        let mut sibling = response.references[0].clone();
+        sibling.file_checksum = vec![0x99; 21];
+        sibling.ford_reference = Some(chunk_reference(99, 0));
+        response.references.insert(0, sibling);
+
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response, &requested,
         ));
     }
 
