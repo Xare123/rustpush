@@ -964,7 +964,7 @@ fn preauthorized_asset_evidence(
     let match_count = usize::from(first.is_some()) + matches.count();
     // Ambiguous/malformed references remain unavailable, not false matches.
     let reference = first.filter(|_| match_count == 1);
-    let keys_container = reference
+    let for_chunks = reference
         .and_then(|reference| reference.ford_reference.as_ref())
         .and_then(|ford| {
             response
@@ -973,12 +973,13 @@ fn preauthorized_asset_evidence(
                 .and_then(|container| container.chunks.get(ford.chunk_index as usize))
         })
         .and_then(|chunk| chunk.encryption.as_ref())
-        .and_then(|encryption| encryption.for_chunks.as_ref())
-        .map(|chunks| chunks.keys_container.as_slice());
+        .and_then(|encryption| encryption.for_chunks.as_ref());
+    let keys_container = for_chunks.map(|chunks| chunks.keys_container.as_slice());
+    let container = for_chunks.map(|chunks| chunks.container.as_slice());
     let reference_signature = asset.reference_signature.as_deref();
     let derived = key.and_then(|key| ford_key_signature(key).ok());
     format!(
-        "CloudKit attachment evidence asset_bytes={:?} validation_ok={} file_matches={} selected_chunks={:?} ford_present={:?} key_len={:?} reference_signature_len={:?} keys_container_len={:?} keys_match_reference={:?} reference_matches_derived={:?} keys_match_derived={:?}",
+        "CloudKit attachment evidence asset_bytes={:?} validation_ok={} file_matches={} selected_chunks={:?} ford_present={:?} key_len={:?} reference_signature_len={:?} keys_container_len={:?} keys_match_reference={:?} reference_matches_derived={:?} keys_match_derived={:?} container_len={:?} container_matches_reference={:?} container_matches_derived={:?} container_matches_keys={:?}",
         asset.size,
         validation_ok,
         match_count,
@@ -990,6 +991,10 @@ fn preauthorized_asset_evidence(
         keys_container.zip(reference_signature).map(|(a, b)| a == b),
         reference_signature.zip(derived.as_ref()).map(|(a, b)| a == b.as_slice()),
         keys_container.zip(derived.as_ref()).map(|(a, b)| a == b.as_slice()),
+        container.map(<[u8]>::len),
+        container.zip(reference_signature).map(|(a, b)| a == b),
+        container.zip(derived.as_ref()).map(|(a, b)| a == b.as_slice()),
+        container.zip(keys_container).map(|(a, b)| a == b),
     )
 }
 
@@ -3089,7 +3094,7 @@ mod download_only_tests {
             false,
         );
         assert_eq!(diagnostic,
-            "CloudKit attachment evidence asset_bytes=Some(123) validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(true) key_len=Some(32) reference_signature_len=Some(21) keys_container_len=Some(21) keys_match_reference=Some(true) reference_matches_derived=Some(false) keys_match_derived=Some(false)");
+            "CloudKit attachment evidence asset_bytes=Some(123) validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(true) key_len=Some(32) reference_signature_len=Some(21) keys_container_len=Some(21) keys_match_reference=Some(true) reference_matches_derived=Some(false) keys_match_derived=Some(false) container_len=Some(21) container_matches_reference=Some(true) container_matches_derived=Some(false) container_matches_keys=Some(true)");
         // Observing the authenticated reference must not turn rejection into acceptance.
         assert_verification_failed(validate_preauthorized_download_response(
             &response, &requested,
@@ -3115,7 +3120,7 @@ mod download_only_tests {
             false,
         );
         assert_eq!(diagnostic,
-            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(false) key_len=Some(27) reference_signature_len=Some(27) keys_container_len=None keys_match_reference=None reference_matches_derived=Some(false) keys_match_derived=None");
+            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(false) key_len=Some(27) reference_signature_len=Some(27) keys_container_len=None keys_match_reference=None reference_matches_derived=Some(false) keys_match_derived=None container_len=None container_matches_reference=None container_matches_derived=None container_matches_keys=None");
         let missing = preauthorized_asset_evidence(
             &response,
             &[],
@@ -3127,7 +3132,7 @@ mod download_only_tests {
             false,
         );
         assert_eq!(missing,
-            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=0 selected_chunks=None ford_present=None key_len=None reference_signature_len=None keys_container_len=None keys_match_reference=None reference_matches_derived=None keys_match_derived=None");
+            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=0 selected_chunks=None ford_present=None key_len=None reference_signature_len=None keys_container_len=None keys_match_reference=None reference_matches_derived=None keys_match_derived=None container_len=None container_matches_reference=None container_matches_derived=None container_matches_keys=None");
     }
 
     #[test]
@@ -3150,6 +3155,24 @@ mod download_only_tests {
             false,
         );
         assert!(diagnostic.contains("keys_container_len=None keys_match_reference=None"));
+        let unavailable = "container_len=None container_matches_reference=None container_matches_derived=None container_matches_keys=None";
+        assert!(diagnostic.ends_with(unavailable));
+        let ford = response.references[0].ford_reference.as_mut().unwrap();
+        ford.container_index = 0;
+        ford.chunk_index = u32::MAX;
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            false,
+        );
+        assert!(diagnostic.ends_with(unavailable));
+        response.references[0]
+            .ford_reference
+            .as_mut()
+            .unwrap()
+            .chunk_index = 1;
         response.references.push(response.references[0].clone());
         let diagnostic = preauthorized_asset_evidence(
             &response,
@@ -3159,9 +3182,55 @@ mod download_only_tests {
             false,
         );
         assert!(diagnostic.contains("file_matches=2 selected_chunks=None ford_present=None"));
+        assert!(diagnostic.ends_with(unavailable));
         assert_verification_failed(validate_preauthorized_download_response(
             &response, &requested,
         ));
+    }
+
+    #[test]
+    fn asset_evidence_container_values_stay_private_and_do_not_change_acceptance() {
+        let (mut response, requested) = valid_ford_download_response();
+        let evidence = PreauthorizedAssetEvidence {
+            size: Some(4),
+            reference_signature: Some(b"PRIVATE_CONTAINER_123".to_vec()),
+        };
+        let chunks = response.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .for_chunks
+            .as_mut()
+            .unwrap();
+        chunks.container = evidence.reference_signature.clone().unwrap();
+        assert!(validate_preauthorized_download_response(&response, &requested).is_ok());
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            true,
+        );
+        assert!(diagnostic.ends_with("container_len=Some(21) container_matches_reference=Some(true) container_matches_derived=Some(false) container_matches_keys=Some(false)"));
+        assert!(!diagnostic.contains("PRIVATE_CONTAINER_123"));
+
+        let chunks = response.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .for_chunks
+            .as_mut()
+            .unwrap();
+        chunks.container = chunks.keys_container.clone();
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            true,
+        );
+        assert!(diagnostic.ends_with("container_len=Some(21) container_matches_reference=Some(false) container_matches_derived=Some(true) container_matches_keys=Some(true)"));
+        assert!(validate_preauthorized_download_response(&response, &requested).is_ok());
     }
 
     fn encode_test_varint(mut value: u64) -> Vec<u8> {
