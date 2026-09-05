@@ -1125,6 +1125,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                     let _ = retry_send.send(result.clone());
                 };
 
+            let mut terminal_failure = false;
             'stop: loop {
                 debug!("Resource {}: waiting for retry reason", resource_name);
                 select! {
@@ -1168,6 +1169,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                     resource_state.send_replace(ResourceState::Failed(failure));
                     if is_final {
                         debug!("Resource {}: final error; shutting down", resource_name);
+                        terminal_failure = true;
                         break 'stop;
                     }
                     debug!("Resource {}: task closed", resource_name);
@@ -1204,7 +1206,12 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let _ = generated_send.send(());
                 resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
             }
-            resource_state.send_replace(ResourceState::Closed);
+            // Keep the final registration cause available to later observers.
+            // Closing the worker after a non-retryable failure is not an
+            // explicit close of the resource and must not erase that failure.
+            if !terminal_failure {
+                resource_state.send_replace(ResourceState::Closed);
+            }
             current_resource.abort();
             debug!("Resource {}: task closed", resource_name);
         });
@@ -1256,17 +1263,21 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     async fn refresh_option(&self, now: bool) -> Result<(), PushError> {
-        if let ResourceState::Failed(ResourceFailure {
-            retry_wait: None,
-            error,
-        }) = &*self.resource_state.borrow()
-        {
-            // this is a permanent failure
-            return Err(ResourceFailure {
+        match &*self.resource_state.borrow() {
+            ResourceState::Failed(ResourceFailure {
                 retry_wait: None,
-                error: error.clone(),
+                error,
+            }) => {
+                return Err(ResourceFailure {
+                    retry_wait: None,
+                    error: error.clone(),
+                }
+                .into());
             }
-            .into());
+            // A dead worker cannot receive a refresh request. Check before
+            // the recent-refresh shortcut, which would otherwise return Ok.
+            ResourceState::Closed => return Err(PushError::ResourceClosed),
+            _ => {}
         }
         let elapsed = self.refreshed_at.lock().await.elapsed().unwrap();
         if elapsed < MAX_RESOURCE_REGEN {
@@ -1285,6 +1296,10 @@ impl<T: Resource + 'static> ResourceManager<T> {
             .unwrap()?)
     }
 }
+
+#[cfg(test)]
+#[path = "resource_manager_tests.rs"]
+mod resource_manager_tests;
 
 #[derive(Serialize, Deserialize)]
 struct KeyedArchiveClass {
