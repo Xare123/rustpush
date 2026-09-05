@@ -32,7 +32,7 @@ use crate::{
     keychain::KeychainClient,
     mmcs::{
         get_headers, get_mmcs, get_mmcs_pre_authorized_download_only, put_authorize_body, put_mmcs,
-        AuthorizedOperation, MMCSConfig, PreparedPut,
+        AuthorizedOperation, MMCSConfig, PreauthorizedAssetEvidence, PreparedPut,
     },
     mmcsp::FordChunk,
     pcs::{
@@ -5424,6 +5424,15 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             let authorization_body = response.body.as_deref().ok_or_else(|| {
                 cloudkit_protocol_error("CloudKit asset authorization was missing")
             })?;
+            // Same iteration order as the download tuples below. This metadata
+            // is diagnostic-only and cannot authorize a size or key mismatch.
+            let asset_evidence = asset
+                .iter()
+                .map(|(asset, _)| PreauthorizedAssetEvidence {
+                    size: asset.size,
+                    reference_signature: asset.reference_signature.clone(),
+                })
+                .collect::<Vec<_>>();
             let assets = asset
                 .into_iter()
                 .map(|(asset, writer)| {
@@ -5446,6 +5455,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 authorization_body,
                 assets,
                 |_, _| {},
+                &asset_evidence,
             )
             .await?;
         }
@@ -5611,8 +5621,9 @@ mod cloud_sync_transport_tests {
     use super::*;
     use crate::{
         cloud_messages::{
-            CloudMessage, CloudMessageRecordKind, CloudMessageSaveInput, CloudMessagesClient,
-            CloudMessagesWriterPreparationBinding,
+            validate_direct_chat_create, CloudChat, CloudChatSaveInput, CloudMessage,
+            CloudMessageRecordKind, CloudMessageSaveInput, CloudMessagesClient,
+            CloudMessagesWriterPreparationBinding, CloudParticipant,
         },
         keychain::KeychainClientState,
         util::ungzip,
@@ -7164,6 +7175,74 @@ mod cloud_sync_transport_tests {
             Err(PushError::CloudKitWarmAuthenticationRequired)
         ));
         assert!(transport.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_v2_chat_prepare_and_lookup_never_implicitly_warm_or_mutate() {
+        let open = Arc::new(one_shot_test_open_container(&SEMANTIC_MESSAGES_CONTAINER));
+        let keychain = semantic_test_keychain(&open);
+        let cloud_messages = CloudMessagesClient::new(open.client.clone(), keychain);
+        let transport = FaithfulSemanticTransport::default();
+        let writer_binding = CloudMessagesWriterPreparationBinding::new_for_test(open.clone());
+        let server_record = "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD";
+        let group_id = "CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC";
+        let request_identity = CloudKitRequestIdentity::new(
+            HTTP_REQUEST_UUID.to_owned(),
+            vec![OPERATION_UUID_A.to_owned()],
+        )
+        .expect("valid chat request identity");
+        let input = CloudChatSaveInput {
+            local_operation_id: "local-chat-operation".to_owned(),
+            server_record_name: server_record.to_owned(),
+            apple_operation_uuid: OPERATION_UUID_A.to_owned(),
+            chat: CloudChat {
+                style: 45,
+                state: 3,
+                successful_query: 1,
+                service_name: "iMessage".to_owned(),
+                chat_identifier: "recipient@example.invalid".to_owned(),
+                guid: "iMessage;-;recipient@example.invalid".to_owned(),
+                participants: vec![CloudParticipant {
+                    uri: "recipient@example.invalid".to_owned(),
+                }],
+                group_id: group_id.to_owned(),
+                original_group_id: group_id.to_owned(),
+                last_addressed_handle: "sender@example.invalid".to_owned(),
+                group_photo: None,
+                group_photo_guid: None,
+                ..Default::default()
+            },
+        };
+        // Prove this reaches the cold-auth gate, not an earlier fixture rejection.
+        validate_direct_chat_create(&input.chat).expect("valid direct chat fixture");
+
+        with_cloudkit_test_transport(transport.transport(), async {
+            let prepare = cloud_messages
+                .prepare_chat_save_submission(
+                    &writer_binding,
+                    input,
+                    request_identity,
+                    Duration::from_secs(30),
+                )
+                .await;
+            assert!(matches!(
+                prepare,
+                Err(PushError::CloudKitWarmAuthenticationRequired)
+            ));
+            assert!(transport.recorded().is_empty());
+            assert_eq!(transport.invocations(), 0);
+
+            let lookup = cloud_messages
+                .lookup_chat_record(&writer_binding, server_record)
+                .await;
+            assert!(matches!(
+                lookup,
+                Err(PushError::CloudKitWarmAuthenticationRequired)
+            ));
+            assert!(transport.recorded().is_empty());
+            assert_eq!(transport.invocations(), 0);
+        })
+        .await;
     }
 
     #[tokio::test]

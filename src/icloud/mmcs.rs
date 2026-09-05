@@ -942,6 +942,57 @@ fn ford_key_signature(key: &[u8]) -> Result<[u8; 21], PushError> {
     Ok(signature)
 }
 
+// Observation only: never feed this metadata or its comparisons into admission.
+// Deliberately no Debug implementation: the reference signature stays private.
+pub struct PreauthorizedAssetEvidence {
+    pub size: Option<u64>,
+    pub reference_signature: Option<Vec<u8>>,
+}
+
+fn preauthorized_asset_evidence(
+    response: &authorize_get_response::F1,
+    checksum: &[u8],
+    key: Option<&[u8]>,
+    asset: &PreauthorizedAssetEvidence,
+    validation_ok: bool,
+) -> String {
+    let mut matches = response
+        .references
+        .iter()
+        .filter(|reference| reference.file_checksum == checksum);
+    let first = matches.next();
+    let match_count = usize::from(first.is_some()) + matches.count();
+    // Ambiguous/malformed references remain unavailable, not false matches.
+    let reference = first.filter(|_| match_count == 1);
+    let keys_container = reference
+        .and_then(|reference| reference.ford_reference.as_ref())
+        .and_then(|ford| {
+            response
+                .containers
+                .get(ford.container_index as usize)
+                .and_then(|container| container.chunks.get(ford.chunk_index as usize))
+        })
+        .and_then(|chunk| chunk.encryption.as_ref())
+        .and_then(|encryption| encryption.for_chunks.as_ref())
+        .map(|chunks| chunks.keys_container.as_slice());
+    let reference_signature = asset.reference_signature.as_deref();
+    let derived = key.and_then(|key| ford_key_signature(key).ok());
+    format!(
+        "CloudKit attachment evidence asset_bytes={:?} validation_ok={} file_matches={} selected_chunks={:?} ford_present={:?} key_len={:?} reference_signature_len={:?} keys_container_len={:?} keys_match_reference={:?} reference_matches_derived={:?} keys_match_derived={:?}",
+        asset.size,
+        validation_ok,
+        match_count,
+        reference.map(|reference| reference.chunk_references.len()),
+        reference.map(|reference| reference.ford_reference.is_some()),
+        key.map(<[u8]>::len),
+        reference_signature.map(<[u8]>::len),
+        keys_container.map(<[u8]>::len),
+        keys_container.zip(reference_signature).map(|(a, b)| a == b),
+        reference_signature.zip(derived.as_ref()).map(|(a, b)| a == b.as_slice()),
+        keys_container.zip(derived.as_ref()).map(|(a, b)| a == b.as_slice()),
+    )
+}
+
 fn decode_ford_item(ford: &[u8], key: &[u8]) -> Result<FordItem, PushError> {
     if key.is_empty() || ford.len() <= 17 {
         return Err(PushError::VerificationFailed);
@@ -2518,6 +2569,7 @@ async fn get_mmcs_with_network_policy(
     progress: impl FnMut(usize, usize) + Send + Sync,
     _ford: bool,
     network_policy: MMCSGetNetworkPolicy,
+    asset_evidence: &[PreauthorizedAssetEvidence],
 ) -> Result<(), PushError> {
     let mut files = files
         .into_iter()
@@ -2612,9 +2664,18 @@ async fn get_mmcs_with_network_policy(
             ford_references,
             requested_keys
         );
-        if let Err(error) =
-            validate_preauthorized_download_response(response_data, &requested_files)
-        {
+        let validation = validate_preauthorized_download_response(response_data, &requested_files);
+        for ((checksum, key), asset) in requested_files.iter().zip(asset_evidence) {
+            // Android's native log threshold is Warn. One content-free summary
+            // per requested asset, including successful validation for size failures.
+            warn!(
+                "{}",
+                preauthorized_asset_evidence(
+                    response_data, checksum, key.as_deref(), asset, validation.is_ok(),
+                )
+            );
+        }
+        if let Err(error) = validation {
             warn!("Rejected preauthorized MMCS response at decoded-response validation");
             return Err(error);
         }
@@ -2879,6 +2940,7 @@ pub async fn get_mmcs(
         progress,
         ford,
         MMCSGetNetworkPolicy::Standard,
+        &[],
     )
     .await
 }
@@ -2898,6 +2960,7 @@ pub async fn get_mmcs_pre_authorized_download_only(
         Option<Vec<u8>>,
     )>,
     progress: impl FnMut(usize, usize) + Send + Sync,
+    asset_evidence: &[PreauthorizedAssetEvidence],
 ) -> Result<(), PushError> {
     // Preflight before cloning so an oversized or malformed CloudKit body
     // cannot cause a second attacker-sized allocation before Prost sees it.
@@ -2920,6 +2983,7 @@ pub async fn get_mmcs_pre_authorized_download_only(
         progress,
         false,
         MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        asset_evidence,
     )
     .await
 }
@@ -2996,6 +3060,108 @@ mod download_only_tests {
         response.references[0].ford_reference = Some(chunk_reference(0, 1));
         requested[0].1 = Some(ford_key);
         (response, requested)
+    }
+
+    #[test]
+    fn asset_evidence_distinguishes_reference_binding_without_changing_validation() {
+        let (mut response, requested) = valid_ford_download_response();
+        let reference_signature = vec![0x33; 21];
+        response.containers[0].chunks[1]
+            .encryption
+            .as_mut()
+            .unwrap()
+            .for_chunks
+            .as_mut()
+            .unwrap()
+            .keys_container = reference_signature.clone();
+        let evidence = PreauthorizedAssetEvidence {
+            size: Some(123),
+            reference_signature: Some(reference_signature),
+        };
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response, &requested,
+        ));
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            false,
+        );
+        assert_eq!(diagnostic,
+            "CloudKit attachment evidence asset_bytes=Some(123) validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(true) key_len=Some(32) reference_signature_len=Some(21) keys_container_len=Some(21) keys_match_reference=Some(true) reference_matches_derived=Some(false) keys_match_derived=Some(false)");
+        // Observing the authenticated reference must not turn rejection into acceptance.
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response, &requested,
+        ));
+    }
+
+    #[test]
+    fn asset_evidence_is_content_free_and_missing_values_are_not_false() {
+        let (mut response, mut requested) = valid_download_response();
+        let sentinel = b"PRIVATE_DIAGNOSTIC_SENTINEL".to_vec();
+        requested[0].0 = sentinel.clone();
+        response.references[0].file_checksum = sentinel.clone();
+        requested[0].1 = Some(sentinel.clone());
+        let evidence = PreauthorizedAssetEvidence {
+            size: None,
+            reference_signature: Some(sentinel),
+        };
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            false,
+        );
+        assert_eq!(diagnostic,
+            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=1 selected_chunks=Some(1) ford_present=Some(false) key_len=Some(27) reference_signature_len=Some(27) keys_container_len=None keys_match_reference=None reference_matches_derived=Some(false) keys_match_derived=None");
+        let missing = preauthorized_asset_evidence(
+            &response,
+            &[],
+            None,
+            &PreauthorizedAssetEvidence {
+                size: None,
+                reference_signature: None,
+            },
+            false,
+        );
+        assert_eq!(missing,
+            "CloudKit attachment evidence asset_bytes=None validation_ok=false file_matches=0 selected_chunks=None ford_present=None key_len=None reference_signature_len=None keys_container_len=None keys_match_reference=None reference_matches_derived=None keys_match_derived=None");
+    }
+
+    #[test]
+    fn asset_evidence_handles_invalid_indices_and_duplicate_matches_without_panicking() {
+        let (mut response, requested) = valid_ford_download_response();
+        let evidence = PreauthorizedAssetEvidence {
+            size: Some(4),
+            reference_signature: None,
+        };
+        response.references[0]
+            .ford_reference
+            .as_mut()
+            .unwrap()
+            .container_index = u32::MAX;
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            false,
+        );
+        assert!(diagnostic.contains("keys_container_len=None keys_match_reference=None"));
+        response.references.push(response.references[0].clone());
+        let diagnostic = preauthorized_asset_evidence(
+            &response,
+            &requested[0].0,
+            requested[0].1.as_deref(),
+            &evidence,
+            false,
+        );
+        assert!(diagnostic.contains("file_matches=2 selected_chunks=None ford_present=None"));
+        assert_verification_failed(validate_preauthorized_download_response(
+            &response, &requested,
+        ));
     }
 
     fn encode_test_varint(mut value: u64) -> Vec<u8> {

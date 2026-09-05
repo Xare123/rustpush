@@ -61,6 +61,9 @@ use crate::{
 use crate::{Attachment, AttachmentType, FileContainer};
 use cloudkit_proto::CloudKitEncryptor;
 
+mod chat_create;
+pub use chat_create::{validate_direct_chat_create, CloudChatRecordLookup, CloudChatSaveInput};
+
 pub const MESSAGES_SERVICE: PCSService = PCSService {
     name: "Messages3",
     view_hint: "Engram",
@@ -1405,7 +1408,8 @@ impl CloudMessagesSaveMode {
     }
 }
 
-/// A native, single-use owner for one message-only CloudKit save request.
+/// A native, single-use owner for one CloudKit save request. Message batches
+/// and single direct-chat creates use separate typed preparation entrypoints.
 ///
 /// This intentionally has no `Clone` implementation. Once `consume_once` is
 /// called, the authentication, request identity, and operations are moved
