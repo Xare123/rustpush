@@ -3341,6 +3341,27 @@ impl ZoneEncryptionConfigAccess {
 }
 
 impl PCSZoneConfig {
+    pub(crate) fn matches_zone(&self, identifier: &RecordZoneIdentifier) -> bool {
+        self.identifier == *identifier
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_record_keys_for_test(
+        identifier: RecordZoneIdentifier,
+        default_record_keys: Vec<PCSKey>,
+    ) -> Self {
+        Self {
+            identifier,
+            zone_keys: vec![],
+            zone_protection_tag: Some("fixture-zone-tag".to_owned()),
+            default_record_keys,
+            record_prot_tag: Some("fixture-record-tag".to_owned()),
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        }
+    }
+
     fn decode_record_protection(
         &self,
         protection: &ProtectionInfo,

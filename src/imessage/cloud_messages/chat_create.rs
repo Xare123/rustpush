@@ -97,7 +97,7 @@ fn build_chat_create_operation(
     key: &crate::cloudkit::PCSZoneConfig,
 ) -> Result<SaveRecordOperation, PushError> {
     if zone.value.as_ref().and_then(|value| value.name.as_deref()) != Some(CHAT_CREATE_ZONE)
-        || key.identifier != zone
+        || !key.matches_zone(&zone)
     {
         return Err(PushError::BadMsg);
     }
@@ -350,16 +350,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let key = crate::cloudkit::PCSZoneConfig {
-            identifier: zone.clone(),
-            zone_keys: vec![],
-            zone_protection_tag: None,
-            default_record_keys: vec![],
-            record_prot_tag: None,
-            zone_pcs_key: vec![],
-            zone_roll_count: 0,
-            record_roll_count: 0,
-        };
+        let key = crate::cloudkit::PCSZoneConfig::with_record_keys_for_test(zone.clone(), vec![]);
         assert!(build_chat_create_operation(zone.clone(), input(), &key).is_err());
         let mut wrong = zone;
         wrong.value.as_mut().unwrap().name = Some("messageManateeZone".to_owned());
@@ -379,16 +370,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        let key = crate::cloudkit::PCSZoneConfig {
-            identifier: zone.clone(),
-            zone_keys: vec![],
-            zone_protection_tag: Some("zone-tag".to_owned()),
-            default_record_keys: vec![PCSKey::random()],
-            record_prot_tag: Some("record-tag".to_owned()),
-            zone_pcs_key: vec![],
-            zone_roll_count: 0,
-            record_roll_count: 0,
-        };
+        let record_keys = vec![PCSKey::random()];
+        let key = crate::cloudkit::PCSZoneConfig::with_record_keys_for_test(
+            zone.clone(),
+            record_keys.clone(),
+        );
+        let mut wrong_owner = zone.clone();
+        wrong_owner.owner_identifier.as_mut().unwrap().name = Some("other-owner".to_owned());
+        assert!(!key.matches_zone(&wrong_owner));
+        assert!(build_chat_create_operation(wrong_owner, input(), &key).is_err());
         let operation = build_chat_create_operation(zone.clone(), input(), &key).unwrap();
         assert_eq!(operation.0.save_semantics, Some(2));
         let record = operation.0.record.unwrap();
@@ -401,7 +391,7 @@ mod tests {
         let decoded = CloudChat::from_record_encrypted(
             &record.record_field,
             Some(&crate::pcs::PCSEncryptor {
-                keys: key.default_record_keys,
+                keys: record_keys,
                 record_id: identifier,
             }),
         );
