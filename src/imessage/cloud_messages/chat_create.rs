@@ -118,7 +118,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = self.get_container().await?;
         let zone = container.private_zone(CHAT_CREATE_ZONE.to_owned());
         container
-            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .get_writer_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
             .await?;
         container
             .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
@@ -412,7 +412,8 @@ mod tests {
         assert!(production.contains("CloudMessagesSaveMode::CreateOnly.update_flag()"));
         assert!(production.contains("max_attempts: 1"));
         assert!(production.contains("get_cached_zone_encryption_config_exact"));
-        assert!(production.contains("get_zone_encryption_config_lookup_only"));
+        assert!(production.contains("get_writer_zone_encryption_config_lookup_only"));
+        assert!(!production.contains(".get_zone_encryption_config_lookup_only("));
         for forbidden in [
             "save_chats(",
             "save_records(",

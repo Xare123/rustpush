@@ -14,7 +14,7 @@ use std::{
 use crate::{
     aps::APSInterestToken,
     cloudkit_operation_gate::{
-        cloudkit_writer_operation_is_held, try_acquire_cloudkit_operation,
+        cloudkit_writer_operation_is_held, try_acquire_cloudkit_operation, with_cloudkit_writer_operation,
         CloudKitReadAuthenticationPermit,
     },
     util::{
@@ -3323,6 +3323,9 @@ enum ZoneEncryptionConfigAccess {
     /// Semantic decode may resolve existing configuration, but cannot create
     /// or modify a CloudKit zone.
     LookupOnly,
+    /// Writer preparation resolves existing PCS metadata with its own general
+    /// container. It must not enter the restored semantic-auth transport.
+    WriterLookupOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3335,8 +3338,12 @@ impl ZoneEncryptionConfigAccess {
     const fn missing_zone_action(self) -> MissingZoneAction {
         match self {
             Self::AllowCreate => MissingZoneAction::CreateAndFetch,
-            Self::LookupOnly => MissingZoneAction::ReturnError,
+            Self::LookupOnly | Self::WriterLookupOnly => MissingZoneAction::ReturnError,
         }
+    }
+
+    const fn is_lookup_only(self) -> bool {
+        !matches!(self, Self::AllowCreate)
     }
 }
 
@@ -3594,6 +3601,44 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         .remove(0)
     }
 
+    async fn validate_writer_pcs_lookup_scope(
+        &self,
+        zone: &RecordZoneIdentifier,
+    ) -> Result<(), PushError> {
+        self.validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
+            .await?;
+        let name = cloudkit_zone_name(zone)?;
+        if !matches!(name.as_str(), "chatManateeZone" | "messageManateeZone")
+            || *zone != self.private_zone(name)
+        {
+            return Err(PushError::CloudKitSemanticOperationDenied);
+        }
+        Ok(())
+    }
+
+    /// Resolve existing Chat/Message PCS keys on the exact general Messages
+    /// container. Keychain lookups remain read-only; zone fetch uses GENERAL
+    /// authentication, never a restored read lease relabeled as a writer.
+    pub(crate) async fn get_writer_zone_encryption_config_lookup_only(
+        &self,
+        zone_id: &RecordZoneIdentifier,
+        client: &KeychainClient<T>,
+        pcs_service: &PCSService<'_>,
+    ) -> Result<PCSZoneConfig, PushError> {
+        with_cloudkit_writer_operation(async {
+            self.validate_writer_pcs_lookup_scope(zone_id).await?;
+            let config = self.get_zone_encryption_config_sev_with_policy(
+                &[(zone_id.clone(), None)], client, pcs_service, true,
+                ZoneEncryptionConfigAccess::WriterLookupOnly,
+            ).await?.remove(0)?;
+            self.validate_writer_pcs_lookup_scope(zone_id).await?;
+            if !config.matches_zone(zone_id) {
+                return Err(PushError::PCSRecordKeyMissing);
+            }
+            Ok(config)
+        }).await
+    }
+
     /// Returns only an already-warmed PCS configuration for this exact zone.
     /// This path performs no CloudKit request and does not read or update the
     /// keychain cache.
@@ -3687,7 +3732,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         // todo what if get_needed is empty
         if !get_needed.is_empty() {
             if sync_keychain {
-                if access == ZoneEncryptionConfigAccess::LookupOnly {
+                if access.is_lookup_only() {
                     client
                         .sync_keychain_lookup_only(&[&pcs_service.zone, "ProtectedCloudStorage"])
                         .await?;
@@ -3728,7 +3773,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             let mut fetch_shares = vec![];
             for (result, (zone_id, share_info)) in zones.into_iter().zip(&get_needed) {
                 if share_info.is_none() && self.database_type == Database::SharedDb {
-                    if access == ZoneEncryptionConfigAccess::LookupOnly {
+                    if access.is_lookup_only() {
                         return Err(PushError::CloudKitSemanticOperationDenied);
                     }
                     fetch_shares.push(FetchRecordOperation::new(
@@ -3818,7 +3863,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 let zone_name = cloudkit_zone_name(&zone_id)?;
 
                 let service = match access {
-                    ZoneEncryptionConfigAccess::LookupOnly => {
+                    ZoneEncryptionConfigAccess::LookupOnly | ZoneEncryptionConfigAccess::WriterLookupOnly => {
                         PCSPrivateKey::require_existing_service_key(client, pcs_service).await?
                     }
                     ZoneEncryptionConfigAccess::AllowCreate => {
@@ -7901,6 +7946,33 @@ mod cloud_sync_transport_tests {
             ZoneEncryptionConfigAccess::AllowCreate.missing_zone_action(),
             MissingZoneAction::CreateAndFetch
         );
+        assert_eq!(ZoneEncryptionConfigAccess::WriterLookupOnly.missing_zone_action(),
+            MissingZoneAction::ReturnError);
+        assert!(ZoneEncryptionConfigAccess::WriterLookupOnly.is_lookup_only());
+        assert!(ZoneEncryptionConfigAccess::LookupOnly.is_lookup_only());
+        assert!(!ZoneEncryptionConfigAccess::AllowCreate.is_lookup_only());
+    }
+
+    #[tokio::test]
+    async fn writer_pcs_lookup_requires_general_private_messages_and_exact_zone_owner() {
+        let container = one_shot_test_container();
+        let mut open = one_shot_test_open_container(&container);
+        let zone = open.private_zone("chatManateeZone".to_owned());
+        // The old writer preparation passed a GENERAL container into the
+        // semantic-only fetch path, which correctly rejected that provenance.
+        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_err());
+        open.read_authentication_generation = None;
+        open.test_read_authentication_lease = None;
+        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_ok());
+        assert!(open.validate_writer_pcs_lookup_scope(
+            &open.private_zone("messageManateeZone".to_owned())).await.is_ok());
+        assert!(open.validate_writer_pcs_lookup_scope(
+            &open.private_zone("attachmentManateeZone".to_owned())).await.is_err());
+        let mut wrong_owner = zone.clone();
+        wrong_owner.owner_identifier.as_mut().unwrap().name = Some("another-user".to_owned());
+        assert!(open.validate_writer_pcs_lookup_scope(&wrong_owner).await.is_err());
+        open.client.state.write().await.dsid = "different-account".to_owned();
+        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_err());
     }
 
     #[test]

@@ -2567,7 +2567,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let container = self.get_container().await?;
         let zone = container.private_zone("messageManateeZone".to_string());
         container
-            .get_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
+            .get_writer_zone_encryption_config_lookup_only(&zone, &self.keychain, &MESSAGES_SERVICE)
             .await?;
         container
             .validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
@@ -3776,7 +3776,7 @@ mod cloud_message_identity_tests {
 
         assert!(method.contains("self.get_container().await?"));
         assert!(method.contains("messageManateeZone"));
-        assert!(method.contains("get_zone_encryption_config_lookup_only"));
+        assert!(method.contains("get_writer_zone_encryption_config_lookup_only"));
         assert!(method.contains("validate_general_identity"));
         assert!(!method.contains("get_zone_encryption_config("));
         assert!(!method.contains("get_zone_encryption_config_sev("));
