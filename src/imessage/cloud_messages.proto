@@ -43,3 +43,44 @@ message MessageProto4 {
     optional string groupId = 7;
     optional uint32 sent_or_received_off_grid = 8; // test is 0, uncomfirmed
 }
+
+// MessageEncryptedV3.msgType selects one of these payloads for system-message
+// outer classes. They intentionally share the msgProto CloudKit field with
+// MessageProto; the outer discriminator, not protobuf trial decoding, selects
+// the schema.
+message GroupTitleChange {
+    optional uint32 version = 1;
+    optional string groupTitle = 2;
+    optional string otherHandle = 3;
+    optional bytes padding = 4;
+}
+
+message LocationShareStatusChange {
+    optional uint32 version = 1;
+    optional int64 shareStatus = 2;
+    optional int64 shareDirection = 3;
+    optional string otherHandle = 4;
+    optional bytes padding = 5;
+}
+
+message MessageAction {
+    optional uint32 version = 1;
+    optional int64 messageActionType = 2;
+    optional string otherHandle = 3;
+    optional string originalMessageGuid = 4;
+    optional bytes padding = 5;
+}
+
+message ParticipantChange {
+    optional uint32 version = 1;
+    optional int64 participantChangeType = 2;
+    optional string otherHandle = 3;
+    optional bytes padding = 4;
+}
+
+message GroupAction {
+    optional uint32 version = 1;
+    optional int64 groupActionType = 2;
+    optional string otherHandle = 3;
+    optional bytes padding = 4;
+}
