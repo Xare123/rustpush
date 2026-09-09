@@ -410,6 +410,21 @@ fn commit_session_operation(
     true
 }
 
+fn remove_session_if_matches(
+    state: &mut FTState,
+    group: &str,
+    baseline: &FTSession,
+) -> bool {
+    let Some(current) = state.sessions.get(group) else {
+        return false;
+    };
+    if !session_matches_operation(current, baseline) {
+        return false;
+    }
+    state.sessions.remove(group);
+    true
+}
+
 fn conversation_link_url(link: &ConversationLink) -> String {
     let encoded = general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
     format!(
@@ -1075,8 +1090,19 @@ impl FTClient {
             state.sessions.insert(group.clone(), session.clone());
         }
 
-        self.ensure_allocations(&mut session, &[]).await?;
-        self.prop_up_conv(&mut session, true).await?;
+        let creation = async {
+            self.ensure_allocations(&mut session, &[]).await?;
+            self.prop_up_conv(&mut session, true).await?;
+            Ok::<(), PushError>(())
+        }
+        .await;
+        if let Err(error) = creation {
+            let mut state = self.state.write().await;
+            if remove_session_if_matches(&mut state, &group, &baseline) {
+                (self.update_state)(&state);
+            }
+            return Err(error);
+        }
 
         let mut state = self.state.write().await;
         if !commit_session_operation(&mut state, &group, &baseline, &session, false) {
@@ -2697,6 +2723,29 @@ mod tests {
         assert_eq!(
             state.sessions.get("group").unwrap().report_id,
             "replacement"
+        );
+    }
+
+    #[test]
+    fn failed_session_creation_removes_only_its_own_provisional_session() {
+        let baseline = session();
+        let mut state = FTState::default();
+        state
+            .sessions
+            .insert("group".to_string(), baseline.clone());
+
+        assert!(remove_session_if_matches(&mut state, "group", &baseline));
+        assert!(!state.sessions.contains_key("group"));
+
+        let mut replacement = session();
+        replacement.report_id = "replacement".to_string();
+        state
+            .sessions
+            .insert("group".to_string(), replacement.clone());
+        assert!(!remove_session_if_matches(&mut state, "group", &baseline));
+        assert_eq!(
+            state.sessions.get("group").unwrap().report_id,
+            replacement.report_id
         );
     }
 

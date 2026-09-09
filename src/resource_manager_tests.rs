@@ -135,6 +135,31 @@ async fn transient_failure_still_recovers_on_immediate_retry() {
 }
 
 #[tokio::test]
+async fn ordinary_refresh_coalesces_a_recent_healthy_generation() {
+    let manager = manager(vec![Ok(())]);
+    manager.ensure_ready().await.unwrap();
+
+    manager.refresh().await.unwrap();
+    assert_eq!(manager.calls.load(Ordering::SeqCst), 1);
+
+    manager.close();
+    worker_finished(&manager).await;
+}
+
+#[tokio::test]
+async fn immediate_refresh_bypasses_a_recent_healthy_generation() {
+    let manager = manager(vec![Ok(()), Ok(())]);
+    manager.ensure_ready().await.unwrap();
+
+    manager.refresh_now().await.unwrap();
+    manager.ensure_ready().await.unwrap();
+    assert_eq!(manager.calls.load(Ordering::SeqCst), 2);
+
+    manager.close();
+    worker_finished(&manager).await;
+}
+
+#[tokio::test]
 async fn terminal_failure_after_a_transient_retry_keeps_its_cause() {
     let manager = manager(vec![
         Err(PushError::ResourceGenTimeout),

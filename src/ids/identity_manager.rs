@@ -1035,7 +1035,10 @@ impl IdentityResource {
                         warn!("IDS returned 6005; attempting to re-register");
                         drop(users);
                         drop(id_lock);
-                        self.manager().await.refresh().await?;
+                        // 6005 explicitly invalidates the current IDS
+                        // registration. Do not let the ordinary refresh
+                        // cooldown turn this recovery into a no-op.
+                        self.manager().await.refresh_now().await?;
                     }
                     return Err(err);
                 }

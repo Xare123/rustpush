@@ -1280,7 +1280,10 @@ impl<T: Resource + 'static> ResourceManager<T> {
             _ => {}
         }
         let elapsed = self.refreshed_at.lock().await.elapsed().unwrap();
-        if elapsed < MAX_RESOURCE_REGEN {
+        // Ordinary refreshes coalesce within the cooldown. `refresh_now` is
+        // reserved for explicit invalidation (for example an IDS 6005) and
+        // must actually regenerate even when the last generation was recent.
+        if !now && elapsed < MAX_RESOURCE_REGEN {
             return Ok(());
         }
         let mut subscribe = self.request_retries.subscribe();
