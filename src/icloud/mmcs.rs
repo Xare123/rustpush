@@ -1325,8 +1325,248 @@ pub async fn prepare_put_v2(
     })
 }
 
-// a `Container` that transfers to an MMCS bucket
-// handles putting into a bucket
+// Native-only V2 upload snapshot for crash recovery.
+const V2_UPLOAD_SNAPSHOT_VERSION: u8 = 1;
+const V2_UPLOAD_SNAPSHOT_HEADER_LEN: usize = 87;
+const MAX_V2_UPLOAD_SNAPSHOT_WIRE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_V2_UPLOAD_SNAPSHOT_CHUNKS: usize = 2048;
+const MAX_V2_UPLOAD_SNAPSHOT_TOTAL_BYTES: usize = u32::MAX as usize;
+const MAX_V2_UPLOAD_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+const MAX_V2_UPLOAD_FORD_BYTES: usize = 1024 * 1024;
+const V2_UPLOAD_SNAPSHOT_CHUNK_RECORD_LEN: usize = 62;
+
+// A snapshot preserves the exact randomized prepare_put_v2 crypto
+// (per-chunk keys, file Ford key/ciphertext/reference) so a retry reuses the
+// original bytes instead of re-running preparation. Snapshots are opaque
+// protected material: the caller must hold them under platform protection and
+// must not treat them as upload admission or record-create authorization.
+
+impl PreparedPut {
+    // Bounded versioned encoding of an exact prepare_put_v2 result.
+    pub fn encode_v2_upload_snapshot(&self) -> Result<Vec<u8>, PushError> {
+        validate_v2_upload_snapshot_shape(self)?;
+        let ford_key = self.ford_key.ok_or(PushError::VerificationFailed)?;
+        let ford = self.ford.as_ref().ok_or(PushError::VerificationFailed)?;
+        let chunk_count =
+            u32::try_from(self.chunk_sigs.len()).map_err(|_| PushError::VerificationFailed)?;
+        let ford_len = u32::try_from(ford.1.len()).map_err(|_| PushError::VerificationFailed)?;
+        let mut out = Vec::with_capacity(
+            V2_UPLOAD_SNAPSHOT_HEADER_LEN
+                + ford.1.len()
+                + self.chunk_sigs.len() * V2_UPLOAD_SNAPSHOT_CHUNK_RECORD_LEN,
+        );
+        out.push(V2_UPLOAD_SNAPSHOT_VERSION);
+        out.extend_from_slice(
+            &u32::try_from(self.total_len)
+                .map_err(|_| PushError::VerificationFailed)?
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&self.total_sig);
+        out.extend_from_slice(&chunk_count.to_le_bytes());
+        out.extend_from_slice(&ford_key);
+        out.extend_from_slice(&ford.0);
+        out.extend_from_slice(&ford_len.to_le_bytes());
+        out.extend_from_slice(&ford.1);
+        for chunk in &self.chunk_sigs {
+            let (key, embedded_len) = match chunk.key {
+                ChunkEncryption::V2(key, embedded_len) => (key, embedded_len),
+                _ => return Err(PushError::VerificationFailed),
+            };
+            out.extend_from_slice(&chunk.id);
+            out.extend_from_slice(
+                &u32::try_from(chunk.size)
+                    .map_err(|_| PushError::VerificationFailed)?
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&embedded_len);
+        }
+        if out.len() > MAX_V2_UPLOAD_SNAPSHOT_WIRE_BYTES {
+            return Err(PushError::VerificationFailed);
+        }
+        Ok(out)
+    }
+
+    // Bounded decoding that re-validates the full V2 shape, including the
+    // Ford reference/key binding and the decrypted Ford/chunk cross-check.
+    pub fn from_v2_upload_snapshot(bytes: &[u8]) -> Result<Self, PushError> {
+        if bytes.len() > MAX_V2_UPLOAD_SNAPSHOT_WIRE_BYTES
+            || bytes.len() < V2_UPLOAD_SNAPSHOT_HEADER_LEN
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        if bytes[0] != V2_UPLOAD_SNAPSHOT_VERSION {
+            return Err(PushError::VerificationFailed);
+        }
+        let total_len = u32::from_le_bytes(fixed_bytes(&bytes[1..5])?) as usize;
+        if total_len > MAX_V2_UPLOAD_SNAPSHOT_TOTAL_BYTES {
+            return Err(PushError::VerificationFailed);
+        }
+        let total_sig: [u8; 21] = fixed_bytes(&bytes[5..26])?;
+        if total_sig[0] != 0x04 {
+            return Err(PushError::VerificationFailed);
+        }
+        let chunk_count = u32::from_le_bytes(fixed_bytes(&bytes[26..30])?) as usize;
+        if chunk_count > MAX_V2_UPLOAD_SNAPSHOT_CHUNKS {
+            return Err(PushError::VerificationFailed);
+        }
+        let ford_key: [u8; 32] = fixed_bytes(&bytes[30..62])?;
+        let ford_reference: [u8; 21] = fixed_bytes(&bytes[62..83])?;
+        if ford_reference[0] != 0x01 {
+            return Err(PushError::VerificationFailed);
+        }
+        if ford_reference != ford_key_signature(&ford_key)? {
+            return Err(PushError::VerificationFailed);
+        }
+        let ford_len = u32::from_le_bytes(fixed_bytes(&bytes[83..87])?) as usize;
+        if ford_len > MAX_V2_UPLOAD_FORD_BYTES {
+            return Err(PushError::VerificationFailed);
+        }
+        let chunks_len = chunk_count
+            .checked_mul(V2_UPLOAD_SNAPSHOT_CHUNK_RECORD_LEN)
+            .ok_or(PushError::VerificationFailed)?;
+        let expected_len = V2_UPLOAD_SNAPSHOT_HEADER_LEN
+            .checked_add(ford_len)
+            .and_then(|end| end.checked_add(chunks_len))
+            .ok_or(PushError::VerificationFailed)?;
+        if bytes.len() != expected_len {
+            return Err(PushError::VerificationFailed);
+        }
+        let ford_ciphertext: &[u8] = bytes
+            .get(V2_UPLOAD_SNAPSHOT_HEADER_LEN..V2_UPLOAD_SNAPSHOT_HEADER_LEN + ford_len)
+            .ok_or(PushError::VerificationFailed)?;
+        if ford_ciphertext.first() != Some(&0x04) {
+            return Err(PushError::VerificationFailed);
+        }
+        let ford_item = decode_ford_item(ford_ciphertext, &ford_key)?;
+        if ford_item.checksum.len() != 32 || ford_item.chunks.len() != chunk_count {
+            return Err(PushError::VerificationFailed);
+        }
+        let mut offset = V2_UPLOAD_SNAPSHOT_HEADER_LEN + ford_len;
+        let mut chunk_sigs = Vec::with_capacity(chunk_count);
+        let mut accumulated_len = 0usize;
+        for ford_chunk in ford_item.chunks.iter() {
+            let record: &[u8] = bytes
+                .get(offset..offset + V2_UPLOAD_SNAPSHOT_CHUNK_RECORD_LEN)
+                .ok_or(PushError::VerificationFailed)?;
+            offset += V2_UPLOAD_SNAPSHOT_CHUNK_RECORD_LEN;
+            let id: [u8; 21] = fixed_bytes(&record[0..21])?;
+            if id[0] != 0x84 {
+                return Err(PushError::VerificationFailed);
+            }
+            let size = u32::from_le_bytes(fixed_bytes(&record[21..25])?) as usize;
+            if size == 0 || size > MAX_V2_UPLOAD_CHUNK_BYTES {
+                return Err(PushError::VerificationFailed);
+            }
+            let key: [u8; 33] = fixed_bytes(&record[25..58])?;
+            if key[0] != 0x04 {
+                return Err(PushError::VerificationFailed);
+            }
+            let embedded_len: [u8; 4] = fixed_bytes(&record[58..62])?;
+            if embedded_len != (size as u32).to_le_bytes() {
+                return Err(PushError::VerificationFailed);
+            }
+            if ford_chunk.key != key.to_vec() || ford_chunk.chunk_len != embedded_len.to_vec() {
+                return Err(PushError::VerificationFailed);
+            }
+            accumulated_len = accumulated_len
+                .checked_add(size)
+                .ok_or(PushError::VerificationFailed)?;
+            chunk_sigs.push(ChunkDesc {
+                id,
+                size,
+                key: ChunkEncryption::V2(key, embedded_len),
+                offset: None,
+            });
+        }
+        if accumulated_len != total_len {
+            return Err(PushError::VerificationFailed);
+        }
+        if (chunk_count == 0) != (total_len == 0) {
+            return Err(PushError::VerificationFailed);
+        }
+        let prepared = PreparedPut {
+            total_sig: total_sig.to_vec(),
+            chunk_sigs,
+            total_len,
+            ford_key: Some(ford_key),
+            ford: Some((ford_reference, ford_ciphertext.to_vec())),
+        };
+        validate_v2_upload_snapshot_shape(&prepared)?;
+        Ok(prepared)
+    }
+}
+
+fn validate_v2_upload_snapshot_shape(prepared: &PreparedPut) -> Result<(), PushError> {
+    if prepared.total_sig.len() != 21 || prepared.total_sig.first() != Some(&0x04) {
+        return Err(PushError::VerificationFailed);
+    }
+    if prepared.total_len > MAX_V2_UPLOAD_SNAPSHOT_TOTAL_BYTES {
+        return Err(PushError::VerificationFailed);
+    }
+    if prepared.chunk_sigs.len() > MAX_V2_UPLOAD_SNAPSHOT_CHUNKS {
+        return Err(PushError::VerificationFailed);
+    }
+    if u32::try_from(prepared.total_len).is_err()
+        || u32::try_from(prepared.chunk_sigs.len()).is_err()
+    {
+        return Err(PushError::VerificationFailed);
+    }
+    let ford_key = prepared.ford_key.ok_or(PushError::VerificationFailed)?;
+    let ford = prepared
+        .ford
+        .as_ref()
+        .ok_or(PushError::VerificationFailed)?;
+    if ford.0.len() != 21 || ford.0[0] != 0x01 {
+        return Err(PushError::VerificationFailed);
+    }
+    if ford.0 != ford_key_signature(&ford_key)? {
+        return Err(PushError::VerificationFailed);
+    }
+    if ford.1.len() > MAX_V2_UPLOAD_FORD_BYTES || ford.1.first() != Some(&0x04) {
+        return Err(PushError::VerificationFailed);
+    }
+    let ford_item = decode_ford_item(&ford.1, &ford_key)?;
+    if ford_item.checksum.len() != 32 || ford_item.chunks.len() != prepared.chunk_sigs.len() {
+        return Err(PushError::VerificationFailed);
+    }
+    let mut accumulated_len = 0usize;
+    for (chunk, ford_chunk) in prepared.chunk_sigs.iter().zip(ford_item.chunks.iter()) {
+        if chunk.offset.is_some() {
+            return Err(PushError::VerificationFailed);
+        }
+        if chunk.id.len() != 21 || chunk.id[0] != 0x84 {
+            return Err(PushError::VerificationFailed);
+        }
+        if chunk.size == 0 || chunk.size > MAX_V2_UPLOAD_CHUNK_BYTES {
+            return Err(PushError::VerificationFailed);
+        }
+        let (key, embedded_len) = match chunk.key {
+            ChunkEncryption::V2(key, embedded_len) => (key, embedded_len),
+            _ => return Err(PushError::VerificationFailed),
+        };
+        if key[0] != 0x04 {
+            return Err(PushError::VerificationFailed);
+        }
+        if embedded_len != (chunk.size as u32).to_le_bytes() {
+            return Err(PushError::VerificationFailed);
+        }
+        if ford_chunk.key != key.to_vec() || ford_chunk.chunk_len != embedded_len.to_vec() {
+            return Err(PushError::VerificationFailed);
+        }
+        accumulated_len = accumulated_len
+            .checked_add(chunk.size)
+            .ok_or(PushError::VerificationFailed)?;
+    }
+    if accumulated_len != prepared.total_len {
+        return Err(PushError::VerificationFailed);
+    }
+    if prepared.chunk_sigs.is_empty() != (prepared.total_len == 0) {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(())
+}
+// A container that transfers to an MMCS upload bucket.
 struct MMCSPutContainer {
     target: UploadTarget,
     hasher: Hasher,
@@ -4610,5 +4850,140 @@ mod download_only_tests {
         );
         source.current_offset = 1;
         assert_verification_failed(source.read_next().await);
+    }
+}
+
+#[cfg(test)]
+mod v2_upload_snapshot_tests {
+    use super::*;
+
+    async fn prepare_v2_fixture(data: Vec<u8>) -> PreparedPut {
+        prepare_put_v2(FileContainer::new(Cursor::new(data)), &[0x42; 32])
+            .await
+            .unwrap()
+    }
+
+    fn assert_snapshot_rejected<T>(result: Result<T, PushError>) {
+        assert!(matches!(
+            result,
+            Err(PushError::VerificationFailed) | Err(PushError::BadMsg)
+        ));
+    }
+
+    fn chunk_keys(prepared: &PreparedPut) -> Vec<([u8; 33], [u8; 4])> {
+        prepared
+            .chunk_sigs
+            .iter()
+            .map(|chunk| match chunk.key {
+                ChunkEncryption::V2(key, embedded) => (key, embedded),
+                _ => panic!("snapshot fixture lost its V2 chunk shape"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn v2_snapshot_roundtrip_preserves_exact_crypto() {
+        let plaintext = b"crash-recovery snapshot fixture".to_vec();
+        let prepared = prepare_v2_fixture(plaintext).await;
+        let snapshot = prepared.encode_v2_upload_snapshot().unwrap();
+        let restored = PreparedPut::from_v2_upload_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.total_sig, prepared.total_sig);
+        assert_eq!(restored.total_len, prepared.total_len);
+        assert_eq!(restored.chunk_sigs.len(), prepared.chunk_sigs.len());
+        assert_eq!(chunk_keys(&restored), chunk_keys(&prepared));
+        assert_eq!(restored.ford_key, prepared.ford_key);
+        assert_eq!(restored.ford, prepared.ford);
+        assert_eq!(restored.encode_v2_upload_snapshot().unwrap(), snapshot);
+        // A fresh preparation randomizes keys; the snapshot must not.
+        let fresh = prepare_v2_fixture(b"crash-recovery snapshot fixture".to_vec()).await;
+        assert_eq!(fresh.total_sig, prepared.total_sig);
+        assert!(fresh.ford_key != prepared.ford_key);
+        assert!(chunk_keys(&fresh) != chunk_keys(&prepared));
+        assert_eq!(restored.ford_key, prepared.ford_key);
+    }
+
+    #[tokio::test]
+    async fn v2_snapshot_multichunk_and_empty_roundtrip() {
+        let big = vec![0xA5u8; 6 * 1024 * 1024];
+        let prepared = prepare_v2_fixture(big).await;
+        assert_eq!(prepared.chunk_sigs.len(), 2);
+        let snapshot = prepared.encode_v2_upload_snapshot().unwrap();
+        let restored = PreparedPut::from_v2_upload_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.total_len, 6 * 1024 * 1024);
+        assert_eq!(restored.encode_v2_upload_snapshot().unwrap(), snapshot);
+
+        let empty = prepare_v2_fixture(Vec::new()).await;
+        assert!(empty.chunk_sigs.is_empty());
+        assert_eq!(empty.total_len, 0);
+        let snapshot = empty.encode_v2_upload_snapshot().unwrap();
+        let restored = PreparedPut::from_v2_upload_snapshot(&snapshot).unwrap();
+        assert!(restored.chunk_sigs.is_empty());
+        assert_eq!(restored.encode_v2_upload_snapshot().unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn v2_snapshot_rejects_malformed_future_truncated_oversized() {
+        let prepared = prepare_v2_fixture(b"rejection fixture".to_vec()).await;
+        let snapshot = prepared.encode_v2_upload_snapshot().unwrap();
+
+        let mut future = snapshot.clone();
+        future[0] = 0x02;
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&future));
+
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(
+            &snapshot[..snapshot.len() - 1],
+        ));
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&[]));
+
+        let mut trailing = snapshot.clone();
+        trailing.push(0x00);
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&trailing));
+
+        let mut bad_prefix = snapshot.clone();
+        bad_prefix[5] = 0xFF;
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&bad_prefix));
+
+        let mut bad_count = snapshot.clone();
+        bad_count[26..30].copy_from_slice(&3000u32.to_le_bytes());
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&bad_count));
+
+        let oversized = vec![0u8; MAX_V2_UPLOAD_SNAPSHOT_WIRE_BYTES + 1];
+        assert_snapshot_rejected(PreparedPut::from_v2_upload_snapshot(&oversized));
+    }
+
+    #[tokio::test]
+    async fn v2_snapshot_encode_rejects_non_v2_shapes() {
+        // Legacy V1 preparation is not a V2 snapshot.
+        let legacy = prepare_put(
+            FileContainer::new(Cursor::new(b"legacy shape".to_vec())),
+            false,
+            0x81,
+        )
+        .await
+        .unwrap();
+        assert_snapshot_rejected(legacy.encode_v2_upload_snapshot());
+
+        // Download offsets are never part of an upload snapshot.
+        let prepared = prepare_v2_fixture(b"offset fixture".to_vec()).await;
+        let mut offset = PreparedPut {
+            total_sig: prepared.total_sig.clone(),
+            chunk_sigs: prepared
+                .chunk_sigs
+                .iter()
+                .map(|chunk| ChunkDesc {
+                    offset: Some(0),
+                    ..*chunk
+                })
+                .collect(),
+            total_len: prepared.total_len,
+            ford_key: prepared.ford_key,
+            ford: prepared.ford.clone(),
+        };
+        assert_snapshot_rejected(offset.encode_v2_upload_snapshot());
+
+        // Unencrypted local transfer state is not V2 upload crypto.
+        offset.chunk_sigs[0].key = ChunkEncryption::TrustedLocal;
+        offset.chunk_sigs[0].offset = None;
+        assert_snapshot_rejected(offset.encode_v2_upload_snapshot());
     }
 }
