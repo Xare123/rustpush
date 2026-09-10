@@ -5529,17 +5529,15 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         Ok(())
     }
 
-    pub async fn upload_asset<F: Read + Send + Sync>(
+    /// MMCS environment for asset-token authorize/PUT round trips. Shared by
+    /// the legacy batch upload and the single prepared one-shot upload so the
+    /// authorize body and MMCS bytes stay identical. The zone name is always
+    /// the caller-supplied exact zone, never a provisioned or substituted one.
+    async fn upload_asset_mmcs_config(
         &self,
         session: &CloudKitSession,
-        zone: &RecordZoneIdentifier,
-        mut assets: Vec<CloudKitUploadRequest<F>>,
-    ) -> Result<HashMap<String, Vec<cloudkit_proto::Asset>>, PushError> {
-        if assets.is_empty() {
-            return Ok(HashMap::new()); // empty requests not allowed
-        }
-        validate_cloudkit_upload_requests(&assets)?;
-        let zone_name = cloudkit_zone_name(zone)?;
+        zone_name: &str,
+    ) -> MMCSConfig {
         let cloudkit_headers = [
             ("x-cloudkit-app-bundleid", self.bundleid), // these header names are slightly different, do not commonize, blame the stupid apple engineers
             ("x-cloudkit-container", &self.containerid),
@@ -5564,7 +5562,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         .map(|(a, b)| (a, b.to_string()))
         .collect();
 
-        let mmcs_config = MMCSConfig {
+        MMCSConfig {
             mme_client_info: self.client.config.get_mme_clientinfo(
                 "com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)",
             ),
@@ -5575,7 +5573,21 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             cloudkit_headers,
             extra_1: Some("2022-08-11".to_string()),
             extra_2: Some("fxd".to_string()),
-        };
+        }
+    }
+
+    pub async fn upload_asset<F: Read + Send + Sync>(
+        &self,
+        session: &CloudKitSession,
+        zone: &RecordZoneIdentifier,
+        mut assets: Vec<CloudKitUploadRequest<F>>,
+    ) -> Result<HashMap<String, Vec<cloudkit_proto::Asset>>, PushError> {
+        if assets.is_empty() {
+            return Ok(HashMap::new()); // empty requests not allowed
+        }
+        validate_cloudkit_upload_requests(&assets)?;
+        let zone_name = cloudkit_zone_name(zone)?;
+        let mmcs_config = self.upload_asset_mmcs_config(session, &zone_name).await;
 
         let mut inputs = vec![];
         let mut cloudkit_put: Vec<CloudKitPreparedAsset> = vec![];
@@ -5608,6 +5620,203 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         .await?;
 
         completed_cloudkit_upload_assets(zone, assets, &receipts)
+    }
+
+    // Single native asset-byte upload through the caller's preallocated
+    // request identity and prepared authentication.
+    //
+    // Exactly one UploadAssetOperation is authorized with
+    // perform_operations_detailed_once_with_identity (no replay, no fresh
+    // identities), then the already-persisted PreparedPut bytes are PUT to
+    // MMCS with the same authorize-body/PUT pieces as Self::upload_asset.
+    // Returns the exact single expected Asset and never creates a record.
+    // retry_policy must carry max_attempts = 1 with a bounded timeout.
+    // Failures past the authorization boundary report
+    // outcome_may_be_committed = true so the durable caller retains the
+    // uncertain attempt instead of replaying. Only redacted logs are emitted;
+    // signatures, receipts, and key material are never logged.
+    pub async fn upload_single_prepared_asset_once_with_identity<F: Read + Send + Sync>(
+        &self,
+        session: &CloudKitSession,
+        zone: &RecordZoneIdentifier,
+        mut asset: CloudKitUploadRequest<F>,
+        request_identity: CloudKitRequestIdentity,
+        prepared_authentication: CloudKitPreparedAuthentication<T>,
+        retry_policy: &CloudKitRetryPolicy,
+    ) -> Result<cloudkit_proto::Asset, CloudKitRequestFailure> {
+        let expected_identity = request_identity.clone();
+        let refused = |reason: &'static str, error: PushError| {
+            warn!("CloudKit single prepared asset upload refused (reason={})", reason);
+            CloudKitRequestFailure {
+                error,
+                retry_after: None,
+                failure_class: None,
+                request_identity: Some(expected_identity.clone()),
+                outcome_may_be_committed: false,
+            }
+        };
+        if retry_policy.max_attempts != 1 {
+            return Err(refused("max-attempts-not-one", cloudkit_invalid_input(
+                "CloudKit single prepared upload requires max_attempts=1",
+            )));
+        }
+        if let Err(error) = validate_cloudkit_upload_requests(std::slice::from_ref(&asset)) {
+            return Err(refused("invalid-upload-request", error));
+        }
+        let zone_name = match cloudkit_zone_name(zone) {
+            Ok(zone_name) => zone_name,
+            Err(error) => {
+                return Err(refused("invalid-zone", error));
+            }
+        };
+        let expected_record = record_identifier(zone.clone(), &asset.record_id);
+        let expected_field = asset.field;
+        let expected_signature = asset.prepared.total_sig.clone();
+        let expected_size = asset.prepared.total_len as u64;
+        let file = match asset.file.take() {
+            Some(file) => file,
+            None => {
+                return Err(refused("upload-file-missing", cloudkit_protocol_error(
+                    "CloudKit upload file was unavailable",
+                )));
+            }
+        };
+        let mmcs_config = self.upload_asset_mmcs_config(session, &zone_name).await;
+        let inputs = vec![(&asset.prepared, None, FileContainer::new(file))];
+        let operation = {
+            let prepared_asset = CloudKitPreparedAsset {
+                record_id: expected_record.clone(),
+                prepared: &asset.prepared,
+                r#type: asset.record_type.to_string(),
+                field_name: asset.field,
+            };
+            let (headers, body) = put_authorize_body(&mmcs_config, &inputs);
+            UploadAssetOperation::new(vec![prepared_asset], headers, body)
+        };
+        let ambiguous = |reason: &'static str, error: PushError| {
+            warn!("CloudKit single prepared asset upload ambiguous (reason={})", reason);
+            CloudKitRequestFailure {
+                error,
+                retry_after: None,
+                failure_class: Some(CloudKitFailureClass::Unknown),
+                request_identity: Some(expected_identity.clone()),
+                outcome_may_be_committed: true,
+            }
+        };
+        let batch = match self
+            .perform_operations_detailed_once_with_identity(
+                session,
+                std::slice::from_ref(&operation),
+                IsolationLevel::Zone,
+                retry_policy,
+                request_identity,
+                prepared_authentication,
+            )
+            .await
+        {
+            Ok(batch) => batch,
+            Err(failure) => {
+                warn!(
+                    "CloudKit single prepared asset upload authorization failed (failure_class={:?})",
+                    failure.failure_class
+                );
+                return Err(failure);
+            }
+        };
+        if batch.request_identity != expected_identity {
+            return Err(ambiguous("response-identity-mismatch", cloudkit_protocol_error(
+                "CloudKit upload authorization identity was unexpected",
+            )));
+        }
+        if batch.outcomes.len() != 1 {
+            return Err(ambiguous("response-shape-mismatch", cloudkit_protocol_error(
+                "CloudKit upload authorization response was not singular",
+            )));
+        }
+        let outcome = match batch.outcomes.into_iter().next() {
+            Some(outcome) => outcome,
+            None => {
+                return Err(ambiguous("response-shape-mismatch", cloudkit_protocol_error(
+                    "CloudKit upload authorization response was missing",
+                )));
+            }
+        };
+        let expected_operation_uuid = expected_identity
+            .operation_uuids()
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        if outcome.request_index != 0 || outcome.operation_uuid != expected_operation_uuid {
+            return Err(ambiguous("response-identity-mismatch", cloudkit_protocol_error(
+                "CloudKit upload authorization identity was unexpected",
+            )));
+        }
+        let retry_after = outcome.retry_after;
+        let failure_class = outcome.failure_class;
+        let token = match outcome.result {
+            Ok(token) => token,
+            Err(error) => {
+                warn!(
+                    "CloudKit single prepared asset upload authorization rejected (failure_class={:?})",
+                    failure_class
+                );
+                return Err(CloudKitRequestFailure {
+                    error,
+                    retry_after,
+                    failure_class,
+                    request_identity: Some(expected_identity),
+                    outcome_may_be_committed: false,
+                });
+            }
+        };
+        let authorization = match cloudkit_upload_authorization(token) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return Err(ambiguous("authorization-incomplete", error));
+            }
+        };
+        let receipts = tokio::time::timeout(
+            bounded_upload_bytes_timeout(retry_policy),
+            put_mmcs(&mmcs_config, inputs, authorization, |_, _| {}),
+        )
+        .await
+        .map_err(|_| {
+            ambiguous("bytes-timed-out", cloudkit_protocol_error(
+                "CloudKit prepared asset bytes timed out",
+            ))
+        })?;
+        let (_, _, receipts) = receipts.map_err(|error| {
+            ambiguous("bytes-failed", error)
+        })?;
+        let mut completed = match completed_cloudkit_upload_assets(zone, vec![asset], &receipts) {
+            Ok(completed) => completed,
+            Err(error) => {
+                return Err(ambiguous("receipt-missing", error));
+            }
+        };
+        let mut single = match completed.remove(expected_field) {
+            Some(single) if single.len() == 1 && completed.is_empty() => single,
+            _ => {
+                return Err(ambiguous("asset-shape-mismatch", cloudkit_protocol_error(
+                    "CloudKit upload did not return the exact single expected asset",
+                )));
+            }
+        };
+        let uploaded = single.remove(0);
+        let receipt_present = uploaded
+            .upload_receipt
+            .as_deref()
+            .is_some_and(|receipt| !receipt.is_empty());
+        if uploaded.record_id.as_ref() != Some(&expected_record)
+            || uploaded.signature.as_deref() != Some(expected_signature.as_slice())
+            || uploaded.size != Some(expected_size)
+            || !receipt_present
+        {
+            return Err(ambiguous("asset-shape-mismatch", cloudkit_protocol_error(
+                "CloudKit upload did not return the exact single expected asset",
+            )));
+        }
+        Ok(uploaded)
     }
 }
 
@@ -5697,6 +5906,15 @@ fn completed_cloudkit_upload_assets<F: Read + Send + Sync>(
     Ok(completed)
 }
 
+// Bounds one MMCS byte-transfer window for the single prepared upload. The
+// authorize step already rejects out-of-range timeouts before any bytes move;
+// this clamp keeps the byte window independently bounded and unit-testable.
+pub(crate) fn bounded_upload_bytes_timeout(retry_policy: &CloudKitRetryPolicy) -> Duration {
+    retry_policy
+        .request_timeout
+        .clamp(Duration::from_secs(1), CLOUDKIT_MAX_ONE_SHOT_REQUEST_TIMEOUT)
+}
+
 #[cfg(test)]
 mod cloudkit_upload_integrity_tests {
     use super::*;
@@ -5762,6 +5980,27 @@ mod cloudkit_upload_integrity_tests {
             req.prepared.total_len = oversized;
             assert!(validate_cloudkit_upload_requests(&[req]).is_err());
         }
+    }
+
+    #[test]
+    fn prepared_upload_byte_window_is_independently_bounded() {
+        let policy = |timeout: Duration| CloudKitRetryPolicy {
+            max_attempts: 1,
+            request_timeout: timeout,
+            ..CloudKitRetryPolicy::default()
+        };
+        assert_eq!(
+            bounded_upload_bytes_timeout(&policy(Duration::from_secs(45))),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            bounded_upload_bytes_timeout(&policy(Duration::from_secs(3600))),
+            CLOUDKIT_MAX_ONE_SHOT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            bounded_upload_bytes_timeout(&policy(Duration::from_secs(0))),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

@@ -64,7 +64,11 @@ use cloudkit_proto::CloudKitEncryptor;
 mod chat_create;
 pub use chat_create::{validate_direct_chat_create, CloudChatRecordLookup, CloudChatSaveInput};
 mod attachment_create;
-pub use attachment_create::{CloudAttachmentRecordLookup, CloudAttachmentSaveInput};
+pub use attachment_create::{
+    CloudAttachmentNativeUploadInput, CloudAttachmentNativeUploadOutcome,
+    CloudAttachmentNativeUploadResult, CloudAttachmentRecordLookup, CloudAttachmentSaveInput,
+    CloudAttachmentUploadConsumeError, CloudMessagesPreparedUploadSubmission,
+};
 
 pub const MESSAGES_SERVICE: PCSService = PCSService {
     name: "Messages3",
