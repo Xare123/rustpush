@@ -37,9 +37,10 @@ impl SendConfirmation {
     }
 
     pub(crate) fn record_status(&self, participant: &str, status: i64) {
-        // Match the send path's existing accepted statuses. Refresh requests,
-        // missing responses and APSError progress are not positive evidence.
-        if matches!(status, 0 | 5008) && self.required.contains(participant) {
+        // Only explicit zero-status acknowledgment is strict proof. Legacy
+        // sending also reports 5008 as Sent, but its exact meaning has not
+        // been qualified for V2. Do not silently promote that weaker result.
+        if status == 0 && self.required.contains(participant) {
             if let Ok(mut accepted) = self.accepted.lock() {
                 accepted.insert(participant.to_owned());
             }
@@ -92,7 +93,7 @@ mod tests {
         evidence.record_status("first", 0);
         evidence.record_status("sender", 0);
         assert!(evidence.require_confirmed().is_err());
-        evidence.record_status("second", 5008);
+        evidence.record_status("second", 0);
         assert!(evidence.require_confirmed().is_ok());
     }
 
@@ -108,6 +109,7 @@ mod tests {
         let evidence = proof(&["recipient"]);
         evidence.record_status("foreign", 0);
         evidence.record_status("recipient", 5032);
+        evidence.record_status("recipient", 5008);
         evidence.record_status("recipient", 6005);
         assert!(evidence.require_confirmed().is_err());
     }
