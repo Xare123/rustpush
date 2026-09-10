@@ -2509,6 +2509,29 @@ pub struct FindMyPhoneStateUpdate {
     content: Vec<FoundDevice>,
 }
 
+fn require_findmy_success_status(status: reqwest::StatusCode) -> Result<(), PushError> {
+    if !status.is_success() {
+        // Status only: never deserialize, log or persist the failure body/URL.
+        return Err(PushError::StatusError(status));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod findmy_http_status_tests {
+    use super::require_findmy_success_status;
+
+    #[test]
+    fn only_success_statuses_can_become_findmy_observations() {
+        for value in [200, 204, 299] {
+            assert!(require_findmy_success_status(reqwest::StatusCode::from_u16(value).unwrap()).is_ok());
+        }
+        for value in [301, 400, 401, 403, 429, 500, 503] {
+            assert!(require_findmy_success_status(reqwest::StatusCode::from_u16(value).unwrap()).is_err());
+        }
+    }
+}
+
 pub struct FindMyPhoneClient<P: AnisetteProvider> {
     server_context: Option<serde_json::Value>,
     dsid: String,
@@ -2585,13 +2608,13 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
         config: &dyn OSConfig,
         path: &str,
     ) -> Result<(), PushError> {
-        let raw_request: serde_json::Value = self
+        let response = self
             .build_request(config, path, json!({}))
             .await?
             .send()
-            .await?
-            .json()
             .await?;
+        require_findmy_success_status(response.status())?;
+        let raw_request: serde_json::Value = response.json().await?;
 
         let request: FindMyPhoneStateUpdate = serde_json::from_value(raw_request.clone())?;
 
@@ -2787,6 +2810,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             self.token_provider.refresh_mme().await?;
         }
 
+        require_findmy_success_status(response.status())?;
         let raw_request: serde_json::Value = response.json().await?;
 
         let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
