@@ -1750,6 +1750,40 @@ impl MMCSFile {
     }
 }
 
+impl MMCSFile {
+    /// Verify plaintext against the original IDS ciphertext signature and key.
+    /// Reads at most size + 1 bytes and rewinds the same handle on success.
+    /// No network or new keys. This is point-in-time verification: the caller
+    /// must retain an immutable source through subsequent preparation/upload.
+    pub async fn verify_plaintext_source<R: Read + Seek + Send + Sync>(
+        &self,
+        mut reader: R,
+    ) -> Result<R, PushError> {
+        if self.key.len() != 32
+            || self.signature.len() != 21
+            || self.signature.first() != Some(&0x81)
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        let limit = self
+            .size
+            .checked_add(1)
+            .ok_or(PushError::VerificationFailed)?;
+        let (total_len, total_sig) = {
+            let bounded = (&mut reader).take(limit as u64);
+            let container = IMessageContainer::new(&self.key, bounded, false);
+            let prepared = prepare_put(container, false, 0x81).await?;
+            (prepared.total_len, prepared.total_sig)
+        };
+        if total_len != self.size || total_sig != self.signature {
+            return Err(PushError::VerificationFailed);
+        }
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        Ok(reader)
+    }
+}
+
 #[cfg(test)]
 mod mmcs_exact_length_tests {
     use super::*;
@@ -1815,6 +1849,155 @@ mod mmcs_exact_length_tests {
         drop(container);
         writer.verify_complete().unwrap();
         assert_eq!(writer.inner.0, plaintext);
+    }
+}
+
+#[cfg(test)]
+mod verify_plaintext_source_tests {
+    use super::*;
+    use std::io::SeekFrom;
+
+    async fn original_fixture(data: &[u8]) -> (MMCSFile, Vec<u8>) {
+        let prepared = MMCSFile::prepare_put(Cursor::new(data.to_vec())).await.unwrap();
+        let file = MMCSFile {
+            signature: prepared.mmcs.total_sig.clone(),
+            object: "test-object".to_string(),
+            url: "https://example.invalid/test-object".to_string(),
+            key: prepared.key.to_vec(),
+            size: prepared.mmcs.total_len,
+        };
+        (file, data.to_vec())
+    }
+
+    fn is_verification_failed(err: PushError) -> bool {
+        matches!(err, PushError::VerificationFailed)
+    }
+
+    #[tokio::test]
+    async fn accepts_original_source_at_eof_and_rewinds_same_handle() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let mut source = Cursor::new(plaintext.to_vec());
+        source.seek(SeekFrom::End(0)).unwrap();
+        let mut returned = file.verify_plaintext_source(source).await.unwrap();
+        assert_eq!(returned.position(), 0);
+        let mut rest = Vec::new();
+        returned.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, plaintext);
+    }
+
+    #[tokio::test]
+    async fn rejects_same_size_wrong_content() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let mut tampered = plaintext.to_vec();
+        tampered[0] ^= 0xff;
+        let err = file
+            .verify_plaintext_source(Cursor::new(tampered))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_key_and_signature() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let mut bad_key = file.clone();
+        bad_key.key[0] ^= 0xff;
+        let err = bad_key
+            .verify_plaintext_source(Cursor::new(plaintext.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+        let mut bad_sig = file.clone();
+        bad_sig.signature[10] ^= 0xff;
+        let err = bad_sig
+            .verify_plaintext_source(Cursor::new(plaintext.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_and_longer_sources() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let err = file
+            .verify_plaintext_source(Cursor::new(plaintext[..8].to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+        let mut longer = plaintext.to_vec();
+        longer.extend_from_slice(b"0123456789abcdef");
+        let err = file
+            .verify_plaintext_source(Cursor::new(longer))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_descriptors() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let mut short_key = file.clone();
+        short_key.key.pop();
+        let err = short_key
+            .verify_plaintext_source(Cursor::new(plaintext.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+        let mut short_sig = file.clone();
+        short_sig.signature.pop();
+        let err = short_sig
+            .verify_plaintext_source(Cursor::new(plaintext.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+        let mut bad_prefix = file.clone();
+        bad_prefix.signature[0] = 0x04;
+        let err = bad_prefix
+            .verify_plaintext_source(Cursor::new(plaintext.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+    }
+
+    #[derive(Debug)]
+    struct FailRead;
+    impl Read for FailRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "synthetic read failure"))
+        }
+    }
+    impl Seek for FailRead {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailSeek;
+    impl Read for FailSeek {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "synthetic read failure"))
+        }
+    }
+    impl Seek for FailSeek {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "synthetic seek failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_read_and_seek_errors() {
+        let plaintext = b"synthetic cloudkit-descriptor fixture";
+        let (file, _) = original_fixture(plaintext).await;
+        let err = file.verify_plaintext_source(FailRead).await.unwrap_err();
+        assert!(matches!(err, PushError::IoError(_)));
+        let err = file.verify_plaintext_source(FailSeek).await.unwrap_err();
+        assert!(matches!(err, PushError::IoError(_)));
     }
 }
 
