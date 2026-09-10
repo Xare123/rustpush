@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, collections::BTreeSet, io::Cursor, time::SystemTime};
 
 use crate::{
-    keychain::{KeychainClient, KeychainClientState, PCSMeta, SavedKeychainZone},
+    keychain::{KeychainClient, KeychainClientState, PCSMeta, SavedKeychainZone, SivKey},
     util::{
         base64_decode, base64_encode, decode_hex, encode_hex, kdf_ctr_hmac, rfc6637_unwrap_key,
         rfc6637_wrap_key, CompactECKey,
@@ -14,6 +14,7 @@ use aes_gcm::KeyInit;
 use aes_gcm::{AesGcm, Nonce, Tag};
 use chrono::Utc;
 use cloudkit_proto::{CloudKitEncryptor, ProtectionInfo, RecordIdentifier};
+use keystore::keystore;
 use log::{info, warn};
 use omnisette::AnisetteProvider;
 use openssl::{
@@ -224,6 +225,88 @@ pub async fn get_boundary_key(
             .await?;
 
         Ok(key.to_vec())
+    }
+}
+
+/// Reads the existing exact service/current-DSID boundary key without
+/// generating, inserting, or syncing boundary-key material and without any
+/// remote operation.
+///
+/// Plaintext entries open with no keystore access. Wrapped-only entries
+/// open through the injected read-only access-secret loader, which never
+/// creates secrets (unlike the legacy ensure-based path). The production
+/// loader calls the global keystore, so it carries the same precondition
+/// as every other keystore path in the app: the global store must already
+/// be initialized, otherwise the global accessor panics.
+///
+/// Missing, duplicate, or ambiguous matches and entries without key data
+/// fail with the existing content-free share-key error. Loader failures,
+/// decrypt failures, and stored keys that are not exactly 32 bytes fail
+/// with the existing content-free malformed error; raw keystore or decrypt
+/// details never propagate.
+pub async fn get_boundary_key_lookup_only(
+    service: &PCSService<'_>,
+    keychain: &KeychainClient<impl AnisetteProvider>,
+) -> Result<Vec<u8>, PushError> {
+    get_boundary_key_lookup_only_with(service, keychain, |dsid: &str| {
+        keystore()
+            .get_secret(&format!("keychain:access-key:{dsid}"))
+            .map_err(|_| PushError::BadMsg)
+    })
+    .await
+}
+
+/// Lookup-only boundary-key read with an injected read-only access-secret
+/// loader. The loader receives the current DSID borrowed from the same
+/// state lock guarding the entry scan, so the alias always names the
+/// account whose entries are being matched even if state changes between
+/// calls. Production passes a loader over that alias; tests inject canned
+/// secrets, so no global store initialization or mutation is required to
+/// exercise the wrapped path. The loader runs only for a single
+/// wrapped-only match, never for plaintext, missing, or ambiguous
+/// entries. The generic takes Send + Sync so the returned future stays
+/// Send across the state-lock await.
+pub(crate) async fn get_boundary_key_lookup_only_with<F>(
+    service: &PCSService<'_>,
+    keychain: &KeychainClient<impl AnisetteProvider>,
+    load_access_secret: F,
+) -> Result<Vec<u8>, PushError>
+where
+    F: Fn(&str) -> Result<Option<Vec<u8>>, PushError> + Send + Sync,
+{
+    let state = keychain.state.read().await;
+    let mut candidates = state.items.get(service.zone).into_iter().flat_map(|items| {
+        items.keys.values().filter(|candidate| {
+            candidate.get("acct") == Some(&Value::String("PCSBoundaryKey".to_string()))
+                && candidate.get("srvr") == Some(&Value::String(state.dsid.clone()))
+        })
+    });
+    let existing = candidates.next();
+    let ambiguous = candidates.next().is_some();
+    match existing {
+        Some(existing) if !ambiguous => {
+            if let Some(Value::Data(key)) = existing.get("v_Data") {
+                if key.len() != 32 {
+                    return Err(PushError::BadMsg);
+                }
+                return Ok(key.clone());
+            }
+            let wrapped = match existing.get("v_Data_Encrypted") {
+                Some(Value::Data(wrapped)) => wrapped,
+                _ => return Err(share_key_not_found()),
+            };
+            let secret = match load_access_secret(&state.dsid) {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return Err(share_key_not_found()),
+                Err(_) => return Err(PushError::BadMsg),
+            };
+            let key = SivKey(secret).try_decrypt(wrapped)?;
+            if key.len() != 32 {
+                return Err(PushError::BadMsg);
+            }
+            Ok(key)
+        }
+        _ => Err(share_key_not_found()),
     }
 }
 

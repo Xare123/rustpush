@@ -700,6 +700,27 @@ fn select_source_chunks(
         .collect()
 }
 
+/// Final download-target gate for every MMCS get path: exact cardinality, no
+/// leftover writers, no incomplete targets, and never an empty target set.
+/// Unrelated sibling references are skipped during selection so they never
+/// reach this gate. Same-checksum duplicates must fully match (one reference
+/// per requested file) or fail closed; a deduped single reference for two
+/// same-checksum files is a leftover-writer failure, not partial success.
+/// Known gap: the standard selector below is first-pending-match and is not
+/// Ford-key-qualified, so same-checksum Ford siblings with different keys may
+/// pair cross-key and fail later at ford decode/transfer rather than here.
+fn validate_download_targets(
+    targets_len: usize,
+    files_len: usize,
+    writers_remaining: bool,
+    any_incomplete: bool,
+) -> Result<(), PushError> {
+    if targets_len == 0 || targets_len != files_len || writers_remaining || any_incomplete {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(())
+}
+
 fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PushError> {
     bytes.try_into().map_err(|_| PushError::VerificationFailed)
 }
@@ -2715,19 +2736,6 @@ async fn get_mmcs_with_network_policy(
             continue;
         };
 
-        if let Some(ford_reference) = &wanted_chunks.ford_reference {
-            let ford_key = files
-                .get(file_index)
-                .and_then(|file| file.3.clone())
-                .ok_or(PushError::VerificationFailed)?;
-            ford_containers.push((
-                wanted_chunks.chunk_references.clone(),
-                ford_reference.clone(),
-                Vec::new(),
-                ford_key,
-            ));
-        }
-
         let mut target_chunks = Vec::with_capacity(wanted_chunks.chunk_references.len());
         for chunk_reference in &wanted_chunks.chunk_references {
             let chunk = response_chunk(
@@ -2751,6 +2759,18 @@ async fn get_mmcs_with_network_policy(
         if target_chunks.is_empty() {
             return Err(PushError::VerificationFailed);
         }
+        if let Some(ford_reference) = &wanted_chunks.ford_reference {
+            let ford_key = files
+                .get(file_index)
+                .and_then(|file| file.3.clone())
+                .ok_or(PushError::VerificationFailed)?;
+            ford_containers.push((
+                wanted_chunks.chunk_references.clone(),
+                ford_reference.clone(),
+                Vec::new(),
+                ford_key,
+            ));
+        }
         let writer = files
             .get_mut(file_index)
             .ok_or(PushError::VerificationFailed)?
@@ -2765,11 +2785,15 @@ async fn get_mmcs_with_network_policy(
         ford_containers.len()
     );
 
-    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
-        && (targets.len() != files.len() || files.iter().any(|file| file.2.is_some()))
-    {
-        return Err(PushError::VerificationFailed);
-    }
+    // Exact cardinality on every path: unrelated siblings skip during
+    // selection, so they never inflate the count; missing or leftover
+    // writers fail here rather than reporting partial success.
+    validate_download_targets(
+        targets.len(),
+        files.len(),
+        files.iter().any(|file| file.2.is_some()),
+        false,
+    )?;
 
     let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
     if !ford_containers.is_empty() {
@@ -2829,11 +2853,14 @@ async fn get_mmcs_with_network_policy(
                 total: total_bytes,
             };
             matcher.transfer_chunks(config, |_, _| {}).await?;
-            if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
-                && matcher.targets.iter().any(|target| !target.complete())
-            {
-                return Err(PushError::VerificationFailed);
-            }
+            // Ford envelope targets must also fully complete on every path;
+            // chunk authentication alone does not prove all chunks arrived.
+            validate_download_targets(
+                matcher.targets.len(),
+                matcher.targets.len(),
+                false,
+                matcher.targets.iter().any(|target| !target.complete()),
+            )?;
         }
 
         for (references, _ford_ref, ford, key) in ford_containers {
@@ -2882,11 +2909,15 @@ async fn get_mmcs_with_network_policy(
     };
     matcher.transfer_chunks(config, progress).await?;
     debug!("Completed MMCS chunk transfer");
-    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
-        && matcher.targets.iter().any(|target| !target.complete())
-    {
-        return Err(PushError::VerificationFailed);
-    }
+    // The standard path previously reported success with incomplete targets here.
+    // Per-chunk reads already fail on short chunks; the guard below closes
+    // the truncated-tail case (cardinality was proven at coverage time).
+    validate_download_targets(
+        matcher.targets.len(),
+        matcher.targets.len(),
+        false,
+        matcher.targets.iter().any(|target| !target.complete()),
+    )?;
 
     // cloudkit doesn't do getComplete
     if network_policy.sends_completion() && !url.is_empty() {
@@ -3268,6 +3299,54 @@ mod download_only_tests {
         assert_verification_failed(validate_preauthorized_download_response(
             &response, &requested,
         ));
+    }
+
+    #[test]
+    fn download_target_gate_rejects_missing_zero_and_leftover() {
+        // Zero targets and missing references fail, even with no writers left.
+        assert_verification_failed(validate_download_targets(0, 1, true, false));
+        assert_verification_failed(validate_download_targets(0, 0, false, false));
+        // Duplicated requested content with only one match leaves a writer
+        // behind and must fail rather than report partial success.
+        assert_verification_failed(validate_download_targets(1, 2, true, false));
+        // Full cardinality with an incomplete tail still fails.
+        assert_verification_failed(validate_download_targets(2, 2, false, true));
+        assert_verification_failed(validate_download_targets(1, 1, false, true));
+        // Fully matched content, including duplicated requests with one
+        // reference per file, passes.
+        assert!(validate_download_targets(1, 1, false, false).is_ok());
+        assert!(validate_download_targets(2, 2, false, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn download_target_gate_uses_real_matcher_completeness() {
+        // Real ChunkedContainer completeness feeds the production guard, so
+        // this asserts the new final guard rather than complete() alone.
+        let chunk = ChunkDesc {
+            id: [0x11; 21],
+            size: 1,
+            key: ChunkEncryption::VerifiedRemotePlaintext,
+            offset: None,
+        };
+        let mut full =
+            ChunkedContainer::new(vec![chunk], FileContainer::new(Cursor::new(Vec::new())));
+        full.write_chunk(&([0x11; 21], vec![9u8])).await.unwrap();
+        assert!(validate_download_targets(1, 1, false, !full.complete()).is_ok());
+        let mut partial = ChunkedContainer::new(
+            vec![
+                chunk,
+                ChunkDesc {
+                    id: [0x22; 21],
+                    size: 1,
+                    key: ChunkEncryption::VerifiedRemotePlaintext,
+                    offset: None,
+                },
+            ],
+            FileContainer::new(Cursor::new(Vec::new())),
+        );
+        partial.write_chunk(&([0x11; 21], vec![9u8])).await.unwrap();
+        assert!(!partial.complete());
+        assert_verification_failed(validate_download_targets(1, 1, false, !partial.complete()));
     }
 
     #[test]

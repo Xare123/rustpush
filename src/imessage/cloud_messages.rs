@@ -19,7 +19,7 @@ use crate::cloudkit::{
     CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE, CLOUDKIT_MAX_OPERATIONS_PER_REQUEST, NO_ASSETS,
 };
 use crate::mmcs::{prepare_put_v2, PreparedPut};
-use crate::pcs::{get_boundary_key, PCSKey, PCSService};
+use crate::pcs::{get_boundary_key, get_boundary_key_lookup_only, PCSKey, PCSService};
 use crate::util::DebugMutex;
 use backon::{ConstantBuilder, Retryable};
 use bitflags::bitflags;
@@ -63,6 +63,8 @@ use cloudkit_proto::CloudKitEncryptor;
 
 mod chat_create;
 pub use chat_create::{validate_direct_chat_create, CloudChatRecordLookup, CloudChatSaveInput};
+mod attachment_create;
+pub use attachment_create::{CloudAttachmentRecordLookup, CloudAttachmentSaveInput};
 
 pub const MESSAGES_SERVICE: PCSService = PCSService {
     name: "Messages3",
@@ -3364,6 +3366,23 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await?)
     }
 
+    /// Stages a file for a V2 protected attachment upload using only the
+    /// already-present exact service/current-DSID boundary key. Never
+    /// generates, inserts, or syncs boundary-key material; missing or
+    /// invalid key data fails instead. Wrapped entries open through the
+    /// read-only access-secret load, so this carries the app's standard
+    /// initialized-keystore precondition and performs no remote writes.
+    pub async fn prepare_file_lookup_only<T: Read + Send + Sync>(
+        &self,
+        file: T,
+    ) -> Result<PreparedPut, PushError> {
+        Ok(prepare_put_v2(
+            FileContainer::new(file),
+            &get_boundary_key_lookup_only(&MESSAGES_SERVICE, &self.keychain).await?,
+        )
+        .await?)
+    }
+
     pub async fn download_attachment<T: Write + Send + Sync>(
         &self,
         files: HashMap<String, T>,
@@ -3642,11 +3661,12 @@ mod cloud_message_identity_tests {
             acquire_cloudkit_read_authentication, pause_cloudkit_writer_operations,
             resume_cloudkit_writer_operations,
         },
-        keychain::{CloudKitContainerCaches, KeychainClient, KeychainClientState},
+        keychain::{CloudKitContainerCaches, KeychainClient, KeychainClientState, SivKey},
         DebugMeta, DebugRwLock, OSConfig, RegisterMeta, TokenProvider,
     };
     use icloud_auth::{AppleAccount, LoginClientInfo};
     use omnisette::{AnisetteClient, AnisetteError, ArcAnisetteClient};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{collections::HashMap, future::Future};
 
     #[test]
@@ -4451,5 +4471,453 @@ mod cloud_message_identity_tests {
                 .await,
             Err(PushError::UnauthorizedAccountError)
         ));
+    }
+
+    fn boundary_key_entry(dsid: &str, key_data: Option<Vec<u8>>) -> plist::Dictionary {
+        let mut entry = plist::Dictionary::new();
+        entry.insert(
+            "acct".to_owned(),
+            Value::String("PCSBoundaryKey".to_owned()),
+        );
+        entry.insert("srvr".to_owned(), Value::String(dsid.to_owned()));
+        if let Some(key_data) = key_data {
+            entry.insert("v_Data".to_owned(), Value::Data(key_data));
+        }
+        entry
+    }
+
+    fn boundary_key_encrypted_entry(dsid: &str, wrapped_data: Vec<u8>) -> plist::Dictionary {
+        let mut entry = plist::Dictionary::new();
+        entry.insert(
+            "acct".to_owned(),
+            Value::String("PCSBoundaryKey".to_owned()),
+        );
+        entry.insert("srvr".to_owned(), Value::String(dsid.to_owned()));
+        entry.insert("v_Data_Encrypted".to_owned(), Value::Data(wrapped_data));
+        entry
+    }
+
+    enum CannedSecret {
+        Absent,
+        Bytes(Vec<u8>),
+        Failing,
+    }
+
+    /// Loader stub that counts invocations and answers only for the
+    /// expected DSID, proving the helper threads the current account alias
+    /// instead of a stale one. Send + Sync so the lookup future stays Send.
+    fn counting_loader<'a>(
+        calls: &'a AtomicUsize,
+        expected_dsid: &'a str,
+        canned: CannedSecret,
+    ) -> impl Fn(&str) -> Result<Option<Vec<u8>>, PushError> + 'a {
+        move |dsid: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if dsid != expected_dsid {
+                return Err(PushError::BadMsg);
+            }
+            match &canned {
+                CannedSecret::Absent => Ok(None),
+                CannedSecret::Bytes(secret) => Ok(Some(secret.clone())),
+                CannedSecret::Failing => Err(PushError::BadMsg),
+            }
+        }
+    }
+
+    async fn insert_engram_boundary_key(fixture: &Fixture, uuid: &str, entry: plist::Dictionary) {
+        fixture
+            .messages
+            .keychain
+            .state
+            .write()
+            .await
+            .items
+            .entry(MESSAGES_SERVICE.zone.to_owned())
+            .or_default()
+            .keys
+            .insert(uuid.to_owned(), entry);
+    }
+
+    async fn engram_boundary_key_count(fixture: &Fixture) -> usize {
+        fixture
+            .messages
+            .keychain
+            .state
+            .read()
+            .await
+            .items
+            .get(MESSAGES_SERVICE.zone)
+            .map(|zone| zone.keys.len())
+            .unwrap_or(0)
+    }
+
+    fn assert_lookup_error_content_free(error: &PushError, sentinels: &[&str]) {
+        let formatted = format!("{error:?} {error}");
+        for sentinel in sentinels {
+            assert!(
+                !formatted.contains(sentinel),
+                "loggable error exposed sentinel material"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_missing_key_fails_without_creating() {
+        let fixture = valid_fixture();
+        assert_eq!(engram_boundary_key_count(&fixture).await, 0);
+        let error =
+            crate::pcs::get_boundary_key_lookup_only(&MESSAGES_SERVICE, &fixture.messages.keychain)
+                .await
+                .expect_err("missing boundary key must fail");
+        assert!(
+            matches!(error, PushError::ShareKeyNotFound(ref name) if name == "unavailable"),
+            "unexpected error: {error:?}"
+        );
+        // PreparedPut carries no Debug impl, so assert on the result with
+        // matches! rather than expect_err.
+        let staged = fixture
+            .messages
+            .prepare_file_lookup_only(Cursor::new(vec![0xA5u8; 8]))
+            .await;
+        assert!(
+            matches!(
+                staged,
+                Err(PushError::ShareKeyNotFound(ref name)) if name == "unavailable"
+            ),
+            "lookup-only staging without a key must fail content-free"
+        );
+        let calls = AtomicUsize::new(0);
+        let tracked = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await;
+        assert!(
+            matches!(
+                tracked,
+                Err(PushError::ShareKeyNotFound(ref name)) if name == "unavailable"
+            ),
+            "lookup-only injected read without a key must fail content-free"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run when no entry matches"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 0);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrong_account_fails_content_free() {
+        let sentinel_dsid = "SENTINEL_WRONG_DSID_DO_NOT_EXPOSE";
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrong-account",
+            boundary_key_entry(sentinel_dsid, Some(vec![0x11u8; 32])),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect_err("wrong-account boundary key must fail");
+        assert!(
+            matches!(error, PushError::ShareKeyNotFound(ref name) if name == "unavailable"),
+            "unexpected error: {error:?}"
+        );
+        assert_lookup_error_content_free(&error, &[sentinel_dsid]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run for a wrong-account entry"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_duplicate_keys_fail_ambiguous() {
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-a",
+            boundary_key_entry("123", Some(vec![0x22u8; 32])),
+        )
+        .await;
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-b",
+            boundary_key_entry("123", Some(vec![0x33u8; 32])),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect_err("duplicate boundary keys must fail as ambiguous");
+        assert!(
+            matches!(error, PushError::ShareKeyNotFound(ref name) if name == "unavailable"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run for ambiguous matches"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 2);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_missing_key_data_fails() {
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-no-data",
+            boundary_key_entry("123", None),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect_err("boundary entry without key data must fail");
+        assert!(
+            matches!(error, PushError::ShareKeyNotFound(ref name) if name == "unavailable"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run when the entry carries no key data"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrong_length_key_fails() {
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-short",
+            boundary_key_entry("123", Some(vec![0x44u8; 16])),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect_err("non-32-byte boundary key must fail");
+        assert!(
+            matches!(error, PushError::BadMsg),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run for a plaintext entry"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrapped_valid_key_round_trips() {
+        // True AES-SIV behavior: wrap with the access secret, then open
+        // through the injected read-only loader. Success proves the loader
+        // received the current DSID, since the stub answers only for it. No
+        // global keystore initialization or mutation is involved.
+        let fixture = valid_fixture();
+        let access = vec![0x0Bu8; 64];
+        let boundary = vec![0x42u8; 32];
+        let wrapped = SivKey(access.clone()).encrypt(&boundary);
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrapped-valid",
+            boundary_key_encrypted_entry("123", wrapped),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let looked_up = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Bytes(access)),
+        )
+        .await
+        .expect("valid wrapped boundary key must open");
+        assert_eq!(looked_up, boundary);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run exactly once for a wrapped-only match"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrapped_malformed_ciphertext_fails_content_free() {
+        let sentinel_wrapped = "SENTINEL_WRAPPED_BYTES_DO_NOT_EXPOSE";
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrapped-malformed",
+            boundary_key_encrypted_entry("123", sentinel_wrapped.as_bytes().to_vec()),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Bytes(vec![0x0Bu8; 64])),
+        )
+        .await
+        .expect_err("malformed wrapped boundary key must fail");
+        assert!(
+            matches!(error, PushError::BadMsg),
+            "unexpected error: {error:?}"
+        );
+        assert_lookup_error_content_free(&error, &[sentinel_wrapped]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run for a wrapped-only match"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrapped_absent_access_key_fails() {
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrapped-no-secret",
+            boundary_key_encrypted_entry("123", vec![0x99u8; 48]),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect_err("wrapped entry without an access secret must fail");
+        assert!(
+            matches!(error, PushError::ShareKeyNotFound(ref name) if name == "unavailable"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run for a wrapped-only match"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrapped_failing_loader_fails_content_free() {
+        let sentinel_wrapped = "SENTINEL_WRAPPED_FAILING_DO_NOT_EXPOSE";
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrapped-failing-loader",
+            boundary_key_encrypted_entry("123", sentinel_wrapped.as_bytes().to_vec()),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Failing),
+        )
+        .await
+        .expect_err("wrapped entry with a failing loader must fail");
+        assert!(
+            matches!(error, PushError::BadMsg),
+            "unexpected error: {error:?}"
+        );
+        assert_lookup_error_content_free(&error, &[sentinel_wrapped]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run for a wrapped-only match"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_lookup_only_wrapped_short_access_key_fails() {
+        let fixture = valid_fixture();
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-wrapped-short-secret",
+            boundary_key_encrypted_entry("123", vec![0x99u8; 48]),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let error = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Bytes(vec![0x0Bu8; 16])),
+        )
+        .await
+        .expect_err("wrapped entry with a short access secret must fail");
+        assert!(
+            matches!(error, PushError::BadMsg),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "loader must run for a wrapped-only match"
+        );
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_file_lookup_only_uses_existing_key_without_creating() {
+        let fixture = valid_fixture();
+        let expected_key = vec![0x42u8; 32];
+        insert_engram_boundary_key(
+            &fixture,
+            "boundary-key-valid",
+            boundary_key_entry("123", Some(expected_key.clone())),
+        )
+        .await;
+        let calls = AtomicUsize::new(0);
+        let looked_up = crate::pcs::get_boundary_key_lookup_only_with(
+            &MESSAGES_SERVICE,
+            &fixture.messages.keychain,
+            counting_loader(&calls, "123", CannedSecret::Absent),
+        )
+        .await
+        .expect("valid boundary key must look up");
+        assert_eq!(looked_up, expected_key);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "loader must not run for a plaintext entry"
+        );
+        let payload = vec![0xA5u8; 64];
+        let prepared = fixture
+            .messages
+            .prepare_file_lookup_only(Cursor::new(payload.clone()))
+            .await
+            .expect("lookup-only staging must use the existing key");
+        assert_eq!(prepared.total_len, payload.len());
+        assert!(!prepared.chunk_sigs.is_empty());
+        assert!(!prepared.total_sig.is_empty());
+        assert_eq!(engram_boundary_key_count(&fixture).await, 1);
     }
 }

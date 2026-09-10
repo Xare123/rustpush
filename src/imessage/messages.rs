@@ -1389,13 +1389,14 @@ impl<T: Write + Send + Sync> WriteContainer for IMessageContainer<T> {
         let mut plaintext = vec![0; data.len() + block_size];
         let len = self.crypter.update(&data, &mut plaintext).unwrap();
         plaintext.resize(len, 0);
-        self.inner.write(&plaintext)?;
+        self.inner.write_all(&plaintext)?;
         Ok(())
     }
 
     async fn finalize(&mut self, _config: &MMCSConfig) -> Result<Option<MMCSReceipt>, PushError> {
         let extra = self.finish();
-        self.inner.write(&extra)?;
+        self.inner.write_all(&extra)?;
+        self.inner.flush()?;
         Ok(None)
     }
 }
@@ -1443,6 +1444,43 @@ pub struct MMCSFile {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub key: Vec<u8>,
     pub size: usize,
+}
+
+// CTR preserves byte length. A successful download must consume exactly the
+// length in the original sent MMCS descriptor, not just the server's progress
+// counter. This bounds writes too, before surplus plaintext reaches the file.
+struct MMCSExactLengthWriter<T> {
+    inner: T,
+    remaining: usize,
+}
+
+impl<T: Write> Write for MMCSExactLengthWriter<T> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MMCS size mismatch",
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining = self.remaining.checked_sub(written).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "MMCS size mismatch")
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T> MMCSExactLengthWriter<T> {
+    fn verify_complete(&self) -> Result<(), PushError> {
+        if self.remaining != 0 {
+            return Err(PushError::VerificationFailed);
+        }
+        Ok(())
+    }
 }
 
 impl From<MMCSTransferData> for MMCSFile {
@@ -1583,6 +1621,13 @@ impl MMCSFile {
         writer: impl Write + Send + Sync,
         progress: impl FnMut(usize, usize) + Send + Sync,
     ) -> Result<(), PushError> {
+        if self.key.len() != 32
+            || self.signature.len() != 21
+            || self.object.is_empty()
+            || self.url.is_empty()
+        {
+            return Err(PushError::VerificationFailed);
+        }
         #[derive(Serialize, Deserialize)]
         struct RequestMMCSDownload {
             #[serde(rename = "mO")]
@@ -1621,7 +1666,11 @@ impl MMCSFile {
             extra_2: None,
         };
 
-        let recieve_container = IMessageContainer::new(&self.key, writer, true);
+        let mut exact_writer = MMCSExactLengthWriter {
+            inner: writer,
+            remaining: self.size,
+        };
+        let recieve_container = IMessageContainer::new(&self.key, &mut exact_writer, true);
 
         let domain = self.url.replace(&format!("/{}", &self.object), "");
         let msg_id = new_aps_id();
@@ -1645,11 +1694,7 @@ impl MMCSFile {
             signature: self.signature.to_vec().into(),
         };
 
-        info!(
-            "mmcs obj {} sig {}",
-            self.object,
-            encode_hex(&self.signature)
-        );
+        debug!("Requesting MMCS attachment download");
 
         let recv = apns.subscribe().await;
         apns.send_message("com.apple.madrid", request_download, Some(msg_id))
@@ -1700,7 +1745,76 @@ impl MMCSFile {
         )
         .await?;
 
+        exact_writer.verify_complete()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mmcs_exact_length_tests {
+    use super::*;
+
+    struct ShortWriter(Vec<u8>);
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = bytes.len().min(1);
+            self.0.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exact_length_rejects_missing_and_extra_bytes() {
+        let mut writer = MMCSExactLengthWriter {
+            inner: Vec::new(),
+            remaining: 3,
+        };
+        assert!(writer.verify_complete().is_err());
+        writer.write_all(b"ab").unwrap();
+        assert!(writer.verify_complete().is_err());
+        assert!(writer.write_all(b"cd").is_err());
+        assert_eq!(writer.inner, b"ab");
+        writer.write_all(b"c").unwrap();
+        writer.verify_complete().unwrap();
+        assert!(writer.write_all(b"d").is_err());
+        assert_eq!(writer.inner, b"abc");
+    }
+
+    #[test]
+    fn exact_length_accounts_for_short_sink_writes() {
+        let mut writer = MMCSExactLengthWriter {
+            inner: ShortWriter(Vec::new()),
+            remaining: 3,
+        };
+        writer.write_all(b"abc").unwrap();
+        writer.verify_complete().unwrap();
+        assert_eq!(writer.inner.0, b"abc");
+    }
+
+    #[tokio::test]
+    async fn decrypted_container_does_not_drop_short_sink_writes() {
+        let key = [0x42u8; 32];
+        let plaintext = b"synthetic short-write fixture";
+        let encrypted =
+            openssl::symm::encrypt(Cipher::aes_256_ctr(), &key, Some(&ZERO_NONCE), plaintext)
+                .unwrap();
+        let mut writer = MMCSExactLengthWriter {
+            inner: ShortWriter(Vec::new()),
+            remaining: plaintext.len(),
+        };
+        let mut container = IMessageContainer::new(&key, &mut writer, true);
+        WriteContainer::write(&mut container, &encrypted)
+            .await
+            .unwrap();
+        // AES-CTR has no final payload or authentication tag. The production
+        // matcher checks chunks; this test isolates decrypted sink integrity.
+        assert!(container.finish().is_empty());
+        drop(container);
+        writer.verify_complete().unwrap();
+        assert_eq!(writer.inner.0, plaintext);
     }
 }
 
