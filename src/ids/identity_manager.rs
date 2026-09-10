@@ -35,6 +35,8 @@ use tokio::select;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+pub use super::send_confirmation::SendConfirmation;
+
 use crate::{
     aps::{get_message, APSConnection, APSInterestToken},
     ids::{
@@ -1433,10 +1435,16 @@ impl IdentityResource {
             message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
         }
 
+        let confirmation = SendConfirmation::new(
+            &ids_message.sender,
+            message_targets.iter().map(|target| target.participant.as_str()),
+            !ids_message.no_response && ids_message.relay.is_none(),
+        );
         if message_targets.is_empty() {
             return Ok(SendJob {
                 process: tokio::sync::broadcast::channel(1).1,
                 handle: None,
+                confirmation,
             });
         }
 
@@ -1454,6 +1462,7 @@ impl IdentityResource {
             status: sender,
             topic,
             sent_timestamp: since_the_epoch.as_millis() as u64,
+            confirmation: confirmation.clone(),
         };
 
         let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
@@ -1486,6 +1495,7 @@ impl IdentityResource {
         Ok(SendJob {
             process: receiver,
             handle: if checked { None } else { Some(job_spawned) },
+            confirmation,
         })
     }
 }
@@ -1565,6 +1575,21 @@ pub enum SendResult {
 pub struct SendJob {
     pub process: tokio::sync::broadcast::Receiver<(DeliveryHandle, SendResult)>,
     pub handle: Option<JoinHandle<Result<(), PushError>>>,
+    confirmation: SendConfirmation,
+}
+
+impl SendJob {
+    /// Clone before consuming the handle, then check only after successful
+    /// completion. `handle == None` also covers zero-target no-op sends and
+    /// therefore cannot, by itself, authorize a CloudKit write.
+    pub fn confirmation(&self) -> SendConfirmation {
+        self.confirmation.clone()
+    }
+
+    pub(crate) fn requiring_participants<'a>(mut self, participants: impl Iterator<Item = &'a str>) -> Self {
+        self.confirmation = self.confirmation.requiring_participants(participants);
+        self
+    }
 }
 
 struct InnerSendJob {
@@ -1575,6 +1600,7 @@ struct InnerSendJob {
     pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
     pub topic: &'static str,
     pub sent_timestamp: u64,
+    confirmation: SendConfirmation,
 }
 
 impl InnerSendJob {
@@ -1764,7 +1790,9 @@ impl InnerSendJob {
                 }) else {
                     continue;
                 };
-                match load.status.unwrap() {
+                let status = load.status.ok_or(PushError::BadMsg)?;
+                self.confirmation.record_status(&remain_targets[target_idx].participant, status);
+                match status {
                     5032 => {
                         info!("got 5032, refreshing keys!");
                         refresh_targets.push(remain_targets.remove(target_idx));

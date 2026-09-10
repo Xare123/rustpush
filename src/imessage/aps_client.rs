@@ -489,8 +489,13 @@ impl IMClient {
 
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
-        self.identity
+        let job = self.identity
             .send_message(topic, ids_message, message_targets)
-            .await
+            .await?;
+        // Positive CloudKit confirmation must cover the intended route, not
+        // only the subset for which IDS returned cached device targets.
+        Ok(job.requiring_participants(targets.iter()
+            .filter(|target| !my_handles.contains(target))
+            .map(String::as_str)))
     }
 }
