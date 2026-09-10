@@ -5538,6 +5538,8 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         if assets.is_empty() {
             return Ok(HashMap::new()); // empty requests not allowed
         }
+        validate_cloudkit_upload_requests(&assets)?;
+        let zone_name = cloudkit_zone_name(zone)?;
         let cloudkit_headers = [
             ("x-cloudkit-app-bundleid", self.bundleid), // these header names are slightly different, do not commonize, blame the stupid apple engineers
             ("x-cloudkit-container", &self.containerid),
@@ -5547,7 +5549,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             ("x-cloudkit-deviceid", &self.client.config.get_udid()),
             (
                 "x-cloudkit-zones",
-                &zone.value.as_ref().unwrap().name.as_ref().unwrap(),
+                &zone_name,
             ),
             (
                 "x-apple-operation-group-id",
@@ -5581,7 +5583,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             inputs.push((
                 &asset.prepared,
                 None,
-                FileContainer::new(asset.file.take().unwrap()),
+                FileContainer::new(asset.file.take().ok_or_else(|| {
+                    cloudkit_protocol_error("CloudKit upload file was unavailable")
+                })?),
             ));
             cloudkit_put.push(CloudKitPreparedAsset {
                 record_id: record_identifier(zone.clone(), &asset.record_id),
@@ -5594,53 +5598,259 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         let operation = UploadAssetOperation::new(cloudkit_put, headers, body);
         let asset_response = self.perform(session, operation).await?;
 
-        let asset_data = asset_response
-            .asset_info
-            .into_iter()
-            .next()
-            .expect("No asset info?")
-            .asset
-            .expect("No asset?");
+        let authorization = cloudkit_upload_authorization(asset_response)?;
         let (_, _, receipts) = put_mmcs(
             &mmcs_config,
             inputs,
-            AuthorizedOperation {
-                url: format!(
-                    "{}/{}",
-                    asset_data.host.expect("No host??"),
-                    asset_data.container.expect("No container??")
-                ),
-                dsid: asset_data.dsid.expect("No dsid??"),
-                body: asset_response.upload_info.expect("No upload info??"),
-            },
+            authorization,
             |p, t| {},
         )
         .await?;
 
-        let mut item: HashMap<String, Vec<cloudkit_proto::Asset>> = HashMap::new();
-        for req in assets {
-            item.entry(req.field.to_string())
-                .or_default()
-                .push(cloudkit_proto::Asset {
-                    signature: Some(req.prepared.total_sig.clone()),
-                    size: Some(req.prepared.total_len as u64),
-                    record_id: Some(record_identifier(zone.clone(), &req.record_id)),
-                    upload_receipt: Some(
-                        receipts
-                            .get(&req.prepared.total_sig)
-                            .expect("No receipt for upload??")
-                            .clone(),
-                    ),
-                    protection_info: req.prepared.ford_key.map(|k| ProtectionInfo {
-                        protection_info: Some(k.to_vec()),
-                        protection_info_tag: None,
-                    }),
-                    reference_signature: req.prepared.ford.as_ref().map(|f| f.0.to_vec()),
-                    ..Default::default()
-                });
-        }
+        completed_cloudkit_upload_assets(zone, assets, &receipts)
+    }
+}
 
-        Ok(item)
+fn validate_cloudkit_upload_requests<F: Read + Send + Sync>(
+    assets: &[CloudKitUploadRequest<F>],
+) -> Result<(), PushError> {
+    let mut identities = HashSet::new();
+    for asset in assets {
+        if asset.file.is_none()
+            || asset.record_id.is_empty()
+            || asset.field.is_empty()
+            || asset.record_type.is_empty()
+            || asset.prepared.total_sig.is_empty()
+            || u32::try_from(asset.prepared.total_len).is_err()
+            || !identities.insert((asset.record_id.as_str(), asset.field))
+        {
+            return Err(cloudkit_protocol_error(
+                "CloudKit upload request was invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cloudkit_upload_authorization(
+    response: cloudkit_proto::AssetUploadTokenRetrieveResponse,
+) -> Result<AuthorizedOperation, PushError> {
+    let invalid = || cloudkit_protocol_error("CloudKit upload authorization was incomplete");
+    // The existing batch protocol uses its first asset's MMCS endpoint and a
+    // single authorization body. Do not infer per-record save success here.
+    let asset = response
+        .asset_info
+        .into_iter()
+        .next()
+        .and_then(|info| info.asset)
+        .ok_or_else(invalid)?;
+    let host = asset
+        .host
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid)?;
+    let container = asset
+        .container
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid)?;
+    let dsid = asset
+        .dsid
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid)?;
+    let body = response
+        .upload_info
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid)?;
+    Ok(AuthorizedOperation {
+        url: format!("{host}/{container}"),
+        dsid,
+        body,
+    })
+}
+
+fn completed_cloudkit_upload_assets<F: Read + Send + Sync>(
+    zone: &RecordZoneIdentifier,
+    assets: Vec<CloudKitUploadRequest<F>>,
+    receipts: &HashMap<Vec<u8>, String>,
+) -> Result<HashMap<String, Vec<cloudkit_proto::Asset>>, PushError> {
+    let mut completed: HashMap<String, Vec<cloudkit_proto::Asset>> = HashMap::new();
+    for req in assets {
+        let receipt = receipts
+            .get(&req.prepared.total_sig)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit upload receipt was missing"))?;
+        completed
+            .entry(req.field.to_string())
+            .or_default()
+            .push(cloudkit_proto::Asset {
+                signature: Some(req.prepared.total_sig.clone()),
+                size: Some(req.prepared.total_len as u64),
+                record_id: Some(record_identifier(zone.clone(), &req.record_id)),
+                upload_receipt: Some(receipt.clone()),
+                protection_info: req.prepared.ford_key.map(|key| ProtectionInfo {
+                    protection_info: Some(key.to_vec()),
+                    protection_info_tag: None,
+                }),
+                reference_signature: req.prepared.ford.as_ref().map(|ford| ford.0.to_vec()),
+                ..Default::default()
+            });
+    }
+    Ok(completed)
+}
+
+#[cfg(test)]
+mod cloudkit_upload_integrity_tests {
+    use super::*;
+
+    fn request(record: &str) -> CloudKitUploadRequest<Cursor<Vec<u8>>> {
+        CloudKitUploadRequest {
+            file: Some(Cursor::new(vec![1, 2, 3])),
+            record_id: record.to_owned(),
+            field: "lqa",
+            record_type: "attachment",
+            prepared: PreparedPut {
+                total_sig: vec![7; 21],
+                chunk_sigs: vec![],
+                total_len: 3,
+                ford_key: None,
+                ford: None,
+            },
+        }
+    }
+
+    fn authorization() -> cloudkit_proto::AssetUploadTokenRetrieveResponse {
+        cloudkit_proto::AssetUploadTokenRetrieveResponse {
+            asset_info: vec![
+                cloudkit_proto::asset_upload_token_retrieve_response::AssetInfo {
+                    asset: Some(cloudkit_proto::AssetUploadData {
+                        host: Some("https://example.invalid".to_owned()),
+                        container: Some("upload".to_owned()),
+                        dsid: Some("test-account".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            upload_info: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn requests_bind_record_and_field_not_content_hash() {
+        assert!(validate_cloudkit_upload_requests(&[request("a"), request("b")]).is_ok());
+        assert!(validate_cloudkit_upload_requests(&[request("a"), request("a")]).is_err());
+        let mut second_field = request("a");
+        second_field.field = "gp";
+        assert!(validate_cloudkit_upload_requests(&[request("a"), second_field]).is_ok());
+    }
+
+    #[test]
+    fn invalid_requests_fail_before_upload() {
+        for variant in 0..5 {
+            let mut req = request("a");
+            match variant {
+                0 => req.file = None,
+                1 => req.record_id.clear(),
+                2 => req.field = "",
+                3 => req.record_type = "",
+                _ => req.prepared.total_sig.clear(),
+            }
+            assert!(validate_cloudkit_upload_requests(&[req]).is_err());
+        }
+        if let Some(oversized) = (u32::MAX as usize).checked_add(1) {
+            let mut req = request("large");
+            req.prepared.total_len = oversized;
+            assert!(validate_cloudkit_upload_requests(&[req]).is_err());
+        }
+    }
+
+    #[test]
+    fn authorization_is_checked_without_panics_or_sensitive_error_values() {
+        let value = cloudkit_upload_authorization(authorization()).unwrap();
+        assert_eq!(value.url, "https://example.invalid/upload");
+        assert_eq!(value.body, vec![1, 2, 3]);
+        for variant in 0..7 {
+            let mut response = authorization();
+            match variant {
+                0 => response.asset_info.clear(),
+                1 => response.asset_info[0].asset = None,
+                2 => response.asset_info[0].asset.as_mut().unwrap().host = None,
+                3 => response.asset_info[0].asset.as_mut().unwrap().container = Some(String::new()),
+                4 => response.asset_info[0].asset.as_mut().unwrap().dsid = None,
+                5 => response.upload_info = None,
+                _ => response.upload_info = Some(vec![]),
+            }
+            let error = cloudkit_upload_authorization(response)
+                .err()
+                .expect("invalid authorization");
+            assert!(!error.to_string().contains("test-account"));
+            assert!(!error.to_string().contains("example.invalid"));
+        }
+    }
+
+    #[test]
+    fn receipts_preserve_distinct_records_with_identical_contents() {
+        let zone = RecordZoneIdentifier::default();
+        let receipts = HashMap::from([(vec![7; 21], "receipt".to_owned())]);
+        let results =
+            completed_cloudkit_upload_assets(&zone, vec![request("a"), request("b")], &receipts)
+                .unwrap();
+        let records = &results["lqa"];
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].record_id,
+            Some(record_identifier(zone.clone(), "a"))
+        );
+        assert_eq!(records[1].record_id, Some(record_identifier(zone, "b")));
+        assert!(records
+            .iter()
+            .all(|asset| asset.upload_receipt.as_deref() == Some("receipt")));
+    }
+
+    #[test]
+    fn upload_result_preserves_protected_asset_metadata() {
+        let mut protected = request("a");
+        protected.prepared.ford_key = Some([3; 32]);
+        protected.prepared.ford = Some(([4; 21], vec![5; 8]));
+        let receipts = HashMap::from([(vec![7; 21], "receipt".to_owned())]);
+        let result = completed_cloudkit_upload_assets(
+            &RecordZoneIdentifier::default(),
+            vec![protected],
+            &receipts,
+        )
+        .unwrap();
+        let asset = &result["lqa"][0];
+        assert_eq!(asset.size, Some(3));
+        assert_eq!(asset.reference_signature.as_deref(), Some(&[4; 21][..]));
+        assert_eq!(
+            asset
+                .protection_info
+                .as_ref()
+                .unwrap()
+                .protection_info
+                .as_deref(),
+            Some(&[3; 32][..])
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_receipt_never_returns_partial_success() {
+        let mut missing = request("b");
+        missing.prepared.total_sig = vec![8; 21];
+        let receipts = HashMap::from([(vec![7; 21], "receipt".to_owned())]);
+        assert!(completed_cloudkit_upload_assets(
+            &RecordZoneIdentifier::default(),
+            vec![request("a"), missing],
+            &receipts
+        )
+        .is_err());
+        let empty = HashMap::from([(vec![7; 21], String::new())]);
+        assert!(completed_cloudkit_upload_assets(
+            &RecordZoneIdentifier::default(),
+            vec![request("a")],
+            &empty
+        )
+        .is_err());
     }
 }
 
