@@ -669,6 +669,16 @@ pub struct FTClient {
     direct_admissions: DebugMutex<HashMap<[u8; 32], DirectAdmissionRecord>>,
 }
 
+// Match the Invitation builder's non-self handle rule and the IDS sender's
+// local-token exclusion. Self-device fanout is not a remote invitation route.
+fn has_remote_invitation_target<'a>(
+    sender: &str,
+    local_token: &[u8],
+    mut targets: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> bool {
+    targets.any(|(participant, token)| participant != sender && token != local_token)
+}
+
 impl FTClient {
     pub async fn new(
         state: FTState,
@@ -1324,6 +1334,17 @@ impl FTClient {
             &handle,
             &relevant_people,
         );
+        if ring && !has_remote_invitation_target(
+            &my_participant.handle,
+            &self_token,
+            targets.iter().map(|target| (
+                target.participant.as_str(),
+                target.delivery_data.push_token.as_slice(),
+            )),
+        ) {
+            warn!("FaceTime invitation rejected: no_remote_targets");
+            return Err(PushError::NoValidTargets);
+        }
         self.identity
             .send_message(
                 topic,
@@ -2444,6 +2465,27 @@ impl FTClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outgoing_invitation_requires_an_effective_remote_target() {
+        let local = [1u8];
+        let other = [2u8];
+        let cases: &[(&[(&str, &[u8])], bool)] = &[
+            (&[], false),
+            (&[("self", &local)], false),
+            (&[("self", &other)], false), // another self device gets no Invitation
+            (&[("peer", &local)], false), // IDS removes the local push token
+            (&[("peer", &other)], true),
+            (&[("self", &local), ("self", &other)], false),
+            (&[("self", &local), ("peer", &other)], true),
+        ];
+        for (targets, expected) in cases {
+            assert_eq!(
+                has_remote_invitation_target("self", &local, targets.iter().copied()),
+                *expected,
+            );
+        }
+    }
 
     fn session() -> FTSession {
         FTSession {
