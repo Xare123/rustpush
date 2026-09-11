@@ -4115,7 +4115,8 @@ mod cloud_message_identity_tests {
         assert!(fixture.messages.read_authentication_container.lock().await.is_none());
         assert_eq!(container.keys.lock().await.len(), 1);
 
-        fixture.client.state.write().await.dsid = "replacement-account".to_owned();
+        *fixture.client.state.write().await =
+            CloudKitState::new("replacement-account".to_owned()).unwrap();
         assert!(fixture.messages.validate_writer_preparation_binding(&binding).await.is_err());
     }
 
