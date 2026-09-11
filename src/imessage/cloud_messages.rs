@@ -4091,6 +4091,35 @@ mod cloud_message_identity_tests {
     }
 
     #[tokio::test]
+    async fn attachment_writer_preparation_accepts_existing_exact_zone_without_bootstrap() {
+        let fixture = valid_fixture();
+        let container = Arc::new(CloudKitOpenContainer::new_cached_identity_for_test(
+            &MESSAGES_CONTAINER,
+            fixture.client.clone(),
+            "attachment-writer-user".to_owned(),
+            "123".to_owned(),
+        ));
+        let zone = container.private_zone("attachmentManateeZone".to_owned());
+        container.keys.lock().await.insert(
+            "attachmentManateeZone".to_owned(),
+            crate::cloudkit::PCSZoneConfig::with_record_keys_for_test(zone, vec![]),
+        );
+        *fixture.messages.container.lock().await = Some(container.clone());
+
+        // Exercise the real attachment preparation -> shared PCS lookup path.
+        // All state is cached; NoBootstrapAnisette rejects any hidden login.
+        let binding = fixture.messages.warm_attachment_writer_preparation_lookup_only()
+            .await.expect("existing attachment zone must be permitted for its writer");
+        assert!(Arc::ptr_eq(&binding.container, &container));
+        fixture.messages.validate_writer_preparation_binding(&binding).await.unwrap();
+        assert!(fixture.messages.read_authentication_container.lock().await.is_none());
+        assert_eq!(container.keys.lock().await.len(), 1);
+
+        fixture.client.state.write().await.dsid = "replacement-account".to_owned();
+        assert!(fixture.messages.validate_writer_preparation_binding(&binding).await.is_err());
+    }
+
+    #[tokio::test]
     async fn restored_read_authentication_containers_are_provenance_separated() {
         static CUTTLEFISH_CONTAINER_FOR_TEST: CloudKitContainer<'static> = CloudKitContainer {
             database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,

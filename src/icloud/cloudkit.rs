@@ -3608,7 +3608,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         self.validate_general_identity(&self.client, CloudKitReadAuthenticationContainer::Messages)
             .await?;
         let name = cloudkit_zone_name(zone)?;
-        if !matches!(name.as_str(), "chatManateeZone" | "messageManateeZone")
+        if !matches!(
+            name.as_str(),
+            "chatManateeZone" | "messageManateeZone" | "attachmentManateeZone"
+        )
             || *zone != self.private_zone(name)
         {
             return Err(PushError::CloudKitSemanticOperationDenied);
@@ -3616,8 +3619,8 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         Ok(())
     }
 
-    /// Resolve existing Chat/Message PCS keys on the exact general Messages
-    /// container. Keychain lookups remain read-only; zone fetch uses GENERAL
+    /// Resolve existing Chat/Message/Attachment PCS keys on the exact general
+    /// Messages container. Keychain lookups remain read-only; zone fetch uses GENERAL
     /// authentication, never a restored read lease relabeled as a writer.
     pub(crate) async fn get_writer_zone_encryption_config_lookup_only(
         &self,
@@ -8406,22 +8409,31 @@ mod cloud_sync_transport_tests {
     async fn writer_pcs_lookup_requires_general_private_messages_and_exact_zone_owner() {
         let container = one_shot_test_container();
         let mut open = one_shot_test_open_container(&container);
-        let zone = open.private_zone("chatManateeZone".to_owned());
+        let zones = ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"]
+            .map(|name| open.private_zone(name.to_owned()));
         // The old writer preparation passed a GENERAL container into the
         // semantic-only fetch path, which correctly rejected that provenance.
-        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_err());
+        for zone in &zones {
+            assert!(open.validate_writer_pcs_lookup_scope(zone).await.is_err());
+        }
         open.read_authentication_generation = None;
         open.test_read_authentication_lease = None;
-        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_ok());
-        assert!(open.validate_writer_pcs_lookup_scope(
-            &open.private_zone("messageManateeZone".to_owned())).await.is_ok());
-        assert!(open.validate_writer_pcs_lookup_scope(
-            &open.private_zone("attachmentManateeZone".to_owned())).await.is_err());
-        let mut wrong_owner = zone.clone();
-        wrong_owner.owner_identifier.as_mut().unwrap().name = Some("another-user".to_owned());
-        assert!(open.validate_writer_pcs_lookup_scope(&wrong_owner).await.is_err());
+        for zone in &zones {
+            assert!(open.validate_writer_pcs_lookup_scope(zone).await.is_ok());
+            let mut wrong_owner = zone.clone();
+            wrong_owner.owner_identifier.as_mut().unwrap().name = Some("another-user".to_owned());
+            assert!(open.validate_writer_pcs_lookup_scope(&wrong_owner).await.is_err());
+            assert!(open.shared().validate_writer_pcs_lookup_scope(zone).await.is_err());
+        }
+        for name in ["unknownZone", "attachmentManateeZone-extra", "AttachmentManateeZone"] {
+            assert!(matches!(open.validate_writer_pcs_lookup_scope(
+                &open.private_zone(name.to_owned())).await,
+                Err(PushError::CloudKitSemanticOperationDenied)));
+        }
         open.client.state.write().await.dsid = "different-account".to_owned();
-        assert!(open.validate_writer_pcs_lookup_scope(&zone).await.is_err());
+        for zone in &zones {
+            assert!(open.validate_writer_pcs_lookup_scope(zone).await.is_err());
+        }
     }
 
     #[test]
