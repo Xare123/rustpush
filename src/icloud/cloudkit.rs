@@ -1304,6 +1304,14 @@ impl UploadAssetOperation {
 
 #[derive(Clone)]
 pub struct SaveRecordOperation(pub cloudkit_proto::RecordSaveRequest);
+
+// Observed in Apple's CKDPRecordSaveRequest serializer and enum converters on
+// macOS 15.7.9 (24G830), image UUID 002449BA-60D0-341F-933F-D5582A63F116.
+// These are verified cases, not an exhaustive private enum definition.
+const SAVE_FAIL_IF_OUTDATED: u32 = 1;
+const SAVE_FAIL_IF_EXISTS: u32 = 2;
+const SAVE_OVERRIDE: u32 = 3;
+
 impl CloudKitOp for SaveRecordOperation {
     type Response = Option<cloudkit_proto::Record>;
     fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
@@ -1380,7 +1388,12 @@ impl SaveRecordOperation {
                 }),
                 merge: Some(true),
                 fields_to_delete_if_exist_on_merge: Vec::new(),
-                save_semantics: Some(if update.is_some() { 3 } else { 2 }),
+                etag: None,
+                save_semantics: Some(if update.is_some() {
+                    SAVE_OVERRIDE
+                } else {
+                    SAVE_FAIL_IF_EXISTS
+                }),
                 record_protection_info_tag: update,
                 zone_protection_info_tag: key.zone_protection_tag.clone(),
             }),
@@ -1431,10 +1444,75 @@ impl SaveRecordOperation {
             }),
             merge: Some(true),
             fields_to_delete_if_exist_on_merge: Vec::new(),
-            save_semantics: Some(if update { 3 } else { 2 }),
+            etag: None,
+            save_semantics: Some(if update {
+                SAVE_OVERRIDE
+            } else {
+                SAVE_FAIL_IF_EXISTS
+            }),
             record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
             zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
         }))
+    }
+
+    /// Build an update tied to one fetched record version. This performs no
+    /// network request and never falls back to create or unconditional save.
+    /// Callers still need durable mutation intent, account/PCS authority and
+    /// conflict/readback reconciliation. No V2 transport uses this builder yet.
+    pub fn try_update_if_unchanged<R: CloudKitRecord>(
+        id: RecordIdentifier,
+        record: R,
+        key: Option<&PCSZoneConfig>,
+        predecessor: &FetchedRecord,
+    ) -> Result<Self, PushError> {
+        predecessor.verify_identifier(&id)?;
+        let previous = predecessor.get_raw_record()?;
+        let record_name = id.value.as_ref().and_then(|value| value.name.as_deref());
+        let zone = id
+            .zone_identifier
+            .as_ref()
+            .ok_or_else(|| cloudkit_invalid_input("CloudKit update zone was missing"))?;
+        let zone_name = zone.value.as_ref().and_then(|value| value.name.as_deref());
+        if record_name.is_none_or(str::is_empty) || zone_name.is_none_or(str::is_empty) {
+            return Err(cloudkit_invalid_input("CloudKit update identity was empty"));
+        }
+        if key.is_some_and(|key| &key.identifier != zone) {
+            return Err(cloudkit_invalid_input("CloudKit update PCS zone did not match"));
+        }
+        if previous.r#type.as_ref().and_then(|kind| kind.name.as_deref()) != Some(R::record_type()) {
+            return Err(cloudkit_invalid_input("CloudKit update predecessor type did not match"));
+        }
+        let etag = previous
+            .etag
+            .as_deref()
+            .filter(|tag| !tag.is_empty() && tag.len() <= 4096)
+            .ok_or_else(|| {
+                cloudkit_invalid_input("CloudKit update predecessor tag was missing or oversized")
+            })?;
+        // The merge builder encrypts with the current first default key. Do
+        // not silently rotate keys or replace custom record protection while
+        // retaining server fields encrypted under the predecessor's key.
+        if previous.protection_info.is_some() {
+            return Err(cloudkit_invalid_input("CloudKit conditional custom protection is unsupported"));
+        }
+        match key {
+            None if previous.pcs_key.is_some() => {
+                return Err(cloudkit_invalid_input("CloudKit update predecessor requires PCS keys"));
+            }
+            Some(key) => {
+                let key_id = key.default_record_keys.first()
+                    .ok_or(PushError::PCSRecordKeyMissing)?.key_id()?;
+                let prefix = key_id.get(..4).ok_or(PushError::PCSRecordKeyMissing)?;
+                if previous.pcs_key.as_deref() != Some(prefix) {
+                    return Err(cloudkit_invalid_input("CloudKit update predecessor PCS key changed"));
+                }
+            }
+            None => {}
+        }
+        let mut operation = Self::try_new(id, record, key, false)?;
+        operation.0.etag = Some(etag.to_owned());
+        operation.0.save_semantics = Some(SAVE_FAIL_IF_OUTDATED);
+        Ok(operation)
     }
 
     /// Compatibility spelling retained for callers that have not adopted the
@@ -8621,7 +8699,234 @@ mod cloud_sync_transport_tests {
         .unwrap();
 
         assert_eq!(operation.0.save_semantics, Some(2));
+        assert!(operation.0.etag.is_none());
         assert!(operation.0.record_protection_info_tag.is_none());
+    }
+
+    #[test]
+    fn apple_save_serializer_golden_wire_roundtrips() {
+        // Independent Apple serializer output, not generated by this crate:
+        // OpenBubbles fork Actions 34620660937, macOS 15.7.9 (24G830).
+        // Full synthetic report SHA256:
+        // e05fdca3ee4378bb566a0cfaed20a1032d501007ccaa812380a0db7bd823facf.
+        let fixtures: &[(&[u8], &str)] = &[
+            (b"\x22\x11ob-synthetic-etag", "etag"),
+            (b"\x3a\x22ob-synthetic-zoneProtectionInfoTag", "zone"),
+            (b"\x42\x24ob-synthetic-recordProtectionInfoTag", "record"),
+        ];
+        for (bytes, field) in fixtures {
+            let decoded = cloudkit_proto::RecordSaveRequest::decode(*bytes).unwrap();
+            let actual = match *field {
+                "etag" => decoded.etag.as_deref(),
+                "zone" => decoded.zone_protection_info_tag.as_deref(),
+                _ => decoded.record_protection_info_tag.as_deref(),
+            };
+            assert_eq!(actual.unwrap().as_bytes(), &bytes[2..]);
+            assert_eq!(decoded.encode_to_vec(), *bytes);
+        }
+        // The same runtime labels these cases failIfOutdated/failIfExists/override.
+        for (bytes, semantics) in [
+            (b"\x30\x01", SAVE_FAIL_IF_OUTDATED),
+            (b"\x30\x02", SAVE_FAIL_IF_EXISTS),
+            (b"\x30\x03", SAVE_OVERRIDE),
+        ] {
+            let decoded = cloudkit_proto::RecordSaveRequest::decode(bytes.as_slice()).unwrap();
+            assert_eq!(decoded.save_semantics, Some(semantics));
+            assert_eq!(decoded.encode_to_vec().as_slice(), bytes.as_slice());
+        }
+    }
+
+    fn conditional_save_predecessor(id: RecordIdentifier) -> FetchedRecord {
+        FetchRecordOperation::retrieve_response(&ResponseOperation {
+            record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
+                record: Some(Record {
+                    record_identifier: Some(id),
+                    r#type: Some(cloudkit_proto::record::Type {
+                        name: Some(ZoneUpdatePlugin::record_type().to_owned()),
+                    }),
+                    etag: Some("opaque-predecessor-tag".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }).unwrap()
+    }
+
+    fn conditional_save_body() -> ZoneUpdatePlugin {
+        ZoneUpdatePlugin { zone_update_data: vec![1, 2, 3] }
+    }
+
+    #[test]
+    fn conditional_save_binds_exact_predecessor_without_mutating_it() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let previous = conditional_save_predecessor(id.clone());
+        let original = previous.get_raw_record().unwrap().encode_to_vec();
+        let operation = SaveRecordOperation::try_update_if_unchanged(
+            id.clone(), conditional_save_body(), None, &previous,
+        ).unwrap();
+        assert_eq!(operation.0.save_semantics, Some(SAVE_FAIL_IF_OUTDATED));
+        assert_eq!(operation.0.etag.as_deref(), Some("opaque-predecessor-tag"));
+        assert_eq!(operation.0.merge, Some(true));
+        assert!(operation.0.fields_to_delete_if_exist_on_merge.is_empty());
+        let saved = operation.0.record.as_ref().unwrap();
+        assert_eq!(saved.record_identifier.as_ref(), Some(&id));
+        assert!(saved.etag.is_none()); // Request precondition is not a nested Record field.
+        assert!(operation.0.zone_protection_info_tag.is_none());
+        assert!(operation.0.record_protection_info_tag.is_none());
+        assert_eq!(previous.get_raw_record().unwrap().encode_to_vec(), original);
+        let again = SaveRecordOperation::try_update_if_unchanged(
+            id, conditional_save_body(), None, &previous,
+        ).unwrap();
+        assert_eq!(operation.0.encode_to_vec(), again.0.encode_to_vec());
+    }
+
+    #[test]
+    fn conditional_save_rejects_missing_empty_or_oversized_predecessor_tag() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        for tag in [None, Some(String::new()), Some("x".repeat(4097))] {
+            let mut previous = conditional_save_predecessor(id.clone());
+            previous.response.record_retrieve_response.as_mut().unwrap()
+                .record.as_mut().unwrap().etag = tag;
+            assert!(SaveRecordOperation::try_update_if_unchanged(
+                id.clone(), conditional_save_body(), None, &previous,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn conditional_save_rejects_different_record_owner_zone_or_environment() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let mut wrong_record = id.clone();
+        wrong_record.value.as_mut().unwrap().name = Some("other-record".to_owned());
+        let mut wrong_owner = id.clone();
+        wrong_owner.zone_identifier.as_mut().unwrap().owner_identifier.as_mut()
+            .unwrap().name = Some("other-owner".to_owned());
+        let mut wrong_zone = id.clone();
+        wrong_zone.zone_identifier.as_mut().unwrap().value.as_mut().unwrap().name =
+            Some("other-zone".to_owned());
+        let mut wrong_environment = id.clone();
+        wrong_environment.zone_identifier.as_mut().unwrap().environment = Some(1);
+        for mismatch in [wrong_record, wrong_owner, wrong_zone, wrong_environment] {
+            let previous = conditional_save_predecessor(mismatch);
+            assert!(SaveRecordOperation::try_update_if_unchanged(
+                id.clone(), conditional_save_body(), None, &previous,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn conditional_save_rejects_missing_predecessor_record_or_wrong_type() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let mut previous = conditional_save_predecessor(id.clone());
+        previous.response.record_retrieve_response.as_mut().unwrap()
+            .record.as_mut().unwrap().r#type = None;
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id.clone(), conditional_save_body(), None, &previous,
+        ).is_err());
+        previous.response.record_retrieve_response.as_mut().unwrap()
+            .record.as_mut().unwrap().r#type = Some(cloudkit_proto::record::Type {
+                name: Some("OtherType".to_owned()),
+            });
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id.clone(), conditional_save_body(), None, &previous,
+        ).is_err());
+        previous.response.record_retrieve_response.as_mut().unwrap().record = None;
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id, conditional_save_body(), None, &previous,
+        ).is_err());
+    }
+
+    #[test]
+    fn conditional_save_rejects_empty_identity_even_if_predecessor_matches() {
+        for id in [RecordIdentifier::default(), record_identifier(public_zone(), "")] {
+            let previous = conditional_save_predecessor(id.clone());
+            assert!(SaveRecordOperation::try_update_if_unchanged(
+                id, conditional_save_body(), None, &previous,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn conditional_save_rejects_pcs_key_from_another_zone() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let previous = conditional_save_predecessor(id.clone());
+        let mut zone = public_zone();
+        zone.value.as_mut().unwrap().name = Some("other-zone".to_owned());
+        let key = PCSZoneConfig {
+            identifier: zone,
+            zone_keys: vec![],
+            zone_protection_tag: None,
+            default_record_keys: vec![],
+            record_prot_tag: None,
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        };
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id, conditional_save_body(), Some(&key), &previous,
+        ).is_err());
+    }
+
+    #[test]
+    fn legacy_override_save_keeps_its_existing_wire_behavior() {
+        let operation = SaveRecordOperation::try_new(
+            record_identifier(public_zone(), "legacy-update"),
+            conditional_save_body(), None, true,
+        ).unwrap();
+        assert_eq!(operation.0.save_semantics, Some(SAVE_OVERRIDE));
+        assert!(operation.0.etag.is_none());
+    }
+
+    #[test]
+    fn conditional_save_preserves_default_pcs_key_and_keeps_version_tags_separate() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let key = PCSZoneConfig {
+            identifier: public_zone(),
+            zone_keys: vec![],
+            zone_protection_tag: Some("zone-pcs-tag".to_owned()),
+            default_record_keys: vec![PCSKey::random()],
+            record_prot_tag: Some("record-pcs-tag".to_owned()),
+            zone_pcs_key: vec![],
+            zone_roll_count: 0,
+            record_roll_count: 0,
+        };
+        let prefix = key.default_record_keys[0].key_id().unwrap()[..4].to_vec();
+        let mut previous = conditional_save_predecessor(id.clone());
+        previous.response.record_retrieve_response.as_mut().unwrap()
+            .record.as_mut().unwrap().pcs_key = Some(prefix.clone());
+        let operation = SaveRecordOperation::try_update_if_unchanged(
+            id.clone(), conditional_save_body(), Some(&key), &previous,
+        ).unwrap();
+        assert_eq!(operation.0.record.as_ref().unwrap().pcs_key, Some(prefix));
+        assert_eq!(operation.0.etag.as_deref(), Some("opaque-predecessor-tag"));
+        assert_eq!(operation.0.record_protection_info_tag.as_deref(), Some("record-pcs-tag"));
+        assert_eq!(operation.0.zone_protection_info_tag.as_deref(), Some("zone-pcs-tag"));
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id.clone(), conditional_save_body(), None, &previous,
+        ).is_err());
+        let mut rotated = key.clone();
+        loop {
+            rotated.default_record_keys = vec![PCSKey::random()];
+            if rotated.default_record_keys[0].key_id().unwrap()[..4]
+                != key.default_record_keys[0].key_id().unwrap()[..4] {
+                break;
+            }
+        }
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id, conditional_save_body(), Some(&rotated), &previous,
+        ).is_err());
+    }
+
+    #[test]
+    fn conditional_save_does_not_replace_custom_pcs_protection() {
+        let id = record_identifier(public_zone(), "conditional-record");
+        let mut previous = conditional_save_predecessor(id.clone());
+        previous.response.record_retrieve_response.as_mut().unwrap()
+            .record.as_mut().unwrap().protection_info = Some(Default::default());
+        assert!(SaveRecordOperation::try_update_if_unchanged(
+            id, conditional_save_body(), None, &previous,
+        ).is_err());
     }
 
     #[test]

@@ -622,6 +622,9 @@ message RequestOperation {
     optional Record record = 1;
     optional bool merge = 2;
     repeated string fieldsToDeleteIfExistOnMerge = 3;
+    // CKDPRecordSaveRequest serializer/decoder, macOS 15.7.9 (24G830).
+    // Request version precondition, not the nested Record or PCS tag.
+    optional string etag = 4;
     optional uint32 saveSemantics = 6;
     optional string zoneProtectionInfoTag = 7;
     optional string recordProtectionInfoTag = 8;
