@@ -1417,7 +1417,28 @@ impl IdentityResource {
         &self,
         topic: &'static str,
         ids_message: IDSSendMessage,
+        message_targets: Vec<DeliveryHandle>,
+    ) -> Result<SendJob, PushError> {
+        self.send_message_with_retry_limit(topic, ids_message, message_targets, 5).await
+    }
+
+    /// A single dispatch for an explicit acknowledgment experiment. Completing
+    /// without a positive response is not acceptance and never grants a retry.
+    pub(crate) async fn send_message_once(
+        &self,
+        topic: &'static str,
+        ids_message: IDSSendMessage,
+        message_targets: Vec<DeliveryHandle>,
+    ) -> Result<SendJob, PushError> {
+        self.send_message_with_retry_limit(topic, ids_message, message_targets, 0).await
+    }
+
+    async fn send_message_with_retry_limit(
+        &self,
+        topic: &'static str,
+        ids_message: IDSSendMessage,
         mut message_targets: Vec<DeliveryHandle>,
+        retry_limit: u8,
     ) -> Result<SendJob, PushError> {
         if ids_message.scheduled_ms.is_some() && ids_message.queue_id.is_none() {
             return Err(PushError::BadMsg);
@@ -1463,6 +1484,7 @@ impl IdentityResource {
             topic,
             sent_timestamp: since_the_epoch.as_millis() as u64,
             confirmation: confirmation.clone(),
+            retry_limit,
         };
 
         let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
@@ -1601,6 +1623,7 @@ struct InnerSendJob {
     pub topic: &'static str,
     pub sent_timestamp: u64,
     confirmation: SendConfirmation,
+    retry_limit: u8,
 }
 
 impl InnerSendJob {
@@ -1824,7 +1847,7 @@ impl InnerSendJob {
                     .await?;
                 remain_targets.extend(new_targets);
 
-                if retry_count == 5 {
+                if retry_count == self.retry_limit {
                     for target in remain_targets {
                         let _ = self.status.send((target, SendResult::TimedOut));
                     }

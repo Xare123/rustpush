@@ -429,6 +429,29 @@ impl IMClient {
     }
 
     pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
+        self.send_with_mutation_acknowledgment_policy(message, false).await
+    }
+
+    /// Opt-in experiment: request a positive IDS acknowledgment for an edit or
+    /// unsend. Ordinary sends retain upstream's existing no-response convention.
+    /// No timeout retry is allowed; absence of proof stays an unknown outcome.
+    pub async fn send_mutation_requesting_acknowledgment(
+        &self,
+        message: &mut MessageInst,
+    ) -> Result<SendJob, PushError> {
+        if !matches!(&message.message, Message::Edit(_) | Message::Unsend(_))
+            || message.is_queued()
+        {
+            return Err(PushError::BadMsg);
+        }
+        self.send_with_mutation_acknowledgment_policy(message, true).await
+    }
+
+    async fn send_with_mutation_acknowledgment_policy(
+        &self,
+        message: &mut MessageInst,
+        request_mutation_ack: bool,
+    ) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
         let topic = if message.message.is_sms() {
@@ -487,15 +510,89 @@ impl IMClient {
             }
         }
 
-        let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
-
-        let job = self.identity
-            .send_message(topic, ids_message, message_targets)
-            .await?;
+        let mut ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
+        let job = if request_mutation_ack {
+            request_mutation_acknowledgment(&message.message, &mut ids_message)?;
+            self.identity.send_message_once(topic, ids_message, message_targets).await?
+        } else {
+            self.identity.send_message(topic, ids_message, message_targets).await?
+        };
         // Positive CloudKit confirmation must cover the intended route, not
         // only the subset for which IDS returned cached device targets.
         Ok(job.requiring_participants(targets.iter()
             .filter(|target| !my_handles.contains(target))
             .map(String::as_str)))
+    }
+}
+
+fn request_mutation_acknowledgment(
+    message: &Message,
+    ids: &mut IDSSendMessage,
+) -> Result<(), PushError> {
+    if !matches!(message, Message::Edit(_) | Message::Unsend(_))
+        || ids.command != 118 || ids.relay.is_some()
+        || ids.scheduled_ms.is_some() || ids.queue_id.is_some()
+        || ids.extras.contains_key("nr") || !matches!(&ids.raw, crate::ids::identity_manager::Raw::Body(_))
+    {
+        return Err(PushError::BadMsg);
+    }
+    ids.no_response = false;
+    Ok(())
+}
+
+#[cfg(test)]
+mod mutation_acknowledgment_tests {
+    use super::*;
+    use crate::{EditMessage, MessageParts, UnsendMessage};
+    use crate::ids::identity_manager::Raw;
+
+    fn mutations() -> [Message; 2] {
+        [Message::Edit(EditMessage { tuuid: "target".into(), edit_part: 0,
+            new_parts: MessageParts(vec![]) }),
+         Message::Unsend(UnsendMessage { tuuid: "target".into(), edit_part: 0 })]
+    }
+
+    fn ids() -> IDSSendMessage {
+        IDSSendMessage { sender: "sender".into(), raw: Raw::Body(vec![1, 2, 3]),
+            send_delivered: false, command: 118, no_response: true,
+            extras: Dictionary::new(), id: "same-uuid".into(), scheduled_ms: None,
+            queue_id: None, relay: None }
+    }
+
+    #[test]
+    fn ordinary_mutations_keep_no_response_and_opt_in_changes_only_request_flag() {
+        for mutation in mutations() {
+            assert_eq!(mutation.get_nr(), Some(true));
+            let mut envelope = ids();
+            request_mutation_acknowledgment(&mutation, &mut envelope).unwrap();
+            assert!(!envelope.no_response);
+            assert_eq!(envelope.command, 118);
+            assert_eq!(envelope.id, "same-uuid");
+            assert_eq!(envelope.sender, "sender");
+            assert!(matches!(envelope.raw, Raw::Body(ref body) if body == &[1, 2, 3]));
+            assert!(!envelope.send_delivered);
+            assert!(envelope.extras.is_empty());
+            assert_eq!(mutation.get_nr(), Some(true));
+        }
+    }
+
+    #[test]
+    fn unsupported_envelopes_fail_before_changing_any_flag() {
+        let [mutation, _] = mutations();
+        for modify in [
+            (|ids: &mut IDSSendMessage| ids.command = 100) as fn(&mut IDSSendMessage),
+            |ids| ids.scheduled_ms = Some(1),
+            |ids| ids.queue_id = Some("queue".into()),
+            |ids| ids.raw = Raw::None,
+            |ids| { ids.extras.insert("nr".into(), Value::Boolean(true)); },
+        ] {
+            let mut envelope = ids();
+            modify(&mut envelope);
+            assert!(request_mutation_acknowledgment(&mutation, &mut envelope).is_err());
+            assert!(envelope.no_response);
+        }
+        let mut envelope = ids();
+        assert!(request_mutation_acknowledgment(&Message::Delivered, &mut envelope).is_err());
+        assert!(envelope.no_response);
     }
 }
