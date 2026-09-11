@@ -14,8 +14,8 @@ use crate::cloudkit::{
     pcs_keys_for_record, record_identifier, CloudKitBatchResponse, CloudKitFailureClass,
     CloudKitOpenContainer, CloudKitPreparedAuthentication, CloudKitRequestFailure,
     CloudKitRequestIdentity, CloudKitRetryPolicy, CloudKitSession, CloudKitUploadRequest,
-    DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords,
-    QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS,
+    DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecord,
+    FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS,
     CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE, CLOUDKIT_MAX_OPERATIONS_PER_REQUEST, NO_ASSETS,
 };
 use crate::mmcs::{prepare_put_v2, PreparedPut};
@@ -1340,6 +1340,59 @@ pub enum CloudMessageRecordLookup {
     },
 }
 
+/// Native-only fetched predecessor. Unlike the typed message lookup, this
+/// retains every decoded CloudKit field and its opaque payload without a
+/// CloudMessage roundtrip. It is not a write permit or proof of a later save.
+pub enum CloudMessageRecordVersionLookup {
+    Found(FetchedRecord, CloudMessagesSaveReceipt),
+    NotFound,
+    Unresolved {
+        failure_class: Option<CloudKitFailureClass>,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl Debug for CloudMessageRecordVersionLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found(_, _) => f
+                .debug_tuple("Found")
+                .field(&"[protected record and version]")
+                .finish(),
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Unresolved {
+                failure_class,
+                retry_after,
+            } => f
+                .debug_struct("Unresolved")
+                .field("failure_class", failure_class)
+                .field("retry_after", retry_after)
+                .finish(),
+        }
+    }
+}
+
+fn validate_message_record_version(
+    record: FetchedRecord,
+    expected_identifier: &RecordIdentifier,
+) -> Result<CloudMessageRecordVersionLookup, PushError> {
+    record.verify_identifier(expected_identifier)?;
+    let raw = record.get_raw_record()?;
+    if raw.r#type.as_ref().and_then(|kind| kind.name.as_deref())
+        != Some(CloudMessage::record_type())
+    {
+        return Err(PushError::BadMsg);
+    }
+    let Some(receipt) = CloudMessagesSaveReceipt::validate(Some(expected_identifier), Some(raw))
+    else {
+        return Ok(CloudMessageRecordVersionLookup::Unresolved {
+            failure_class: Some(CloudKitFailureClass::Unknown),
+            retry_after: None,
+        });
+    };
+    Ok(CloudMessageRecordVersionLookup::Found(record, receipt))
+}
+
 fn is_cloudkit_record_not_found(error: &PushError) -> bool {
     let PushError::CloudKitError(result) = error else {
         return false;
@@ -1700,7 +1753,7 @@ fn ordered_message_save_pairs(
 #[cfg(test)]
 mod cloud_message_save_tests {
     use super::*;
-    use crate::cloudkit::CloudKitOperationOutcome;
+    use crate::cloudkit::{CloudKitOp, CloudKitOperationOutcome};
 
     #[test]
     fn only_explicit_server_not_found_proves_record_absence() {
@@ -1791,6 +1844,133 @@ mod cloud_message_save_tests {
             record_identifier: Some(identifier.clone()),
             ..Default::default()
         }
+    }
+
+    fn fixture_message_version() -> Record {
+        use cloudkit_proto::record::{field, Field, Type};
+        Record {
+            r#type: Some(Type {
+                name: Some(CloudMessage::record_type().to_string()),
+            }),
+            // The second field is deliberately unknown to CloudMessage. Both
+            // payloads must survive without decoding or decrypting either one.
+            record_field: ["msgProto", "futureOpaqueField"]
+                .into_iter()
+                .map(|name| Field {
+                    identifier: Some(field::Identifier {
+                        name: Some(name.to_string()),
+                    }),
+                    value: Some(field::Value {
+                        r#type: Some(field::value::Type::EncryptedBytesType as i32),
+                        bytes_value: Some(vec![0xff, 0x00, 0x1a, 0x02, 0x80, 0xfe]),
+                        is_encrypted: Some(true),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            conflict_loser_etag: vec!["older-version".to_string()],
+            modified_by_device: Some("private-device".to_string()),
+            pcs_key: Some(vec![9, 8, 7]),
+            ..fixture_saved_record(
+                &fixture_full_identifier("private-message"),
+                Some("private-etag"),
+            )
+        }
+    }
+
+    fn fetched_version(raw: Record) -> FetchedRecord {
+        FetchRecordOperation::retrieve_response(&cloudkit_proto::ResponseOperation {
+            record_retrieve_response: Some(cloudkit_proto::RecordRetrieveResponse {
+                record: Some(raw),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("synthetic retrieved record")
+    }
+
+    #[test]
+    fn message_version_preserves_opaque_fields_and_record_metadata() {
+        let raw = fixture_message_version();
+        let expected = raw.record_identifier.as_ref().unwrap();
+        let lookup =
+            validate_message_record_version(fetched_version(raw.clone()), expected).unwrap();
+        let CloudMessageRecordVersionLookup::Found(record, receipt) = lookup else {
+            panic!("valid predecessor was not found")
+        };
+        assert_eq!(record.get_raw_record().unwrap(), &raw);
+        assert_eq!(receipt.record_identifier(), expected);
+        assert_eq!(receipt.etag(), "private-etag");
+    }
+
+    #[test]
+    fn message_version_rejects_wrong_full_identity() {
+        let raw = fixture_message_version();
+        let expected = raw.record_identifier.as_ref().unwrap().clone();
+        for component in ["name", "type", "zone", "owner", "environment", "missing"] {
+            let mut changed = raw.clone();
+            let id = changed.record_identifier.as_mut().unwrap();
+            match component {
+                "name" => id.value.as_mut().unwrap().name = Some("other-message".to_string()),
+                "type" => id.value.as_mut().unwrap().r#type = None,
+                "zone" => {
+                    id.zone_identifier.as_mut().unwrap().value.as_mut().unwrap().name =
+                        Some("other-zone".to_string());
+                }
+                "owner" => {
+                    id.zone_identifier.as_mut().unwrap().owner_identifier.as_mut().unwrap().name =
+                        Some("other-owner".to_string());
+                }
+                "environment" => {
+                    id.zone_identifier.as_mut().unwrap().environment = Some(Default::default());
+                }
+                "missing" => changed.record_identifier = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_message_record_version(fetched_version(changed), &expected).is_err(),
+                "{component}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_version_rejects_wrong_or_missing_record_type() {
+        for kind in [None, Some(""), Some("ChatEncryptedV3")] {
+            let mut raw = fixture_message_version();
+            let expected = raw.record_identifier.as_ref().unwrap().clone();
+            raw.r#type = kind.map(|name| cloudkit_proto::record::Type {
+                name: Some(name.to_string()),
+            });
+            assert!(validate_message_record_version(fetched_version(raw), &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn message_version_without_etag_remains_unresolved_not_absent() {
+        for etag in [None, Some(""), Some(" \t")] {
+            let mut raw = fixture_message_version();
+            let expected = raw.record_identifier.as_ref().unwrap().clone();
+            raw.etag = etag.map(ToOwned::to_owned);
+            assert!(matches!(
+                validate_message_record_version(fetched_version(raw), &expected).unwrap(),
+                CloudMessageRecordVersionLookup::Unresolved {
+                    failure_class: Some(CloudKitFailureClass::Unknown),
+                    retry_after: None,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn message_version_debug_does_not_expose_record_or_etag() {
+        let raw = fixture_message_version();
+        let expected = raw.record_identifier.as_ref().unwrap().clone();
+        let lookup = validate_message_record_version(fetched_version(raw), &expected).unwrap();
+        assert_eq!(
+            format!("{lookup:?}"),
+            "Found(\"[protected record and version]\")"
+        );
     }
 
     #[test]
@@ -2658,6 +2838,43 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         writer_binding: &CloudMessagesWriterPreparationBinding<P>,
         server_record_name: &str,
     ) -> Result<CloudMessageRecordLookup, PushError> {
+        match self
+            .lookup_message_record_version(writer_binding, server_record_name)
+            .await?
+        {
+            CloudMessageRecordVersionLookup::Found(record, receipt) => {
+                let container = self
+                    .get_writer_container_for_binding(writer_binding)
+                    .await?;
+                let zone = container.private_zone("messageManateeZone".to_string());
+                let key = container
+                    .get_cached_zone_encryption_config_exact(&zone)
+                    .await?;
+                Ok(CloudMessageRecordLookup::Found(
+                    record.get_record(Some(&key))?,
+                    receipt,
+                ))
+            }
+            CloudMessageRecordVersionLookup::NotFound => Ok(CloudMessageRecordLookup::NotFound),
+            CloudMessageRecordVersionLookup::Unresolved {
+                failure_class,
+                retry_after,
+            } => Ok(CloudMessageRecordLookup::Unresolved {
+                failure_class,
+                retry_after,
+            }),
+        }
+    }
+
+    /// Fetches an exact predecessor without converting its fields into the
+    /// lossy CloudMessage model. The existing general container and cached PCS
+    /// are required even though decryption is deferred. No assets are fetched,
+    /// and this read neither prepares nor authorizes a conditional update.
+    pub async fn lookup_message_record_version(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        server_record_name: &str,
+    ) -> Result<CloudMessageRecordVersionLookup, PushError> {
         if server_record_name.is_empty() || server_record_name.len() > 4096 {
             return Err(PushError::BadMsg);
         }
@@ -2665,7 +2882,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .get_writer_container_for_binding(writer_binding)
             .await?;
         let zone = container.private_zone("messageManateeZone".to_string());
-        let key = container
+        container
             .get_cached_zone_encryption_config_exact(&zone)
             .await?;
         let expected_record_identifier = record_identifier(zone, server_record_name);
@@ -2685,14 +2902,14 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let response = match response {
             Ok(response) => response,
             Err(failure) => {
-                return Ok(CloudMessageRecordLookup::Unresolved {
+                return Ok(CloudMessageRecordVersionLookup::Unresolved {
                     failure_class: failure.failure_class,
                     retry_after: failure.retry_after,
                 })
             }
         };
         if response.outcomes.len() != 1 {
-            return Ok(CloudMessageRecordLookup::Unresolved {
+            return Ok(CloudMessageRecordVersionLookup::Unresolved {
                 failure_class: Some(CloudKitFailureClass::Unknown),
                 retry_after: None,
             });
@@ -2703,32 +2920,11 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             .next()
             .ok_or(PushError::BadMsg)?;
         match outcome.result {
-            Ok(record) => {
-                record.verify_identifier(&expected_record_identifier)?;
-                // A confirmed find must also prove etag freshness: the
-                // validated native-only receipt binds the exact returned
-                // identifier to its present, nonempty etag. Anything less
-                // stays unresolved so reconciliation retries instead of
-                // trusting an unproven fetch.
-                let raw_record = record.get_raw_record()?;
-                let Some(receipt) = CloudMessagesSaveReceipt::validate(
-                    Some(&expected_record_identifier),
-                    Some(raw_record),
-                ) else {
-                    return Ok(CloudMessageRecordLookup::Unresolved {
-                        failure_class: Some(CloudKitFailureClass::Unknown),
-                        retry_after: None,
-                    });
-                };
-                Ok(CloudMessageRecordLookup::Found(
-                    record.get_record(Some(&key))?,
-                    receipt,
-                ))
-            }
+            Ok(record) => validate_message_record_version(record, &expected_record_identifier),
             Err(error) if is_cloudkit_record_not_found(&error) => {
-                Ok(CloudMessageRecordLookup::NotFound)
+                Ok(CloudMessageRecordVersionLookup::NotFound)
             }
-            Err(_) => Ok(CloudMessageRecordLookup::Unresolved {
+            Err(_) => Ok(CloudMessageRecordVersionLookup::Unresolved {
                 failure_class: outcome.failure_class,
                 retry_after: outcome.retry_after,
             }),
@@ -3769,6 +3965,7 @@ mod cloud_message_identity_tests {
         let source = include_str!("cloud_messages.rs");
         for method_name in [
             "pub async fn lookup_message_record",
+            "pub async fn lookup_message_record_version",
             "pub async fn prepare_message_save_submission",
         ] {
             let method_start = source.find(method_name).expect("write-path method");
@@ -3785,6 +3982,20 @@ mod cloud_message_identity_tests {
             assert!(!method.contains("get_zone_encryption_config_lookup_only"));
             assert!(!method.contains("get_container_for_read_authentication"));
         }
+    }
+
+    #[test]
+    fn message_version_lookup_defers_decoding_and_revalidates_container_after_fetch() {
+        let source = include_str!("cloud_messages.rs");
+        let start = source.find("pub async fn lookup_message_record_version(").unwrap();
+        let end = source[start..].find("pub async fn prepare_message_save_submission(").unwrap();
+        let method = &source[start..start + end];
+        assert!(method.contains("&NO_ASSETS"));
+        assert!(method.contains("validate_message_record_version"));
+        assert_eq!(method.matches("get_writer_container_for_binding").count(), 2);
+        assert!(!method.contains("get_record("));
+        assert!(!method.contains("SaveRecordOperation::"));
+        assert!(!method.contains("DeleteRecordOperation::"));
     }
 
     #[test]
