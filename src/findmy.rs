@@ -73,6 +73,9 @@ use sha2::Sha256;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
+#[path = "findmy/diagnostics.rs"]
+mod diagnostics;
+
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
     sub_services: &[
@@ -1479,13 +1482,37 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     }
 
     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
-        with_cloudkit_writer_operation(self.sync_item_positions_with_writer_permit()).await
+        let mut observation = diagnostics::Observation::start(
+            diagnostics::Service::Items, "items", false, diagnostics::Snapshot::default,
+        );
+        let result = with_cloudkit_writer_operation(async {
+            if let Some(record) = diagnostics::items(&mut observation) {
+                record.writer_gate = diagnostics::StepOutcome::Succeeded;
+                record.stage = diagnostics::ItemsStage::Inventory;
+            }
+            self.sync_item_positions_with_writer_permit(&mut observation).await
+        }).await;
+        if let Some(record) = diagnostics::items(&mut observation) {
+            if result.is_err() && record.writer_gate == diagnostics::StepOutcome::Pending {
+                record.writer_gate = diagnostics::StepOutcome::Failed;
+            }
+        }
+        let result = diagnostics::result(&mut observation, result, diagnostics::Outcome::ItemsFailed);
+        if result.is_ok() {
+            if let Some(record) = observation.as_mut() { record.outcome = diagnostics::Outcome::ItemsSucceeded; }
+        }
+        result
     }
 
-    async fn sync_item_positions_with_writer_permit(&self) -> Result<(), PushError> {
+    async fn sync_item_positions_with_writer_permit(&self, observation: &mut Option<diagnostics::Observation>) -> Result<(), PushError> {
         self.sync_items(true).await?;
 
         let mut state = self.state.state.lock().await;
+        if let Some(record) = diagnostics::items(observation) {
+            record.inventory_owned = Some(diagnostics::CappedCount::new(state.accessories.len()));
+            record.inventory_shared_circles = Some(diagnostics::CappedCount::new(state.share_state.circles_member.len()));
+            record.stage = diagnostics::ItemsStage::Retrieval;
+        }
         let mut bignum = BigNumContext::new()?;
 
         let range = SystemTime::now();
@@ -1797,13 +1824,32 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             pending_shared_reports.push((beacon_identifier, newest_report));
         }
 
+        if let Some(record) = diagnostics::items(observation) {
+            record.stage = diagnostics::ItemsStage::AlignmentWrite;
+            record.alignment_write = if update_records.is_empty() {
+                diagnostics::StepOutcome::NotNeeded
+            } else {
+                diagnostics::StepOutcome::Pending
+            };
+        }
         if !update_records.is_empty() {
-            with_cloudkit_writer_operation(container.perform_operations_checked(
+            let result = with_cloudkit_writer_operation(container.perform_operations_checked(
                 &CloudKitSession::new(),
                 &update_records,
                 IsolationLevel::Operation,
             ))
-            .await?;
+            .await;
+            if let Some(record) = diagnostics::items(observation) {
+                record.alignment_write = if result.is_ok() {
+                    diagnostics::StepOutcome::Succeeded
+                } else {
+                    diagnostics::StepOutcome::Failed
+                };
+            }
+            result?;
+        }
+        if let Some(record) = diagnostics::items(observation) {
+            record.stage = diagnostics::ItemsStage::Publish;
         }
 
         for (device, local_alignment, alignment_update, newest_report) in pending_accessory_updates
@@ -2613,13 +2659,23 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             .await?
             .send()
             .await?;
-        require_findmy_success_status(response.status())?;
-        let raw_request: serde_json::Value = response.json().await?;
-
-        let request: FindMyPhoneStateUpdate = serde_json::from_value(raw_request.clone())?;
+        let mut observation = diagnostics::Observation::start(diagnostics::Service::Fmip, path, false, || {
+            diagnostics::Snapshot::read(&self.devices, |row| row.location.is_some())
+        });
+        diagnostics::result(&mut observation, require_findmy_success_status(response.status()), diagnostics::Outcome::HttpRejected)?;
+        let raw_request: serde_json::Value = diagnostics::body(&mut observation, response.json().await)?;
+        if let Some(record) = observation.as_mut() {
+            record.raw(&raw_request);
+        }
+        let request: FindMyPhoneStateUpdate = diagnostics::result(&mut observation, serde_json::from_value(raw_request.clone()), diagnostics::Outcome::TypedDecodeFailed)?;
 
         self.server_context = request.server_context;
         self.devices = request.content;
+        if let Some(record) = observation.as_mut() {
+            record.begin_join(false);
+            record.after = diagnostics::Snapshot::read(&self.devices, |row| row.location.is_some());
+            record.outcome = diagnostics::Outcome::Merged;
+        }
         Ok(())
     }
 
@@ -2810,10 +2866,16 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             self.token_provider.refresh_mme().await?;
         }
 
-        require_findmy_success_status(response.status())?;
-        let raw_request: serde_json::Value = response.json().await?;
-
-        let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
+        let mut observation = diagnostics::Observation::start(diagnostics::Service::Fmf, path, self.daemon, || {
+            diagnostics::Snapshot::read(&self.following, |row| row.last_location.is_some())
+        });
+        diagnostics::result(&mut observation, require_findmy_success_status(response.status()), diagnostics::Outcome::HttpRejected)?;
+        let raw_request: serde_json::Value = diagnostics::body(&mut observation, response.json().await)?;
+        if let Some(record) = observation.as_mut() {
+            record.raw(&raw_request);
+        }
+        let request: FindMyFriendsStateUpdate = diagnostics::result(&mut observation, serde_json::from_value(raw_request.clone()), diagnostics::Outcome::TypedDecodeFailed)?;
+        if let Some(record) = observation.as_mut() { record.begin_join(request.locations.is_some()); }
 
         self.data_context = request.data_context;
         self.server_context = request.server_context;
@@ -2835,8 +2897,10 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         if let Some(locations) = request.locations {
             for location in locations {
                 let Some(follow) = self.following.iter_mut().find(|f| f.id == location.id) else {
+                    if let Some(record) = observation.as_mut() { record.join(false, location.location.is_some()); }
                     continue;
                 };
+                if let Some(record) = observation.as_mut() { record.join(true, location.location.is_some()); }
                 follow.last_location = location.location;
             }
         }
@@ -2853,7 +2917,12 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             }
         }
 
-        Ok(serde_json::from_value(raw_request)?)
+        if let Some(record) = observation.as_mut() {
+            record.after = diagnostics::Snapshot::read(&self.following, |row| row.last_location.is_some());
+        }
+        let result = diagnostics::result(&mut observation, serde_json::from_value(raw_request), diagnostics::Outcome::ReturnDecodeFailed)?;
+        if let Some(record) = observation.as_mut() { record.outcome = diagnostics::Outcome::Merged; }
+        Ok(result)
     }
 
     pub async fn new(
