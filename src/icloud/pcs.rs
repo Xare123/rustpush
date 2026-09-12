@@ -962,6 +962,33 @@ impl PCSEncryptor {
         self.key_for_ciphertext(ciphertext)?
             .decrypt(ciphertext, tag.as_bytes())
     }
+
+    /// Encrypts a replacement with the exact PCS key selected by an existing
+    /// ciphertext. Conditional record updates must preserve the predecessor's
+    /// key routing even when the cached zone contains more than one key.
+    pub fn encrypt_data_matching_ciphertext(
+        &self,
+        predecessor_ciphertext: &[u8],
+        plaintext: &[u8],
+        field_name: &str,
+    ) -> Result<Vec<u8>, PushError> {
+        let zone_name = self
+            .record_id
+            .zone_identifier
+            .as_ref()
+            .and_then(|zone| zone.value.as_ref())
+            .and_then(|identifier| identifier.name.as_deref())
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let record_name = self
+            .record_id
+            .value
+            .as_ref()
+            .and_then(|identifier| identifier.name.as_deref())
+            .ok_or(PushError::PCSCiphertextMalformed)?;
+        let tag = format!("{zone_name}-{record_name}-{field_name}");
+        self.key_for_ciphertext(predecessor_ciphertext)?
+            .encrypt(plaintext, tag.as_bytes())
+    }
 }
 
 impl CloudKitEncryptor for PCSEncryptor {
@@ -1895,6 +1922,36 @@ mod tests {
         ] {
             assert!(!formatted.contains(sentinel));
         }
+    }
+
+    #[test]
+    fn replacement_encryption_preserves_the_predecessor_key_route() {
+        let first = PCSKey(vec![0x11; 16]);
+        let predecessor_key = PCSKey(vec![0x22; 16]);
+        let record_id = record_identifier(public_zone(), "sentinel-record");
+        let aad = b"_defaultZone-sentinel-record-sentinel-field";
+        let predecessor = predecessor_key
+            .encrypt(b"old payload", aad)
+            .expect("fixture encryption");
+        let encryptor = PCSEncryptor {
+            keys: vec![first, predecessor_key],
+            record_id,
+        };
+
+        let replacement = encryptor
+            .encrypt_data_matching_ciphertext(&predecessor, b"new payload", "sentinel-field")
+            .expect("same-key replacement encryption");
+
+        assert_eq!(
+            super::get_ciphertext_key(&replacement).unwrap().0,
+            super::get_ciphertext_key(&predecessor).unwrap().0
+        );
+        assert_eq!(
+            encryptor
+                .decrypt_data_checked(&replacement, "sentinel-field")
+                .unwrap(),
+            b"new payload"
+        );
     }
 }
 

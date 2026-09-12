@@ -1352,6 +1352,28 @@ pub enum CloudMessageRecordVersionLookup {
     },
 }
 
+/// Native-only predecessor view supplied to a lossless msgProto composer.
+/// Plaintext is borrowed for the duration of one Rust callback and is never
+/// serializable or exposed through the Flutter bridge.
+pub struct CloudMessageUpdatePredecessorView<'a> {
+    pub msg_proto: &'a [u8],
+    pub message_time_apple_nanos: i64,
+    pub outer_type: i64,
+}
+
+/// Separates native record/PCS failures from closed composer failures without
+/// reducing either class to a string or exposing record content.
+pub enum CloudMessageRewriteError<E> {
+    Native(PushError),
+    Compose(E),
+}
+
+impl<E> From<PushError> for CloudMessageRewriteError<E> {
+    fn from(value: PushError) -> Self {
+        Self::Native(value)
+    }
+}
+
 impl Debug for CloudMessageRecordVersionLookup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1914,12 +1936,22 @@ mod cloud_message_save_tests {
                 "name" => id.value.as_mut().unwrap().name = Some("other-message".to_string()),
                 "type" => id.value.as_mut().unwrap().r#type = None,
                 "zone" => {
-                    id.zone_identifier.as_mut().unwrap().value.as_mut().unwrap().name =
-                        Some("other-zone".to_string());
+                    id.zone_identifier
+                        .as_mut()
+                        .unwrap()
+                        .value
+                        .as_mut()
+                        .unwrap()
+                        .name = Some("other-zone".to_string());
                 }
                 "owner" => {
-                    id.zone_identifier.as_mut().unwrap().owner_identifier.as_mut().unwrap().name =
-                        Some("other-owner".to_string());
+                    id.zone_identifier
+                        .as_mut()
+                        .unwrap()
+                        .owner_identifier
+                        .as_mut()
+                        .unwrap()
+                        .name = Some("other-owner".to_string());
                 }
                 "environment" => {
                     id.zone_identifier.as_mut().unwrap().environment = Some(Default::default());
@@ -2929,6 +2961,166 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 retry_after: outcome.retry_after,
             }),
         }
+    }
+
+    /// Decrypts the exact fetched predecessor, lets a closed native composer
+    /// replace only the uncompressed msgProto bytes, then deterministically
+    /// gzips and re-encrypts them with the same PCS key as the predecessor.
+    /// Neither plaintext nor ciphertext crosses the Flutter bridge.
+    pub async fn rewrite_message_record_msg_proto<E, F>(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        predecessor: &FetchedRecord,
+        compose: F,
+    ) -> Result<Vec<u8>, CloudMessageRewriteError<E>>
+    where
+        F: FnOnce(CloudMessageUpdatePredecessorView<'_>) -> Result<Vec<u8>, E>,
+    {
+        const MAX_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_PLAIN_BYTES: usize = 4 * 1024 * 1024;
+
+        let container = self
+            .get_writer_container_for_binding(writer_binding)
+            .await?;
+        let raw = predecessor.get_raw_record()?;
+        if raw.r#type.as_ref().and_then(|kind| kind.name.as_deref())
+            != Some(CloudMessage::record_type())
+            || raw.protection_info.is_some()
+            || raw.pcs_key.as_ref().is_none_or(|value| value.len() != 4)
+        {
+            return Err(PushError::BadMsg.into());
+        }
+        let field_value = |name: &str| -> Result<&cloudkit_proto::record::field::Value, PushError> {
+            let mut found = raw.record_field.iter().filter(|field| {
+                field
+                    .identifier
+                    .as_ref()
+                    .and_then(|identifier| identifier.name.as_deref())
+                    == Some(name)
+            });
+            let value = found
+                .next()
+                .and_then(|field| field.value.as_ref())
+                .ok_or(PushError::BadMsg)?;
+            if found.next().is_some() {
+                return Err(PushError::BadMsg);
+            }
+            Ok(value)
+        };
+        use cloudkit_proto::record::field::value::Type;
+        let outer = field_value("msgType")?;
+        if outer.r#type != Some(Type::Int64Type as i32)
+            || outer.is_encrypted == Some(true)
+            || outer.bytes_value.is_some()
+            || outer.double_value.is_some()
+            || outer.date_value.is_some()
+            || outer.string_value.is_some()
+            || outer.location_value.is_some()
+            || outer.reference_value.is_some()
+            || outer.asset_value.is_some()
+            || !outer.list_values.is_empty()
+            || outer.package_value.is_some()
+        {
+            return Err(PushError::BadMsg.into());
+        }
+        let outer_type = outer.signed_value.ok_or(PushError::BadMsg)?;
+        if !matches!(outer_type, 0..=2) {
+            return Err(PushError::BadMsg.into());
+        }
+        let message_time = field_value("time")?;
+        if message_time.r#type != Some(Type::Int64Type as i32)
+            || message_time.is_encrypted != Some(true)
+            || message_time.bytes_value.as_ref().is_none_or(Vec::is_empty)
+            || message_time.signed_value.is_some()
+            || message_time.double_value.is_some()
+            || message_time.date_value.is_some()
+            || message_time.string_value.is_some()
+            || message_time.location_value.is_some()
+            || message_time.reference_value.is_some()
+            || message_time.asset_value.is_some()
+            || !message_time.list_values.is_empty()
+            || message_time.package_value.is_some()
+        {
+            return Err(PushError::BadMsg.into());
+        }
+        let msg_proto = field_value("msgProto")?;
+        if msg_proto.r#type != Some(Type::EncryptedBytesType as i32)
+            || msg_proto.is_encrypted != Some(true)
+            || msg_proto.bytes_value.as_ref().is_none_or(Vec::is_empty)
+            || msg_proto.signed_value.is_some()
+            || msg_proto.double_value.is_some()
+            || msg_proto.date_value.is_some()
+            || msg_proto.string_value.is_some()
+            || msg_proto.location_value.is_some()
+            || msg_proto.reference_value.is_some()
+            || msg_proto.asset_value.is_some()
+            || !msg_proto.list_values.is_empty()
+            || msg_proto.package_value.is_some()
+        {
+            return Err(PushError::BadMsg.into());
+        }
+        let ciphertext = msg_proto
+            .bytes_value
+            .as_deref()
+            .filter(|value| !value.is_empty() && value.len() <= MAX_COMPRESSED_BYTES)
+            .ok_or(PushError::BadMsg)?;
+        let zone = container.private_zone("messageManateeZone".to_owned());
+        let keys = container
+            .get_cached_zone_encryption_config_exact(&zone)
+            .await?;
+        let decryptor = pcs_keys_for_record(raw, &keys)?;
+        let encrypted_time = message_time
+            .bytes_value
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or(PushError::BadMsg)?;
+        let time_plain = decryptor.decrypt_data_checked(encrypted_time, "time")?;
+        let decoded_time =
+            cloudkit_proto::record::field::EncryptedValue::decode(time_plain.as_slice())
+                .map_err(|_| PushError::BadMsg)?;
+        if decoded_time.date_value.is_some() || decoded_time.string_value.is_some() {
+            return Err(PushError::BadMsg.into());
+        }
+        let message_time_apple_nanos = decoded_time.signed_value.ok_or(PushError::BadMsg)?;
+        if message_time_apple_nanos < 0 {
+            return Err(PushError::BadMsg.into());
+        }
+        let compressed = decryptor.decrypt_data_checked(ciphertext, "msgProto")?;
+        if compressed.is_empty() || compressed.len() > MAX_COMPRESSED_BYTES {
+            return Err(PushError::BadMsg.into());
+        }
+        let mut decoder =
+            libflate::gzip::Decoder::new(compressed.as_slice()).map_err(|_| PushError::BadMsg)?;
+        let mut original = Vec::new();
+        decoder
+            .take((MAX_PLAIN_BYTES + 1) as u64)
+            .read_to_end(&mut original)
+            .map_err(|_| PushError::BadMsg)?;
+        if original.is_empty() || original.len() > MAX_PLAIN_BYTES {
+            return Err(PushError::BadMsg.into());
+        }
+        let replacement = compose(CloudMessageUpdatePredecessorView {
+            msg_proto: &original,
+            message_time_apple_nanos,
+            outer_type,
+        })
+        .map_err(CloudMessageRewriteError::Compose)?;
+        if replacement.is_empty() || replacement.len() > MAX_PLAIN_BYTES || replacement == original
+        {
+            return Err(PushError::BadMsg.into());
+        }
+        let recompressed = gzip(&replacement).map_err(PushError::IoError)?;
+        if recompressed.is_empty() || recompressed.len() > MAX_COMPRESSED_BYTES {
+            return Err(PushError::BadMsg.into());
+        }
+        let encrypted =
+            decryptor.encrypt_data_matching_ciphertext(ciphertext, &recompressed, "msgProto")?;
+        if encrypted.is_empty() || encrypted == ciphertext {
+            return Err(PushError::BadMsg.into());
+        }
+        self.get_writer_container_for_binding(writer_binding)
+            .await?;
+        Ok(encrypted)
     }
 
     /// Prepares one message-only, CREATE-ONLY save batch while all
@@ -3987,12 +4179,19 @@ mod cloud_message_identity_tests {
     #[test]
     fn message_version_lookup_defers_decoding_and_revalidates_container_after_fetch() {
         let source = include_str!("cloud_messages.rs");
-        let start = source.find("pub async fn lookup_message_record_version(").unwrap();
-        let end = source[start..].find("pub async fn prepare_message_save_submission(").unwrap();
+        let start = source
+            .find("pub async fn lookup_message_record_version(")
+            .unwrap();
+        let end = source[start..]
+            .find("pub async fn rewrite_message_record_msg_proto")
+            .unwrap();
         let method = &source[start..start + end];
         assert!(method.contains("&NO_ASSETS"));
         assert!(method.contains("validate_message_record_version"));
-        assert_eq!(method.matches("get_writer_container_for_binding").count(), 2);
+        assert_eq!(
+            method.matches("get_writer_container_for_binding").count(),
+            2
+        );
         assert!(!method.contains("get_record("));
         assert!(!method.contains("SaveRecordOperation::"));
         assert!(!method.contains("DeleteRecordOperation::"));
@@ -4319,16 +4518,32 @@ mod cloud_message_identity_tests {
 
         // Exercise the real attachment preparation -> shared PCS lookup path.
         // All state is cached; NoBootstrapAnisette rejects any hidden login.
-        let binding = fixture.messages.warm_attachment_writer_preparation_lookup_only()
-            .await.expect("existing attachment zone must be permitted for its writer");
+        let binding = fixture
+            .messages
+            .warm_attachment_writer_preparation_lookup_only()
+            .await
+            .expect("existing attachment zone must be permitted for its writer");
         assert!(Arc::ptr_eq(&binding.container, &container));
-        fixture.messages.validate_writer_preparation_binding(&binding).await.unwrap();
-        assert!(fixture.messages.read_authentication_container.lock().await.is_none());
+        fixture
+            .messages
+            .validate_writer_preparation_binding(&binding)
+            .await
+            .unwrap();
+        assert!(fixture
+            .messages
+            .read_authentication_container
+            .lock()
+            .await
+            .is_none());
         assert_eq!(container.keys.lock().await.len(), 1);
 
         *fixture.client.state.write().await =
             CloudKitState::new("replacement-account".to_owned()).unwrap();
-        assert!(fixture.messages.validate_writer_preparation_binding(&binding).await.is_err());
+        assert!(fixture
+            .messages
+            .validate_writer_preparation_binding(&binding)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
