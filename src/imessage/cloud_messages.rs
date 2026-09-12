@@ -3100,6 +3100,29 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
     }
 
+    /// Decodes one already-fetched exact Message record with the same cached
+    /// writer container and PCS configuration used by the typed lookup. This
+    /// performs no CloudKit request and preserves the caller's raw
+    /// [FetchedRecord] for lossless conditional-update storage.
+    pub async fn decode_message_record_version(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        record: &FetchedRecord,
+    ) -> Result<CloudMessage, PushError> {
+        let container = self
+            .get_writer_container_for_binding(writer_binding)
+            .await?;
+        let zone = container.private_zone("messageManateeZone".to_string());
+        let key = container
+            .get_cached_zone_encryption_config_exact(&zone)
+            .await?;
+        let message = record.get_record(Some(&key))?;
+        // Revalidate the non-forgeable container binding after PCS access so a
+        // replacement cannot authorize the decoded result.
+        self.get_writer_container_for_binding(writer_binding).await?;
+        Ok(message)
+    }
+
     /// Fetches an exact predecessor without converting its fields into the
     /// lossy CloudMessage model. The existing general container and cached PCS
     /// are required even though decryption is deferred. No assets are fetched,
