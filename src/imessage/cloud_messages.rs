@@ -1772,6 +1772,119 @@ fn ordered_message_save_pairs(
         .collect())
 }
 
+fn validate_message_update_save_request(request: &cloudkit_proto::RecordSaveRequest) -> bool {
+    use cloudkit_proto::record::field::value::Type;
+
+    if request.merge != Some(true)
+        || request.save_semantics != Some(1)
+        || request.etag.as_deref().is_none_or(str::is_empty)
+        || !request.fields_to_delete_if_exist_on_merge.is_empty()
+    {
+        return false;
+    }
+    let Some(record) = request.record.as_ref() else {
+        return false;
+    };
+    let Some(identifier) = record.record_identifier.as_ref() else {
+        return false;
+    };
+    let Some(zone) = identifier.zone_identifier.as_ref() else {
+        return false;
+    };
+    if identifier
+        .value
+        .as_ref()
+        .and_then(|v| v.name.as_deref())
+        .is_none_or(str::is_empty)
+        || identifier.value.as_ref().and_then(|v| v.r#type) != Some(1)
+        || zone.value.as_ref().and_then(|v| v.name.as_deref()) != Some("messageManateeZone")
+        || zone.value.as_ref().and_then(|v| v.r#type) != Some(6)
+        || zone
+            .owner_identifier
+            .as_ref()
+            .and_then(|v| v.name.as_deref())
+            .is_none_or(str::is_empty)
+        || zone.owner_identifier.as_ref().and_then(|v| v.r#type) != Some(7)
+        || record.r#type.as_ref().and_then(|v| v.name.as_deref())
+            != Some(CloudMessage::record_type())
+        || record.protection_info.is_some()
+        || record.pcs_key.as_ref().is_none_or(|value| value.len() != 4)
+        || record.record_field.is_empty()
+        || record.record_field.len() > 2
+    {
+        return false;
+    }
+    let expected_record = cloudkit_proto::Record {
+        record_identifier: record.record_identifier.clone(),
+        r#type: record.r#type.clone(),
+        pcs_key: record.pcs_key.clone(),
+        record_field: record.record_field.clone(),
+        ..Default::default()
+    };
+    if record != &expected_record {
+        return false;
+    }
+
+    let mut names = std::collections::HashSet::with_capacity(record.record_field.len());
+    for field in &record.record_field {
+        let Some(name) = field
+            .identifier
+            .as_ref()
+            .and_then(|value| value.name.as_deref())
+        else {
+            return false;
+        };
+        let Some(value) = field.value.as_ref() else {
+            return false;
+        };
+        if !names.insert(name) {
+            return false;
+        }
+        match name {
+            "msgProto" => {
+                if value.r#type != Some(Type::EncryptedBytesType as i32)
+                    || value.is_encrypted != Some(true)
+                    || value.bytes_value.as_ref().is_none_or(Vec::is_empty)
+                    || value.signed_value.is_some()
+                    || value.double_value.is_some()
+                    || value.date_value.is_some()
+                    || value.string_value.is_some()
+                    || value.location_value.is_some()
+                    || value.reference_value.is_some()
+                    || value.asset_value.is_some()
+                    || !value.list_values.is_empty()
+                    || value.package_value.is_some()
+                {
+                    return false;
+                }
+            }
+            "utm" => {
+                let Some(time) = value.date_value.as_ref().and_then(|date| date.time) else {
+                    return false;
+                };
+                if value.r#type != Some(Type::DateType as i32)
+                    || value.is_encrypted == Some(true)
+                    || !time.is_finite()
+                    || time <= 0.0
+                    || value.bytes_value.is_some()
+                    || value.signed_value.is_some()
+                    || value.double_value.is_some()
+                    || value.string_value.is_some()
+                    || value.location_value.is_some()
+                    || value.reference_value.is_some()
+                    || value.asset_value.is_some()
+                    || !value.list_values.is_empty()
+                    || value.package_value.is_some()
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    names.contains("msgProto")
+}
+
 #[cfg(test)]
 mod cloud_message_save_tests {
     use super::*;
@@ -1820,6 +1933,95 @@ mod cloud_message_save_tests {
             apple_operation_uuid: apple_operation_uuid.to_string(),
             message: CloudMessage::default(),
         }
+    }
+
+    fn conditional_update_request() -> cloudkit_proto::RecordSaveRequest {
+        use cloudkit_proto::record::field::value::Type;
+
+        let zone = RecordZoneIdentifier {
+            value: Some(cloudkit_proto::Identifier {
+                name: Some("messageManateeZone".to_owned()),
+                r#type: Some(6),
+            }),
+            owner_identifier: Some(cloudkit_proto::Identifier {
+                name: Some("owner".to_owned()),
+                r#type: Some(7),
+            }),
+            ..Default::default()
+        };
+        cloudkit_proto::RecordSaveRequest {
+            record: Some(cloudkit_proto::Record {
+                record_identifier: Some(record_identifier(zone, "record")),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some("MessageEncryptedV3".to_owned()),
+                }),
+                pcs_key: Some(vec![1, 2, 3, 4]),
+                record_field: vec![cloudkit_proto::record::Field {
+                    identifier: Some(cloudkit_proto::record::field::Identifier {
+                        name: Some("msgProto".to_owned()),
+                    }),
+                    value: Some(cloudkit_proto::record::field::Value {
+                        r#type: Some(Type::EncryptedBytesType as i32),
+                        is_encrypted: Some(true),
+                        bytes_value: Some(vec![5, 6, 7]),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            merge: Some(true),
+            etag: Some("exact-predecessor-etag".to_owned()),
+            save_semantics: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn conditional_update_validator_accepts_only_exact_fail_if_outdated_shape() {
+        let request = conditional_update_request();
+        assert!(validate_message_update_save_request(&request));
+
+        let mut create = request.clone();
+        create.etag = None;
+        create.save_semantics = Some(2);
+        assert!(!validate_message_update_save_request(&create));
+
+        let mut override_request = request.clone();
+        override_request.save_semantics = Some(3);
+        assert!(!validate_message_update_save_request(&override_request));
+
+        let mut wrong_zone = request.clone();
+        wrong_zone
+            .record
+            .as_mut()
+            .unwrap()
+            .record_identifier
+            .as_mut()
+            .unwrap()
+            .zone_identifier
+            .as_mut()
+            .unwrap()
+            .value
+            .as_mut()
+            .unwrap()
+            .name = Some("chatManateeZone".to_owned());
+        assert!(!validate_message_update_save_request(&wrong_zone));
+
+        let mut unknown_field = request.clone();
+        unknown_field.record.as_mut().unwrap().record_field[0]
+            .identifier
+            .as_mut()
+            .unwrap()
+            .name = Some("futureField".to_owned());
+        assert!(!validate_message_update_save_request(&unknown_field));
+
+        let mut plaintext = request;
+        plaintext.record.as_mut().unwrap().record_field[0]
+            .value
+            .as_mut()
+            .unwrap()
+            .is_encrypted = Some(false);
+        assert!(!validate_message_update_save_request(&plaintext));
     }
 
     fn identity_with_http(
@@ -3183,6 +3385,58 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 prepared_authentication,
                 operations,
                 local_operation_ids,
+                retry_policy: CloudKitRetryPolicy {
+                    max_attempts: 1,
+                    request_timeout,
+                    ..CloudKitRetryPolicy::default()
+                },
+            })
+        })
+        .await
+    }
+
+    /// Prepares exactly one already-encrypted, conditional MessageEncryptedV3
+    /// update. The caller must have retained and revalidated the exact
+    /// predecessor before constructing `request`; this method independently
+    /// rejects create/override semantics and freezes the request together with
+    /// the persisted CloudKit request identity in the existing single-use
+    /// prepared owner. It performs no remote mutation.
+    pub async fn prepare_message_update_submission(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        local_operation_id: String,
+        request: cloudkit_proto::RecordSaveRequest,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        with_cloudkit_writer_operation(async move {
+            if local_operation_id.is_empty()
+                || local_operation_id.len() > 256
+                || request_timeout.is_zero()
+                || request_timeout > Duration::from_secs(5 * 60)
+                || request_identity.operation_uuids().len() != 1
+                || !validate_message_update_save_request(&request)
+            {
+                return Err(PushError::BadMsg);
+            }
+            let container = self
+                .get_writer_container_for_binding(writer_binding)
+                .await?;
+            let zone = container.private_zone("messageManateeZone".to_owned());
+            container
+                .get_cached_zone_encryption_config_exact(&zone)
+                .await?;
+            let prepared_authentication = container.prepare_operations_authentication().await?;
+            self.get_writer_container_for_binding(writer_binding)
+                .await?;
+
+            Ok(CloudMessagesPreparedSaveSubmission {
+                container,
+                session: CloudKitSession::new(),
+                request_identity,
+                prepared_authentication,
+                operations: vec![SaveRecordOperation(request)],
+                local_operation_ids: vec![local_operation_id],
                 retry_policy: CloudKitRetryPolicy {
                     max_attempts: 1,
                     request_timeout,
