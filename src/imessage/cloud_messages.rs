@@ -3956,6 +3956,25 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    /// Permit-bound, raw-only discovery for the existing chat1ManateeZone.
+    /// Uses the cached read-authentication container and lookup-only fetch;
+    /// never decrypts records, warms PCS state, creates zones, or writes.
+    pub async fn sync_chat1_discovery_page_for_read_authentication(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication(
+            permit,
+            "chat1ManateeZone",
+            RAW_ONLY_RECORD_TYPE,
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
     async fn sync_raw_only_records_page(
         &self,
         zone: &str,
@@ -4398,6 +4417,35 @@ mod cloud_message_identity_tests {
                 "unexpected semantic fetch surface: {forbidden_method}"
             );
         }
+    }
+
+    #[test]
+    fn chat1_discovery_page_is_permit_bound_and_raw_only() {
+        let source = include_str!("cloud_messages.rs");
+        let method_start = source
+            .find("pub async fn sync_chat1_discovery_page_for_read_authentication")
+            .expect("chat1 discovery method");
+        let following_method = source[method_start..]
+            .find("async fn sync_raw_only_records_page")
+            .expect("following raw-only helper");
+        let method = &source[method_start..method_start + following_method];
+
+        assert!(method.contains("sync_records_page_for_read_authentication("));
+        assert!(method.contains("\"chat1ManateeZone\""));
+        assert!(method.contains("RAW_ONLY_RECORD_TYPE"));
+        assert!(!method.contains("CloudChat::record_type()"));
+        assert!(!method.contains("CloudMessage::record_type()"));
+        assert!(!method.contains("CloudAttachment::record_type()"));
+        assert!(!method.contains("get_container("));
+        assert!(!method.contains("get_container_lookup_only("));
+        assert!(!method.contains("get_read_authentication_container_lookup_only"));
+        assert!(!method.contains("get_zone_encryption_config("));
+        assert!(!method.contains("get_zone_encryption_config_sev("));
+        assert!(!method.contains("from_record_encrypted"));
+        assert!(!method.contains("save_records("));
+        assert!(!method.contains("delete_records("));
+        assert!(!method.contains("ZoneDeleteOperation"));
+        assert!(!method.contains("ZoneCreateOperation"));
     }
 
     #[test]
