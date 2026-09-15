@@ -3119,7 +3119,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let message = record.get_record(Some(&key))?;
         // Revalidate the non-forgeable container binding after PCS access so a
         // replacement cannot authorize the decoded result.
-        self.get_writer_container_for_binding(writer_binding).await?;
+        self.get_writer_container_for_binding(writer_binding)
+            .await?;
         Ok(message)
     }
 
@@ -4289,6 +4290,9 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         record_id: String,
         expected_record_etag: String,
         file: T,
+        on_verified_size: impl FnMut(Option<crate::mmcs::VerifiedPlaintextLength>) -> Result<(), PushError>
+            + Send
+            + Sync,
     ) -> Result<(), PushError> {
         debug!("Starting closed CloudKit attachment lookup");
         if expected_native_account_identifier.is_empty() || expected_record_etag.is_empty() {
@@ -4382,7 +4386,12 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
         debug!("Starting preauthorized MMCS attachment download");
         container
-            .get_assets_download_only(&records.assets, vec![(&record.lqa, file)])
+            .get_asset_download_only_with_verified_size(
+                &records.assets,
+                &record.lqa,
+                file,
+                on_verified_size,
+            )
             .await
             .map_err(|error| {
                 warn!("Closed CloudKit attachment lookup failed during MMCS download");

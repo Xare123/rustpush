@@ -5655,6 +5655,77 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         Ok(())
     }
 
+    /// One exact attachment body with its authenticated Ford plaintext extent.
+    /// The callback runs after Ford verification and before file-data transfer.
+    /// Ordinary asset callers keep the existing no-callback API above.
+    pub async fn get_asset_download_only_with_verified_size<V: Write + Send + Sync>(
+        &self,
+        responses: &[AssetGetResponse],
+        asset: &cloudkit_proto::Asset,
+        writer: V,
+        mut on_verified_size: impl FnMut(Option<crate::mmcs::VerifiedPlaintextLength>) -> Result<(), PushError>
+            + Send
+            + Sync,
+    ) -> Result<(), PushError> {
+        let request_id = asset
+            .bundled_request_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit asset bundle was missing"))?;
+        let requested = [request_id].into_iter().collect::<HashSet<_>>();
+        let indexed = index_download_only_asset_responses(&requested, responses)?;
+        let response = indexed
+            .get(request_id)
+            .copied()
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit asset response was missing"))?;
+        let body = response
+            .body
+            .as_deref()
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit asset authorization was missing"))?;
+        let signature = asset
+            .signature
+            .clone()
+            .ok_or_else(|| cloudkit_protocol_error("CloudKit asset signature was missing"))?;
+        let config = MMCSConfig {
+            mme_client_info: self.client.config.get_mme_clientinfo(
+                "com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)",
+            ),
+            user_agent: self.client.config.get_normal_ua("CloudKit/1970"),
+            dataclass: "com.apple.Dataclass.CloudKit",
+            mini_ua: self.client.config.get_version_ua(),
+            dsid: Some(self.client.state.read().await.dsid.to_string()),
+            cloudkit_headers: Default::default(),
+            extra_1: None,
+            extra_2: None,
+        };
+        let evidence = [PreauthorizedAssetEvidence {
+            size: asset.size,
+            reference_signature: asset.reference_signature.clone(),
+        }];
+        crate::mmcs::get_mmcs_pre_authorized_download_only_with_verified_sizes(
+            &config,
+            body,
+            vec![(
+                signature,
+                "",
+                FileContainer::new(writer),
+                asset
+                    .protection_info
+                    .as_ref()
+                    .and_then(|info| info.protection_info.clone()),
+            )],
+            |_, _| {},
+            &evidence,
+            &mut |lengths| {
+                if lengths.len() != 1 {
+                    return Err(PushError::VerificationFailed);
+                }
+                on_verified_size(lengths[0])
+            },
+        )
+        .await
+    }
+
     /// MMCS environment for asset-token authorize/PUT round trips. Shared by
     /// the legacy batch upload and the single prepared one-shot upload so the
     /// authorize body and MMCS bytes stay identical. The zone name is always

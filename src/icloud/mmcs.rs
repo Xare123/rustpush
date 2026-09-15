@@ -1074,6 +1074,128 @@ fn add_ford_item_keys(
     Ok(())
 }
 
+/// Authenticated per-request file plaintext length for the closed
+/// download-only transport.
+///
+/// The length is derived ONLY from the exact selected Ford entries after
+/// their AES-SIV decode plus key/signature/reference association has
+/// succeeded: every summed byte comes from a chunk_len embedded in a Ford
+/// envelope decrypted with the requested file key, resolved through the
+/// selected reference own (container_index, chunk_index) entries in file
+/// order against the association built by add_ford_item_keys. Repeated
+/// chunk references are counted once per occurrence because each occurrence
+/// decrypts and writes exactly once.
+///
+/// This is length proof, not admission: it neither fetches nor writes, and
+/// all existing MMCS verification stays in place. A selected reference
+/// without a Ford envelope yields FordFilePlaintextLength::NoFordProof.
+/// Server-described Asset.size is never consulted here and must never be
+/// treated as proof.
+pub(crate) enum FordFilePlaintextLength {
+    /// Summed plaintext bytes of the selected Ford file, in file order.
+    Ford(u64),
+    /// The selected reference carries no Ford envelope, so no
+    /// cryptographically authenticated length exists for it here.
+    NoFordProof,
+}
+
+pub(crate) fn ford_file_plaintext_length(
+    keymap: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+    selected: &authorize_get_response::f1::ChunkReferences,
+    containers: &[ProtoContainer],
+    network_policy: MMCSGetNetworkPolicy,
+) -> Result<FordFilePlaintextLength, PushError> {
+    if selected.ford_reference.is_none() {
+        return Ok(FordFilePlaintextLength::NoFordProof);
+    }
+    if selected.chunk_references.is_empty() {
+        return Err(PushError::VerificationFailed);
+    }
+    let mut total = 0u64;
+    for reference in &selected.chunk_references {
+        let chunk = response_chunk(containers, reference.container_index, reference.chunk_index)?;
+        let checksum = chunk
+            .meta
+            .as_ref()
+            .ok_or(PushError::VerificationFailed)?
+            .checksum
+            .clone();
+        fixed_bytes::<21>(&checksum)?;
+        let (key, length) = keymap.get(&checksum).ok_or(PushError::VerificationFailed)?;
+        // Re-check shapes so the proof never depends on insert-time
+        // validation alone. Conflicting keys for one checksum are already
+        // rejected when the association is built; the lookup below then
+        // yields exactly one unambiguous pair.
+        fixed_bytes::<33>(key)?;
+        let length = fixed_bytes::<4>(length)?;
+        let length = u64::from(u32::from_le_bytes(length));
+        if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+            && length > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        total = total
+            .checked_add(length)
+            .filter(|total| {
+                network_policy != MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+                    || *total <= MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES
+            })
+            .ok_or(PushError::VerificationFailed)?;
+    }
+    if total == 0 {
+        return Err(PushError::VerificationFailed);
+    }
+    Ok(FordFilePlaintextLength::Ford(total))
+}
+
+/// Opaque authenticated file plaintext length handed to the admission
+/// callback. Constructible only inside this module from a successfully
+/// decoded and bound Ford envelope, so downstream crates can consume the
+/// proof but never fabricate it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedPlaintextLength(u64);
+
+impl VerifiedPlaintextLength {
+    /// Admitted plaintext bytes for one requested file.
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+/// Builds the admission vector for the length callback in
+/// requested-file-index order, never response order. Every indexed entry
+/// must resolve through ford_file_plaintext_length after its envelope
+/// decoded and bound; files without a Ford envelope stay None. Duplicate
+/// or out-of-range file indexes fail closed.
+pub(crate) fn ford_verified_lengths_in_requested_order(
+    keymap: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+    ford_selected: &[(usize, &authorize_get_response::f1::ChunkReferences)],
+    file_count: usize,
+    containers: &[ProtoContainer],
+    network_policy: MMCSGetNetworkPolicy,
+) -> Result<Vec<Option<VerifiedPlaintextLength>>, PushError> {
+    let mut verified: Vec<Option<VerifiedPlaintextLength>> = vec![None; file_count];
+    for (file_index, wanted) in ford_selected {
+        let slot = verified
+            .get_mut(*file_index)
+            .ok_or(PushError::VerificationFailed)?;
+        if slot.is_some() {
+            return Err(PushError::VerificationFailed);
+        }
+        match ford_file_plaintext_length(keymap, wanted, containers, network_policy)? {
+            FordFilePlaintextLength::Ford(total) => {
+                *slot = Some(VerifiedPlaintextLength(total));
+            }
+            // Unreachable: entries here always carry a Ford envelope, but a
+            // missing proof must never become an implicit admission.
+            FordFilePlaintextLength::NoFordProof => {
+                return Err(PushError::VerificationFailed);
+            }
+        }
+    }
+    Ok(verified)
+}
+
 async fn send_mmcs_req(
     client: &Client,
     config: &MMCSConfig,
@@ -2828,6 +2950,9 @@ async fn get_mmcs_with_network_policy(
     _ford: bool,
     network_policy: MMCSGetNetworkPolicy,
     asset_evidence: &[PreauthorizedAssetEvidence],
+    mut on_ford_lengths: impl FnMut(&[Option<VerifiedPlaintextLength>]) -> Result<(), PushError>
+        + Send
+        + Sync,
 ) -> Result<(), PushError> {
     let mut files = files
         .into_iter()
@@ -2999,17 +3124,12 @@ async fn get_mmcs_with_network_policy(
         if target_chunks.is_empty() {
             return Err(PushError::VerificationFailed);
         }
-        if let Some(ford_reference) = &wanted_chunks.ford_reference {
+        if wanted_chunks.ford_reference.is_some() {
             let ford_key = files
                 .get(file_index)
                 .and_then(|file| file.3.clone())
                 .ok_or(PushError::VerificationFailed)?;
-            ford_containers.push((
-                wanted_chunks.chunk_references.clone(),
-                ford_reference.clone(),
-                Vec::new(),
-                ford_key,
-            ));
+            ford_containers.push((file_index, wanted_chunks.clone(), Vec::new(), ford_key));
         }
         let writer = files
             .get_mut(file_index)
@@ -3039,7 +3159,11 @@ async fn get_mmcs_with_network_policy(
     if !ford_containers.is_empty() {
         {
             let mut ford_targets = Vec::with_capacity(ford_containers.len());
-            for (_, ford_reference, ford_bytes, _) in &mut ford_containers {
+            for (_, wanted, ford_bytes, _) in &mut ford_containers {
+                let ford_reference = wanted
+                    .ford_reference
+                    .as_ref()
+                    .ok_or(PushError::VerificationFailed)?;
                 let chunk = response_chunk(
                     containers,
                     ford_reference.container_index,
@@ -3103,17 +3227,43 @@ async fn get_mmcs_with_network_policy(
             )?;
         }
 
-        for (references, _ford_ref, ford, key) in ford_containers {
-            let item = decode_ford_item(&ford, &key)?;
+        for (_, wanted, ford, key) in &ford_containers {
+            let item = decode_ford_item(ford, key)?;
             add_ford_item_keys(
                 &mut ford_keymap,
                 item,
-                &references,
+                &wanted.chunk_references,
                 containers,
                 network_policy,
             )?;
         }
     }
+
+    // Closed-transport length proof only: after every selected Ford
+    // envelope has decoded and bound, and before any data-source read or
+    // file-target write. Requested-file-index order, never response order.
+    // A failed proof or a refusing callback fails the transfer closed here,
+    // before a single file byte moves. Standard-path behavior is unchanged:
+    // no proofs are computed and the callback never runs there.
+    if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
+        let ford_selected: Vec<(usize, &authorize_get_response::f1::ChunkReferences)> =
+            ford_containers
+                .iter()
+                .map(|(file_index, wanted, _, _)| (*file_index, wanted))
+                .collect();
+        let verified = ford_verified_lengths_in_requested_order(
+            &ford_keymap,
+            &ford_selected,
+            files.len(),
+            containers,
+            network_policy,
+        )?;
+        on_ford_lengths(&verified)?;
+    }
+
+    // Encrypted Ford envelopes and their references are no longer needed:
+    // release them before streaming file bodies.
+    drop(ford_containers);
 
     let required_chunk_ids = targets
         .iter()
@@ -3219,6 +3369,7 @@ pub async fn get_mmcs(
         ford,
         MMCSGetNetworkPolicy::Standard,
         &[],
+        |_| Ok(()),
     )
     .await
 }
@@ -3239,6 +3390,40 @@ pub async fn get_mmcs_pre_authorized_download_only(
     )>,
     progress: impl FnMut(usize, usize) + Send + Sync,
     asset_evidence: &[PreauthorizedAssetEvidence],
+) -> Result<(), PushError> {
+    get_mmcs_pre_authorized_download_only_with_verified_sizes(
+        config,
+        authorization_body,
+        files,
+        progress,
+        asset_evidence,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Same closed download-only transport as
+/// get_mmcs_pre_authorized_download_only, additionally reporting the
+/// authenticated per-request plaintext lengths in requested-file order.
+/// The callback runs after every selected Ford envelope has decoded and
+/// bound, and before any data-source read or file-target write; a
+/// refusing callback fails the transfer closed before a single file byte
+/// moves. Files without a Ford envelope report None: server-described
+/// Asset.size is never a substitute.
+pub async fn get_mmcs_pre_authorized_download_only_with_verified_sizes(
+    config: &MMCSConfig,
+    authorization_body: &[u8],
+    files: Vec<(
+        Vec<u8>,
+        &str,
+        impl WriteContainer + Send + Sync,
+        Option<Vec<u8>>,
+    )>,
+    progress: impl FnMut(usize, usize) + Send + Sync,
+    asset_evidence: &[PreauthorizedAssetEvidence],
+    mut on_ford_lengths: impl FnMut(&[Option<VerifiedPlaintextLength>]) -> Result<(), PushError>
+        + Send
+        + Sync,
 ) -> Result<(), PushError> {
     // Preflight before cloning so an oversized or malformed CloudKit body
     // cannot cause a second attacker-sized allocation before Prost sees it.
@@ -3262,6 +3447,7 @@ pub async fn get_mmcs_pre_authorized_download_only(
         false,
         MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
         asset_evidence,
+        &mut on_ford_lengths,
     )
     .await
 }
@@ -3521,6 +3707,449 @@ mod download_only_tests {
             &response,
             &repeated_request,
         ));
+    }
+
+    /// Post-association artifacts for length-proof tests: one container
+    /// chunk per length, one keymap entry per checksum, and a
+    /// Ford-selected reference visiting order in file order (repeats
+    /// allowed). Mirrors exactly what add_ford_item_keys accepts.
+    fn ford_length_fixture(
+        lengths: &[u32],
+        order: &[usize],
+    ) -> (
+        HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+        Vec<ProtoContainer>,
+        ChunkReferences,
+    ) {
+        let mut keymap = HashMap::new();
+        let mut chunks = Vec::with_capacity(lengths.len());
+        for (index, length) in lengths.iter().enumerate() {
+            let checksum = vec![0x30 + index as u8; 21];
+            let key = vec![0x40 + index as u8; 33];
+            keymap.insert(checksum.clone(), (key, length.to_le_bytes().to_vec()));
+            chunks.push(ChunkWrapper {
+                meta: Some(ChunkMeta {
+                    checksum,
+                    size: u64::from(*length),
+                    offset: 0,
+                    ..Default::default()
+                }),
+                encryption: None,
+            });
+        }
+        let containers = vec![ProtoContainer {
+            chunks,
+            ..Default::default()
+        }];
+        let selected = ChunkReferences {
+            file_checksum: vec![0x11; 21],
+            chunk_references: order
+                .iter()
+                .map(|index| chunk_reference(0, *index as u32))
+                .collect(),
+            ford_reference: Some(chunk_reference(0, 0)),
+            ..Default::default()
+        };
+        (keymap, containers, selected)
+    }
+
+    fn assert_ford_length(
+        keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+        selected: &ChunkReferences,
+        containers: &[ProtoContainer],
+        expected: u64,
+    ) {
+        assert!(matches!(
+            ford_file_plaintext_length(
+                keys,
+                selected,
+                containers,
+                MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+            ),
+            Ok(FordFilePlaintextLength::Ford(total)) if total == expected
+        ));
+    }
+
+    #[test]
+    fn ford_length_proves_multi_chunk_sum_in_file_order() {
+        let (keys, containers, selected) = ford_length_fixture(&[10, 20, 30], &[2, 0, 1]);
+        assert_ford_length(&keys, &selected, &containers, 60);
+    }
+
+    #[test]
+    fn ford_length_counts_repeated_references_once_per_occurrence() {
+        let (keys, containers, selected) = ford_length_fixture(&[7], &[0, 0, 0]);
+        // The association accepts one Ford entry bound to three identical
+        // reference occurrences, and the proof counts all three writes.
+        let item = FordItem {
+            chunks: vec![
+                FordChunkItem {
+                    key: vec![0x40; 33],
+                    chunk_len: 7u32.to_le_bytes().to_vec(),
+                };
+                3
+            ],
+            checksum: vec![0; 32],
+        };
+        let mut associated = HashMap::new();
+        add_ford_item_keys(
+            &mut associated,
+            item,
+            &selected.chunk_references,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        )
+        .unwrap();
+        assert_eq!(associated, keys);
+        assert_ford_length(&associated, &selected, &containers, 21);
+    }
+
+    #[test]
+    fn ford_length_has_no_proof_without_ford_envelope() {
+        // No ford_reference: explicitly no proof. Asset.size is not
+        // consulted anywhere in the proof path, so it can never stand
+        // in as authenticated length.
+        let (response, _) = valid_download_response();
+        assert!(matches!(
+            ford_file_plaintext_length(
+                &HashMap::new(),
+                &response.references[0],
+                &response.containers,
+                MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+            ),
+            Ok(FordFilePlaintextLength::NoFordProof)
+        ));
+    }
+
+    #[test]
+    fn ford_length_rejects_unknown_misindexed_and_foreign_entries() {
+        let (keys, containers, selected) = ford_length_fixture(&[10, 20], &[0, 1]);
+        // Resolvable indexes but no association for the checksum.
+        let mut unknown = containers.clone();
+        unknown[0].chunks[1].meta.as_mut().unwrap().checksum = vec![0x77; 21];
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &selected,
+            &unknown,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Out-of-range index.
+        let mut dangling = selected.clone();
+        dangling.chunk_references[1] = chunk_reference(9, 9);
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &dangling,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Exact indexes only: a checksum exists in the response, but the
+        // reference names a container that does not exist, so a checksum
+        // search must never rescue it.
+        let mut wrong_container = selected.clone();
+        wrong_container.chunk_references[0] = chunk_reference(1, 0);
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &wrong_container,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Proof before any association exists must fail.
+        assert_verification_failed(ford_file_plaintext_length(
+            &HashMap::new(),
+            &selected,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+    }
+
+    #[test]
+    fn ford_length_rejects_empty_zero_oversized_and_over_total_entries() {
+        // Empty file order with a Ford envelope present.
+        let (_, containers, selected) = ford_length_fixture(&[10], &[]);
+        assert_verification_failed(ford_file_plaintext_length(
+            &HashMap::new(),
+            &selected,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Zero total proves no body.
+        let (keys, containers, selected) = ford_length_fixture(&[0], &[0]);
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &selected,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Per-chunk ceiling.
+        let (keys, containers, selected) = ford_length_fixture(&[u32::MAX], &[0]);
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &selected,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Nine 64 MiB entries sum past the 512 MiB response ceiling.
+        let big = 64 * 1024 * 1024u32;
+        let (keys, containers, selected) =
+            ford_length_fixture(&[big; 9], &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &selected,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Exactly eight 64 MiB entries sum to exactly the ceiling.
+        let (keys, containers, selected) =
+            ford_length_fixture(&[big; 8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_ford_length(&keys, &selected, &containers, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ford_ordered_lengths_follow_requested_order_with_non_ford_none() {
+        // Two Ford files plus one non-Ford file. Entries arrive in
+        // response order, but the vector must follow requested order.
+        let mut keymap = HashMap::new();
+        keymap.insert(
+            vec![0xA0; 21],
+            (vec![0xA1; 33], 10u32.to_le_bytes().to_vec()),
+        );
+        keymap.insert(
+            vec![0xB0; 21],
+            (vec![0xB1; 33], 20u32.to_le_bytes().to_vec()),
+        );
+        let containers = vec![ProtoContainer {
+            chunks: vec![
+                ChunkWrapper {
+                    meta: Some(ChunkMeta {
+                        checksum: vec![0xA0; 21],
+                        size: 10,
+                        offset: 0,
+                        ..Default::default()
+                    }),
+                    encryption: None,
+                },
+                ChunkWrapper {
+                    meta: Some(ChunkMeta {
+                        checksum: vec![0xB0; 21],
+                        size: 20,
+                        offset: 10,
+                        ..Default::default()
+                    }),
+                    encryption: None,
+                },
+            ],
+            ..Default::default()
+        }];
+        let wanted_a = ChunkReferences {
+            file_checksum: vec![0x11; 21],
+            chunk_references: vec![chunk_reference(0, 0)],
+            ford_reference: Some(chunk_reference(0, 0)),
+            ..Default::default()
+        };
+        let wanted_b = ChunkReferences {
+            file_checksum: vec![0x12; 21],
+            chunk_references: vec![chunk_reference(0, 1)],
+            ford_reference: Some(chunk_reference(0, 1)),
+            ..Default::default()
+        };
+        // Response order carries file 2 before file 0; file 1 has no
+        // Ford envelope and stays None.
+        let selected = vec![(2usize, &wanted_b), (0usize, &wanted_a)];
+        let ordered = ford_verified_lengths_in_requested_order(
+            &keymap,
+            &selected,
+            3,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        )
+        .unwrap();
+        assert_eq!(ordered.len(), 3);
+        assert!(matches!(ordered[0], Some(v) if v.bytes() == 10));
+        assert!(ordered[1].is_none());
+        assert!(matches!(ordered[2], Some(v) if v.bytes() == 20));
+    }
+
+    #[test]
+    fn ford_ordered_lengths_reject_duplicate_and_foreign_indexes() {
+        let (keys, containers, selected) = ford_length_fixture(&[10], &[0]);
+        // Same file index twice is ambiguous.
+        let duplicated = vec![(0usize, &selected), (0usize, &selected)];
+        assert_verification_failed(ford_verified_lengths_in_requested_order(
+            &keys,
+            &duplicated,
+            1,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Index outside the requested files.
+        let foreign = vec![(4usize, &selected)];
+        assert_verification_failed(ford_verified_lengths_in_requested_order(
+            &keys,
+            &foreign,
+            1,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        // Empty selection admits nothing but proves nothing either.
+        let ordered = ford_verified_lengths_in_requested_order(
+            &keys,
+            &[],
+            2,
+            &containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        )
+        .unwrap();
+        assert_eq!(ordered, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn ford_length_matches_decoded_envelope_after_association() {
+        // Real AES-SIV envelope: proof before association fails, and
+        // after decode plus association it equals the exact plaintext
+        // length across both chunks.
+        let plaintext = vec![0xA5u8; 6_000_000];
+        let prepared = prepare_put_v2(
+            FileContainer::new(Cursor::new(plaintext.clone())),
+            &[0x42; 32],
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.chunk_sigs.len(), 2);
+        let mut container = ProtoContainer {
+            request: Some(chunk_request("GET", "https")),
+            chunks: Vec::new(),
+            ..Default::default()
+        };
+        let mut chunk_refs = Vec::new();
+        let mut offset = 0u64;
+        for (index, piece) in plaintext.chunks(5_242_880).enumerate() {
+            let ciphertext = prepared.chunk_sigs[index].encrypt(piece.to_vec()).unwrap();
+            assert_eq!(ciphertext.len(), piece.len());
+            container.chunks.push(ChunkWrapper {
+                meta: Some(ChunkMeta {
+                    checksum: prepared.chunk_sigs[index].id.to_vec(),
+                    size: ciphertext.len() as u64,
+                    offset,
+                    ..Default::default()
+                }),
+                encryption: None,
+            });
+            offset += ciphertext.len() as u64;
+            chunk_refs.push(chunk_reference(0, index as u32));
+        }
+        let (signature, envelope) = prepared.ford.as_ref().unwrap();
+        container.chunks.push(ChunkWrapper {
+            meta: None,
+            encryption: Some(EncryptionMeta {
+                size: envelope.len() as u32,
+                offset: offset as u32,
+                for_chunks: Some(EncryptedChunks {
+                    container: prepared.total_sig.clone(),
+                    keys_container: signature.to_vec(),
+                }),
+            }),
+        });
+        let ford_index = container.chunks.len() as u32 - 1;
+        let selected = ChunkReferences {
+            file_checksum: prepared.total_sig.clone(),
+            chunk_references: chunk_refs,
+            ford_reference: Some(chunk_reference(0, ford_index)),
+            ..Default::default()
+        };
+        let requested = vec![(
+            prepared.total_sig.clone(),
+            Some(prepared.ford_key.unwrap().to_vec()),
+        )];
+        let response = authorize_get_response::F1 {
+            containers: vec![container],
+            references: vec![selected.clone()],
+        };
+        assert_eq!(
+            validate_preauthorized_download_response(&response, &requested).unwrap(),
+            vec![0]
+        );
+        let mut keys = HashMap::new();
+        assert_verification_failed(ford_file_plaintext_length(
+            &keys,
+            &selected,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        ));
+        add_ford_item_keys(
+            &mut keys,
+            decode_ford_item(envelope, requested[0].1.as_deref().unwrap()).unwrap(),
+            &selected.chunk_references,
+            &response.containers,
+            MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        )
+        .unwrap();
+        assert_ford_length(&keys, &selected, &response.containers, 6_000_000);
+    }
+
+    /// Write sink that records any data write. The admission callback
+    /// must refuse before any data source exists, so this counter must
+    /// stay zero: no DNS, no HTTP, no file write.
+    struct RefusingSink {
+        writes: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Container for RefusingSink {}
+
+    #[async_trait::async_trait]
+    impl WriteContainer for RefusingSink {
+        async fn write(&mut self, _data: &[u8]) -> Result<(), PushError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("data transfer must not start before the admission callback refuses");
+        }
+    }
+
+    #[tokio::test]
+    async fn refusing_callback_runs_before_any_data_write_or_fetch() {
+        // Non-Ford reference: no envelope fetch exists, so the callback
+        // must observe exactly [None] once, and its refusal must end the
+        // transfer before any data source is created.
+        let (response, requested) = valid_download_response();
+        let body = crate::mmcsp::AuthorizeGetResponse {
+            f1: Some(response),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let config = MMCSConfig {
+            mme_client_info: String::new(),
+            user_agent: String::new(),
+            dataclass: "com.apple.Dataclass.CloudKit",
+            mini_ua: String::new(),
+            dsid: None,
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
+        };
+        let writes = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let result = get_mmcs_pre_authorized_download_only_with_verified_sizes(
+            &config,
+            &body,
+            vec![(
+                requested[0].0.clone(),
+                "",
+                RefusingSink {
+                    writes: writes.clone(),
+                },
+                requested[0].1.clone(),
+            )],
+            |_, _| {},
+            &[],
+            |lengths| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(lengths, &[None]);
+                Err(PushError::VerificationFailed)
+            },
+        )
+        .await;
+        assert_verification_failed(result);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
