@@ -1175,6 +1175,12 @@ impl IdentityResource {
                 .decrypt_payload(ident.as_ref(), &encryption, &message)?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
+            // Local fresh-decrypt provenance: true only
+            // here, after `decrypt_payload` succeeded with a resolved
+            // sender identity in this call. Wire input cannot set this bit.
+            if ident.is_some() && !*verification_failed {
+                payload.fresh_decrypt = true;
+            }
             payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
         }
 

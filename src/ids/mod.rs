@@ -101,6 +101,13 @@ pub struct IDSRecvMessage {
 
     #[serde(skip)]
     pub verification_failed: bool,
+    // Local fresh-decrypt provenance: true only when
+    // `receive_message` decrypted this payload via `decrypt_payload`
+    // with a resolved sender identity in the same call. `serde(skip)`
+    // keeps it off the wire, so inbound data can neither set nor clear
+    // it; a spoofed wire `p` body always observes false.
+    #[serde(skip)]
+    pub fresh_decrypt: bool,
     #[serde(skip)]
     pub topic: &'static str,
 }
@@ -117,4 +124,26 @@ pub struct CertifiedContext {
 
 pub mod idsp {
     include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IDSRecvMessage;
+
+    #[test]
+    fn wire_input_cannot_set_fresh_decrypt_provenance() {
+        // Even a hostile envelope that names the provenance bit (and the
+        // verification flag) must deserialize with both local-only bits
+        // clear: `serde(skip)` keeps them off the wire.
+        let raw = serde_json::json!({
+            "c": 242,
+            "fresh_decrypt": true,
+            "verification_failed": true,
+        });
+        let wire = plist::to_value(&raw).unwrap();
+        let msg: IDSRecvMessage = plist::from_value(&wire).unwrap();
+        assert_eq!(msg.command, 242);
+        assert!(!msg.fresh_decrypt);
+        assert!(!msg.verification_failed);
+    }
 }

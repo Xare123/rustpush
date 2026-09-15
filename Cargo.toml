@@ -11,7 +11,7 @@ aps-proxy-test = []
 default = ["macos-validation-data"]
 
 [dependencies]
-plist = "1.7.0"
+plist = { version = "1.7.0", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "stream", "rustls-tls-webpki-roots", "native-tls-vendored"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -2283,16 +2283,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         &self,
         msg: APSMessage,
     ) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
-        if let Some(IDSRecvMessage {
-            message_unenc: Some(message),
-            topic,
-            token: Some(token),
-            target: Some(target),
-            sender: Some(sender),
-            uuid: Some(uuid),
-            ns_since_epoch: Some(ns_since_epoch),
-            ..
-        }) = self
+        let incoming = self
             .identity
             .receive_message(
                 msg,
@@ -2302,7 +2293,22 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     "com.apple.private.alloy.findmy.itemsharing-crossaccount",
                 ],
             )
-            .await?
+            .await?;
+        // Logs-only 242 shape observer: fixed categories
+        // and presence booleans only, ahead of the required-fields
+        // destructure so missing uuid/token/time remain observable.
+        // Never acks, persists, requests keys or alters dispatch below.
+        diagnostics::observe_ids242_shape(incoming.as_ref());
+        if let Some(IDSRecvMessage {
+            message_unenc: Some(message),
+            topic,
+            token: Some(token),
+            target: Some(target),
+            sender: Some(sender),
+            uuid: Some(uuid),
+            ns_since_epoch: Some(ns_since_epoch),
+            ..
+        }) = incoming
         {
             let do_app_ack = || async {
                 let targets = self.identity.cache.lock().await.get_targets(
