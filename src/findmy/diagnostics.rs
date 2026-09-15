@@ -1221,7 +1221,7 @@ mod tests {
         let body = plist::Value::Dictionary(dict);
         let msg = test_242_message(Some(MessageBody::Bytes(bplist_bytes(&body))), true);
         let record = Ids242Record::read(Ids242Topic::Fmf, &msg);
-        match record.body {
+        match &record.body {
             Ids242Body::Dict { outer, .. } => {
                 assert!(outer
                     .entries
