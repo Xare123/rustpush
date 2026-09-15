@@ -4639,7 +4639,19 @@ mod cloud_message_identity_tests {
         assert!(method.contains("&ALL_ASSETS"));
         assert!(method.contains("expected_record_identifier.clone()"));
         assert!(method.contains("records.record_etag(&expected_record_identifier)?"));
-        assert!(method.contains("get_assets_download_only"));
+        assert!(method.contains("get_asset_download_only_with_verified_size"));
+        assert!(method.contains("on_verified_size"));
+        let container_source = include_str!("../icloud/cloudkit.rs");
+        let start = container_source.find("pub async fn get_asset_download_only_with_verified_size")
+            .expect("single-asset closed reader");
+        let end = container_source[start..].find("async fn upload_asset_mmcs_config")
+            .expect("following container method");
+        let container_method = &container_source[start..start + end];
+        assert!(container_method.contains("get_mmcs_pre_authorized_download_only_with_verified_sizes"));
+        assert!(container_method.contains("index_download_only_asset_responses"));
+        assert!(container_method.contains("lengths.len() != 1"));
+        assert!(!container_method.contains(".get_assets("));
+        assert!(!container_method.contains("authorize_get("));
         assert!(method.matches("permit.validate()?").count() >= 4);
         assert!(
             method
