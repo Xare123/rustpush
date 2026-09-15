@@ -5716,7 +5716,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             )],
             |_, _| {},
             &evidence,
-            &mut |lengths| {
+            &mut |lengths: &[Option<crate::mmcs::VerifiedPlaintextLength>]| {
                 if lengths.len() != 1 {
                     return Err(PushError::VerificationFailed);
                 }
