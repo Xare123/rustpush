@@ -3477,13 +3477,32 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         continuation_token: Option<Vec<u8>>,
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_with_direction(
+            zone_name,
+            expected_record_type,
+            continuation_token,
+            max_changes,
+            false,
+        )
+        .await
+    }
+
+    async fn sync_records_page_with_direction(
+        &self,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
         let container = self.get_read_authentication_container_lookup_only().await?;
-        self.sync_records_page_with_container(
+        self.sync_records_page_with_container_and_direction(
             &container,
             zone_name,
             expected_record_type,
             continuation_token,
             max_changes,
+            newest_first,
         )
         .await
     }
@@ -3496,18 +3515,39 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         continuation_token: Option<Vec<u8>>,
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication_with_direction(
+            permit,
+            zone_name,
+            expected_record_type,
+            continuation_token,
+            max_changes,
+            false,
+        )
+        .await
+    }
+
+    async fn sync_records_page_for_read_authentication_with_direction(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
         permit.validate()?;
         let container = self
             .get_cached_container_for_read_authentication(permit)
             .await?;
         permit.validate()?;
         let result = self
-            .sync_records_page_with_container(
+            .sync_records_page_with_container_and_direction(
                 &container,
                 zone_name,
                 expected_record_type,
                 continuation_token,
                 max_changes,
+                newest_first,
             )
             .await;
         permit.validate()?;
@@ -3522,13 +3562,34 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         continuation_token: Option<Vec<u8>>,
         max_changes: u32,
     ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_with_container_and_direction(
+            container,
+            zone_name,
+            expected_record_type,
+            continuation_token,
+            max_changes,
+            false,
+        )
+        .await
+    }
+
+    async fn sync_records_page_with_container_and_direction(
+        &self,
+        container: &Arc<CloudKitOpenContainer<'static, P>>,
+        zone_name: &str,
+        expected_record_type: &str,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: u32,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
         let zone = container.private_zone(zone_name.to_string());
-        let page = FetchRecordChangesOperation::fetch_page_with_limit_lookup_only(
+        let page = FetchRecordChangesOperation::fetch_page_with_limit_lookup_only_and_direction(
             container,
             zone,
             continuation_token,
             &NO_ASSETS,
             max_changes,
+            newest_first,
         )
         .await?;
 
@@ -3842,6 +3903,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    pub async fn sync_chats_page_with_direction(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_with_direction(
+            "chatManateeZone",
+            CloudChat::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
+        )
+        .await
+    }
+
     pub async fn sync_chats_page_for_read_authentication(
         &self,
         permit: &CloudKitReadAuthenticationPermit<'_>,
@@ -3854,6 +3931,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             CloudChat::record_type(),
             continuation_token,
             max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn sync_chats_page_for_read_authentication_with_direction(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication_with_direction(
+            permit,
+            "chatManateeZone",
+            CloudChat::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
         )
         .await
     }
@@ -3891,6 +3986,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    pub async fn sync_messages_page_with_direction(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_with_direction(
+            "messageManateeZone",
+            CloudMessage::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
+        )
+        .await
+    }
+
     pub async fn sync_messages_page_for_read_authentication(
         &self,
         permit: &CloudKitReadAuthenticationPermit<'_>,
@@ -3903,6 +4014,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             CloudMessage::record_type(),
             continuation_token,
             max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn sync_messages_page_for_read_authentication_with_direction(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication_with_direction(
+            permit,
+            "messageManateeZone",
+            CloudMessage::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
         )
         .await
     }
@@ -3940,6 +4069,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    pub async fn sync_attachments_page_with_direction(
+        &self,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_with_direction(
+            "attachmentManateeZone",
+            CloudAttachment::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
+        )
+        .await
+    }
+
     pub async fn sync_attachments_page_for_read_authentication(
         &self,
         permit: &CloudKitReadAuthenticationPermit<'_>,
@@ -3952,6 +4097,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             CloudAttachment::record_type(),
             continuation_token,
             max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+        )
+        .await
+    }
+
+    pub async fn sync_attachments_page_for_read_authentication_with_direction(
+        &self,
+        permit: &CloudKitReadAuthenticationPermit<'_>,
+        continuation_token: Option<Vec<u8>>,
+        max_changes: Option<u32>,
+        newest_first: bool,
+    ) -> Result<CloudMessageRecordPage, PushError> {
+        self.sync_records_page_for_read_authentication_with_direction(
+            permit,
+            "attachmentManateeZone",
+            CloudAttachment::record_type(),
+            continuation_token,
+            max_changes.unwrap_or(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE),
+            newest_first,
         )
         .await
     }

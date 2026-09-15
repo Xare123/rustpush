@@ -2118,6 +2118,22 @@ impl FetchRecordChangesOperation {
         assets: &cloudkit_proto::AssetsToDownload,
         max_changes: u32,
     ) -> Self {
+        Self::new_with_limit_and_direction(
+            zone,
+            continuation_token,
+            assets,
+            max_changes,
+            false,
+        )
+    }
+
+    pub fn new_with_limit_and_direction(
+        zone: cloudkit_proto::RecordZoneIdentifier,
+        continuation_token: Option<Vec<u8>>,
+        assets: &cloudkit_proto::AssetsToDownload,
+        max_changes: u32,
+        newest_first: bool,
+    ) -> Self {
         Self(cloudkit_proto::RetrieveChangesRequest {
             sync_continuation_token: continuation_token,
             zone_identifier: Some(zone),
@@ -2125,7 +2141,7 @@ impl FetchRecordChangesOperation {
             max_changes: Some(max_changes.clamp(1, CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE)),
             requested_changes_types: Some(CLOUDKIT_RECORD_CHANGES_REQUEST_ALL),
             assets_to_download: Some(assets.clone()),
-            newest_first: Some(false),
+            newest_first: Some(newest_first),
             ignore_calling_device_changes: None,
             include_mergeable_deltas: None,
         })
@@ -2161,6 +2177,7 @@ impl FetchRecordChangesOperation {
             assets,
             max_changes,
             false,
+            false,
         )
         .await
     }
@@ -2179,6 +2196,27 @@ impl FetchRecordChangesOperation {
             assets,
             max_changes,
             true,
+            false,
+        )
+        .await
+    }
+
+    pub async fn fetch_page_with_limit_lookup_only_and_direction(
+        container: &CloudKitOpenContainer<'_, impl AnisetteProvider>,
+        zone: cloudkit_proto::RecordZoneIdentifier,
+        continuation_token: Option<Vec<u8>>,
+        assets: &cloudkit_proto::AssetsToDownload,
+        max_changes: u32,
+        newest_first: bool,
+    ) -> Result<CloudKitRecordChangePage, PushError> {
+        Self::fetch_page_with_limit_and_access(
+            container,
+            zone,
+            continuation_token,
+            assets,
+            max_changes,
+            true,
+            newest_first,
         )
         .await
     }
@@ -2190,9 +2228,16 @@ impl FetchRecordChangesOperation {
         assets: &cloudkit_proto::AssetsToDownload,
         max_changes: u32,
         lookup_only: bool,
+        newest_first: bool,
     ) -> Result<CloudKitRecordChangePage, PushError> {
         let requested_token = continuation_token.clone();
-        let operation = Self::new_with_limit(zone, continuation_token, assets, max_changes);
+        let operation = Self::new_with_limit_and_direction(
+            zone,
+            continuation_token,
+            assets,
+            max_changes,
+            newest_first,
+        );
         let (assets, response) = if lookup_only {
             container
                 .perform_semantic_read_only(&CloudKitSession::new(), operation)
@@ -9273,6 +9318,20 @@ mod cloud_sync_transport_tests {
             Some(CLOUDKIT_RECORD_CHANGES_REQUEST_ALL)
         );
         assert_eq!(request.0.max_changes, Some(1));
+        assert_eq!(request.0.newest_first, Some(false));
+
+        let newest = FetchRecordChangesOperation::new_with_limit_and_direction(
+            cloudkit_proto::RecordZoneIdentifier::default(),
+            None,
+            &NO_ASSETS,
+            CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE + 1,
+            true,
+        );
+        assert_eq!(
+            newest.0.max_changes,
+            Some(CLOUDKIT_DEFAULT_MAX_CHANGES_PER_PAGE)
+        );
+        assert_eq!(newest.0.newest_first, Some(true));
     }
 
     #[test]
