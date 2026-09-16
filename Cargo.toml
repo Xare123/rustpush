@@ -24,6 +24,7 @@ rustls = "0.23.38"
 rustls-pemfile = "1.0.3"
 rand = { version = "0.8.5", features = ["min_const_gen"] }
 libflate = "2.0.0"
+flate2 = "1.0"
 thiserror = "1.0.47"
 async-recursion = "1.0.4"
 html-escape = "0.2.13"

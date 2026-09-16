@@ -2717,6 +2717,7 @@ dependencies = [
  "cloudkit-proto",
  "ctr",
  "deku",
+ "flate2",
  "flume",
  "futures",
  "hkdf",

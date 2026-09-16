@@ -1,3 +1,6 @@
+#[path = "cloudkit_received_wire.rs"]
+mod received_wire;
+
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -544,6 +547,15 @@ pub trait CloudKitOp {
     fn retrieve_response(
         response: &cloudkit_proto::ResponseOperation,
     ) -> Result<Self::Response, PushError>;
+    /// Opt-in exact-wire validation. Ordinary operations retain their current
+    /// typed behavior; strict received-record inspection consumes original bytes.
+    fn retrieve_response_with_wire(
+        response: &cloudkit_proto::ResponseOperation,
+        _wire: &[u8],
+    ) -> Result<Self::Response, PushError> {
+        Self::retrieve_response(response)
+    }
+    fn validate_response_wire(_wire: &[u8]) -> Result<(),PushError> {Ok(())}
 
     fn flow_control_key() -> &'static str;
     fn operation() -> cloudkit_proto::operation::Type;
@@ -1179,11 +1191,11 @@ async fn read_cloudkit_http_response_body(
     }
 }
 
-fn decode_cloudkit_response_body(body: Vec<u8>) -> Result<Vec<ResponseOperation>, PushError> {
-    undelimit_response(&body)?
-        .into_iter()
-        .map(|frame| Ok(ResponseOperation::decode(&mut Cursor::new(frame))?))
-        .collect()
+fn decode_cloudkit_response_body(body: Vec<u8>) -> Result<(Vec<ResponseOperation>,Vec<Vec<u8>>), PushError> {
+    let frames=undelimit_response(&body)?;
+    let decoded=frames.iter().map(|frame|Ok(ResponseOperation::decode(frame.as_slice())?))
+        .collect::<Result<Vec<_>,PushError>>()?;
+    Ok((decoded,frames))
 }
 
 /// Awaits one phase of a protected one-shot CloudKit request without extending
@@ -1532,9 +1544,13 @@ impl SaveRecordOperation {
 pub struct FetchedRecord {
     pub assets: Vec<AssetGetResponse>,
     response: ResponseOperation,
+    original_record_wire: Option<Vec<u8>>,
 }
 
 impl FetchedRecord {
+    pub fn original_record_wire(&self) -> Option<&[u8]> {
+        self.original_record_wire.as_deref()
+    }
     pub fn get_raw_record(&self) -> Result<&Record, PushError> {
         self.response
             .record_retrieve_response
@@ -1639,6 +1655,7 @@ impl CloudKitOp for FetchRecordOperation {
                 .map(|header| header.bundled)
                 .unwrap_or_default(),
             response: clonedresponse,
+            original_record_wire: None,
         })
     }
     fn flow_control_key() -> &'static str {
@@ -1688,6 +1705,30 @@ impl FetchRecordOperation {
             })
             .collect()
     }
+}
+
+/// Exact fetch with strict Record wire evidence, never a fallback from a
+/// failed parser. Other fetch callers keep their existing behavior.
+pub struct InspectReceivedRecordOperation(pub FetchRecordOperation);
+impl CloudKitOp for InspectReceivedRecordOperation {
+    type Response=FetchedRecord;
+    fn validate_response_wire(wire:&[u8])->Result<(),PushError>{received_wire::received_record_wire(wire).map(|_|())}
+    fn set_request(&self,out:&mut cloudkit_proto::RequestOperation){self.0.set_request(out)}
+    fn retrieve_response(_response:&ResponseOperation)->Result<Self::Response,PushError>{Err(PushError::BadMsg)}
+    fn retrieve_response_with_wire(response:&ResponseOperation,wire:&[u8])->Result<Self::Response,PushError>{
+        let raw=received_wire::received_record_wire(wire)?.ok_or(PushError::BadMsg)?;
+        let mut value=FetchRecordOperation::retrieve_response(response)?;
+        if Record::decode(raw.as_slice())?!=*value.get_raw_record()? {return Err(PushError::BadMsg)};
+        value.original_record_wire=Some(raw);
+        Ok(value)
+    }
+    fn flow_control_key()->&'static str{FetchRecordOperation::flow_control_key()}
+    fn link()->&'static str{FetchRecordOperation::link()}
+    fn operation()->cloudkit_proto::operation::Type{FetchRecordOperation::operation()}
+    fn provides_assets()->bool{true}
+    fn is_grouped()->bool{false}
+    fn retry_safety(&self)->CloudKitRetrySafety{CloudKitRetrySafety::ReadOnly}
+    fn semantic_read_operation(&self)->Option<SemanticReadOperation>{Some(SemanticReadOperation::FetchRecord)}
 }
 
 pub struct FetchZoneOperation(pub cloudkit_proto::ZoneRetrieveRequest);
@@ -4792,6 +4833,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         &self,
         request_identity: &CloudKitRequestIdentity,
         response: &[ResponseOperation],
+        raw_frames: &[Vec<u8>],
     ) -> Result<CloudKitBatchResponse<Op::Response>, PushError> {
         validate_cloudkit_response_identities(request_identity, response)?;
         let outcomes = request_identity
@@ -4799,14 +4841,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .iter()
             .enumerate()
             .map(|(request_index, request_uuid)| {
-                let mut matching = response.iter().filter(|response| {
+                let mut matching = response.iter().enumerate().filter(|(_,response)| {
                     response
                         .response
                         .as_ref()
                         .and_then(|operation| operation.operation_uuid.as_deref())
                         == Some(request_uuid.as_str())
                 });
-                let Some(operation_response) = matching.next() else {
+                let Some((frame_index,operation_response)) = matching.next() else {
                     return CloudKitOperationOutcome {
                         request_index,
                         operation_uuid: request_uuid.clone(),
@@ -4829,6 +4871,11 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     };
                 }
 
+                if let Err(error)=raw_frames.get(frame_index).ok_or(PushError::BadMsg)
+                    .and_then(|wire|Op::validate_response_wire(wire)) {
+                    return CloudKitOperationOutcome {request_index,operation_uuid:request_uuid.clone(),
+                        result:Err(error),retry_after:None,failure_class:Some(CloudKitFailureClass::Unknown)};
+                }
                 let Some(result) = operation_response.result.as_ref() else {
                     return CloudKitOperationOutcome {
                         request_index,
@@ -4862,7 +4909,8 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 CloudKitOperationOutcome {
                     request_index,
                     operation_uuid: request_uuid.clone(),
-                    result: Op::retrieve_response(operation_response),
+                    result: raw_frames.get(frame_index).ok_or(PushError::BadMsg)
+                        .and_then(|wire|Op::retrieve_response_with_wire(operation_response,wire)),
                     retry_after: None,
                     failure_class: None,
                 }
@@ -5452,7 +5500,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 decode_cloudkit_response_body(body)?
             };
 
-            return Ok(self.parse_operation_responses::<Op>(&request_identity, &response)?);
+            return Ok(self.parse_operation_responses::<Op>(&request_identity, &response.0, &response.1)?);
         }
         }
         .await;

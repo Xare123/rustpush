@@ -64,6 +64,8 @@ use cloudkit_proto::CloudKitEncryptor;
 mod chat_create;
 pub use chat_create::{validate_direct_chat_create, CloudChatRecordLookup, CloudChatSaveInput};
 mod attachment_create;
+mod received_inspection;
+pub use received_inspection::CloudMessageRecordInspection;
 pub use attachment_create::{
     CloudAttachmentNativeUploadInput, CloudAttachmentNativeUploadOutcome,
     CloudAttachmentNativeUploadResult, CloudAttachmentRecordLookup, CloudAttachmentSaveInput,
