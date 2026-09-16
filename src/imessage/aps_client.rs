@@ -132,6 +132,7 @@ impl IDSRecvMessage {
             send_delivered: send_delivered.unwrap_or(false),
             verification_failed: self.verification_failed,
             certified_context: self.certified_context(),
+            received_on_handle: self.target.clone(),
         })
     }
 
@@ -271,6 +272,7 @@ impl IMClient {
                 send_delivered: false,
                 verification_failed: false,
                 certified_context: None,
+                received_on_handle: None,
             }));
         }
         if let Some(received) = self
@@ -538,6 +540,80 @@ fn request_mutation_acknowledgment(
     }
     ids.no_response = false;
     Ok(())
+}
+
+#[cfg(test)]
+mod received_origin_tests {
+    use super::*;
+    use crate::MessageType;
+
+    fn incoming(recipient: Option<&str>, certified: bool) -> IDSRecvMessage {
+        let mut fields = Dictionary::new();
+        fields.insert("c".into(), Value::Integer(100u64.into()));
+        fields.insert("e".into(), Value::Integer(1_700_000_000_000_000_000u64.into()));
+        fields.insert("U".into(), Value::Data(vec![1; 16]));
+        fields.insert("sP".into(), Value::String("mailto:peer@example.com".into()));
+        fields.insert("t".into(), Value::Data(vec![2; 32]));
+        if let Some(recipient) = recipient {
+            fields.insert("tP".into(), Value::String(recipient.into()));
+        }
+        if certified {
+            fields.insert("cdv".into(), Value::Integer(1u64.into()));
+            fields.insert("cdr".into(), Value::Data(vec![3; 16]));
+        }
+        plist::from_value(&Value::Dictionary(fields)).unwrap()
+    }
+
+    fn conversation() -> ConversationData {
+        ConversationData {
+            participants: vec!["mailto:peer@example.com".into(), "mailto:owner@example.com".into()],
+            cv_name: None, sender_guid: None, after_guid: None,
+        }
+    }
+
+    fn text() -> Message {
+        Message::Message(NormalMessage::new("synthetic text".into(), MessageType::IMessage))
+    }
+
+    #[test]
+    fn uncertified_receive_preserves_local_recipient_separately_from_reply_token() {
+        let received = incoming(Some("mailto:owner@example.com"), false)
+            .to_message(Some(conversation()), text()).unwrap();
+        assert_eq!(received.received_on_handle.as_deref(), Some("mailto:owner@example.com"));
+        assert!(received.certified_context.is_none());
+        assert_eq!(received.sender.as_deref(), Some("mailto:peer@example.com"));
+        assert!(matches!(received.target.as_deref(), Some([MessageTarget::Token(token)])
+            if token == &vec![2; 32]));
+        assert!(!received.verification_failed);
+    }
+
+    #[test]
+    fn certified_receive_keeps_both_existing_receipt_and_original_recipient() {
+        let received = incoming(Some("tel:+15550000001"), true)
+            .to_message(Some(conversation()), text()).unwrap();
+        assert_eq!(received.received_on_handle.as_deref(), Some("tel:+15550000001"));
+        let context = received.certified_context.as_ref().unwrap();
+        assert_eq!(context.target, "tel:+15550000001");
+        assert_eq!(context.receipt, vec![3; 16]);
+        assert_eq!(context.token, vec![2; 32]);
+        assert_eq!(received.clone().received_on_handle, received.received_on_handle);
+    }
+
+    #[test]
+    fn missing_recipient_never_borrows_an_alias_from_participants_or_sender() {
+        let received = incoming(None, true).to_message(Some(conversation()), text()).unwrap();
+        assert!(received.received_on_handle.is_none());
+        assert!(received.certified_context.is_none());
+        assert!(received.target.is_some());
+    }
+
+    #[test]
+    fn locally_composed_messages_have_no_receive_origin() {
+        let outgoing = MessageInst::new(conversation(), "mailto:owner@example.com", text());
+        assert!(outgoing.received_on_handle.is_none());
+        assert!(outgoing.certified_context.is_none());
+        assert!(outgoing.target.is_none());
+    }
 }
 
 #[cfg(test)]

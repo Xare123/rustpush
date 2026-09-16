@@ -2594,6 +2594,10 @@ pub struct MessageInst {
     pub send_delivered: bool,
     pub verification_failed: bool,
     pub certified_context: Option<CertifiedContext>,
+    /// Original local IDS destination (tP), kept independently of the optional
+    /// reply-device token in target. Receive metadata only, not send authority.
+    /// Locally composed messages leave this unset.
+    pub received_on_handle: Option<String>,
 }
 
 impl MessageInst {
@@ -2608,6 +2612,7 @@ impl MessageInst {
             target: None,
             verification_failed: false,
             certified_context: None,
+            received_on_handle: None,
         }
     }
 
@@ -2706,6 +2711,7 @@ impl MessageInst {
                     target: None,
                     verification_failed: false,
                     certified_context: None,
+                    received_on_handle: None,
                 };
                 return message.get_ids(my_handles, apns, schedule).await;
             }
