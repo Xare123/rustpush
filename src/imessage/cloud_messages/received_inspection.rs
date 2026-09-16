@@ -40,6 +40,51 @@ pub struct CloudMessageRecordInspection {
 }
 
 impl<P: AnisetteProvider> CloudMessagesClient<P> {
+    /// The same strict raw-wire lookup for an already selected writer binding.
+    /// Used only by received-origin create preflight/readback, never a mutation.
+    pub async fn lookup_received_message_record_for_writer(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        server_record_name: &str,
+    ) -> Result<super::CloudMessageRecordVersionLookup, PushError> {
+        use crate::cloudkit::{record_identifier, CloudKitFailureClass, CloudKitSession,
+            FetchRecordOperation, InspectReceivedRecordOperation, NO_ASSETS};
+        use cloudkit_proto::request_operation::header::IsolationLevel;
+        if server_record_name.is_empty() || server_record_name.len() > 4096 {
+            return Err(PushError::BadMsg);
+        }
+        let container = self.get_writer_container_for_binding(writer_binding).await?;
+        let zone = container.private_zone("messageManateeZone".into());
+        container.get_cached_zone_encryption_config_exact(&zone).await?;
+        let expected = record_identifier(zone, server_record_name);
+        let response = container.perform_operations_detailed(&CloudKitSession::new(),
+            &[InspectReceivedRecordOperation(FetchRecordOperation::new(&NO_ASSETS, expected.clone()))],
+            IsolationLevel::Operation).await;
+        let after = self.get_writer_container_for_binding(writer_binding).await?;
+        if !std::sync::Arc::ptr_eq(&container, &after) {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        let response = match response {
+            Ok(value) => value,
+            Err(failure) => return Ok(super::CloudMessageRecordVersionLookup::Unresolved {
+                failure_class: failure.failure_class, retry_after: failure.retry_after,
+            }),
+        };
+        if response.outcomes.len() != 1 {
+            return Ok(super::CloudMessageRecordVersionLookup::Unresolved {
+                failure_class: Some(CloudKitFailureClass::Unknown), retry_after: None,
+            });
+        }
+        let outcome = response.outcomes.into_iter().next().ok_or(PushError::BadMsg)?;
+        match outcome.result {
+            Ok(record) => super::validate_message_record_version(record, &expected),
+            Err(error) if super::is_cloudkit_record_not_found(&error) => Ok(super::CloudMessageRecordVersionLookup::NotFound),
+            Err(_) => Ok(super::CloudMessageRecordVersionLookup::Unresolved {
+                failure_class: outcome.failure_class, retry_after: outcome.retry_after,
+            }),
+        }
+    }
+
     /// Exact read-only lookup from the already-warmed restored-read container.
     /// No fallback to the general/write container and no asset downloads.
     pub async fn lookup_received_message_record(
@@ -580,6 +625,20 @@ mod tests {
             "ZoneSave",
         ] {
             assert!(!lookup.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn received_writer_readback_uses_strict_wire_and_pinned_container() {
+        let source = include_str!("received_inspection.rs");
+        let method = source.split("pub async fn lookup_received_message_record_for_writer(")
+            .nth(1).unwrap().split("pub async fn lookup_received_message_record(").next().unwrap();
+        assert!(method.contains("InspectReceivedRecordOperation("));
+        assert!(method.contains("get_cached_zone_encryption_config_exact"));
+        assert!(method.contains("Arc::ptr_eq(&container, &after)"));
+        assert_eq!(method.matches("get_writer_container_for_binding").count(), 2);
+        for forbidden in ["SaveRecordOperation", "DeleteRecordOperation", "refresh_now", "get_container()"] {
+            assert!(!method.contains(forbidden));
         }
     }
 }
