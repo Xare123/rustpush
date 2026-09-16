@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 
+use crate::ids::{IDSRecvMessage, MessageBody};
+
 const ROW_LIMIT: usize = 256;
 const REQUEST_LIMIT: usize = 12;
 static FMF_REQUESTS: AtomicUsize = AtomicUsize::new(0);
@@ -355,6 +357,154 @@ impl Drop for Observation {
     }
 }
 
+// ---- IDS 242 single-pass conservative observer ----
+// Value-free: fixed topic category, command, presence booleans and body
+// length bucket only. Never values, ids, names, keys, tokens or error
+// strings. Sync prefix only: never acks, persists, queries, sends, or
+// affects handle control flow. A `shaped` body means the wire had no `p`
+// and the already-decrypted result carries an intact encrypted envelope
+// with byte-form content. That is a conservative shape label, not proof
+// of fresh authenticated delivery. The caller computes `wire_had_plaintext`
+// cheaply from the wire APS payload before the existing decrypt. No `ids/`
+// file is edited here.
+const IDS242_COMMAND: u8 = 242;
+static IDS242_ENVELOPES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ids242Topic {
+    Fmf,
+    Fmd,
+    ItemSharing,
+}
+
+pub(super) fn ids242_topic(topic: &str) -> Option<Ids242Topic> {
+    match topic {
+        "com.apple.private.alloy.fmf" => Some(Ids242Topic::Fmf),
+        "com.apple.private.alloy.fmd" => Some(Ids242Topic::Fmd),
+        "com.apple.private.alloy.findmy.itemsharing-crossaccount" => Some(Ids242Topic::ItemSharing),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Ids242Presence {
+    uuid: bool,
+    sender: bool,
+    target: bool,
+    token: bool,
+    time: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LenBucket {
+    Empty,
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    XLarge,
+    Over,
+}
+
+fn len_bucket(len: usize) -> LenBucket {
+    match len {
+        0 => LenBucket::Empty,
+        1..=32 => LenBucket::Tiny,
+        33..=64 => LenBucket::Small,
+        65..=256 => LenBucket::Medium,
+        257..=1024 => LenBucket::Large,
+        1025..=65536 => LenBucket::XLarge,
+        _ => LenBucket::Over,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ids242Body {
+    Skipped,
+    Bytes(LenBucket),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ids242Record {
+    topic: Ids242Topic,
+    command: u8,
+    // Conservative shape label only; not proof of fresh authenticated delivery.
+    shaped: bool,
+    presence: Ids242Presence,
+    body: Ids242Body,
+}
+
+impl Ids242Record {
+    fn read(topic: Ids242Topic, msg: &IDSRecvMessage, wire_had_plaintext: bool) -> Self {
+        let presence = Ids242Presence {
+            uuid: msg.uuid.is_some(),
+            sender: msg.sender.is_some(),
+            target: msg.target.is_some(),
+            token: msg.token.is_some(),
+            time: msg.ns_since_epoch.is_some(),
+        };
+        // Conservative shape only, no shared IDS bit and no fresh-delivery
+        // claim: wire had no `p`, verification did not fail, the encrypted
+        // envelope fields are intact, and content is byte-form.
+        let shaped = !wire_had_plaintext
+            && !msg.verification_failed
+            && msg.sender.is_some()
+            && msg.message.is_some()
+            && msg.encryption.is_some()
+            && matches!(msg.message_unenc, Some(MessageBody::Bytes(_)));
+        let body = if !shaped {
+            Ids242Body::Skipped
+        } else {
+            match &msg.message_unenc {
+                Some(MessageBody::Bytes(bytes)) => Ids242Body::Bytes(len_bucket(bytes.len())),
+                // Unreachable when `shaped` holds (`shaped` requires byte-form
+                // content), kept as presence-only rather than a second predicate.
+                _ => Ids242Body::Skipped,
+            }
+        };
+        Self {
+            topic,
+            command: msg.command,
+            shaped,
+            presence,
+            body,
+        }
+    }
+}
+
+fn admit_observe_ids242(command: u8, topic: &str) -> Option<Ids242Topic> {
+    if command != IDS242_COMMAND {
+        return None;
+    }
+    ids242_topic(topic)
+}
+
+fn admit_ids242_envelope(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used < REQUEST_LIMIT).then_some(used + 1)
+        })
+        .is_ok()
+}
+
+pub(super) fn observe_ids242_single_pass(msg: Option<&IDSRecvMessage>, wire_had_plaintext: bool) {
+    if option_env!("OPENBUBBLES_FINDMY_VERBOSE_DIAGNOSTICS") != Some("true") {
+        return;
+    }
+    if !log::log_enabled!(target: "findmy_diagnostic", log::Level::Warn) {
+        return;
+    }
+    let Some(msg) = msg else { return };
+    let Some(topic) = admit_observe_ids242(msg.command, msg.topic) else {
+        return;
+    };
+    if !admit_ids242_envelope(&IDS242_ENVELOPES) {
+        return;
+    }
+    let record = Ids242Record::read(topic, msg, wire_had_plaintext);
+    log::warn!(target: "findmy_diagnostic", "Find My IDS 242 conservative envelope {record:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +722,137 @@ mod tests {
             Outcome::TypedDecodeFailed
         ));
         assert!(format!("Find My diagnostic {:?}", observation.as_ref().unwrap()).len() < 1024);
+    }
+}
+
+#[cfg(test)]
+mod ids242_envelope_tests {
+    use super::*;
+    use crate::ids::MessageBody;
+
+    const SECRET: &str = "SECRET-marker";
+
+    fn envelope(body: Option<MessageBody>, wire_p: bool) -> (Ids242Record, bool) {
+        let msg = IDSRecvMessage {
+            command: 242,
+            ns_since_epoch: None,
+            uuid: None,
+            sender: Some("synthetic-sender".to_string()),
+            token: None,
+            target: Some("synthetic-target".to_string()),
+            no_reply: None,
+            is_typing: None,
+            send_delivered: None,
+            message_unenc: body,
+            message: Some(vec![9u8; 16]),
+            encryption: Some("synthetic-encryption".to_string()),
+            status: None,
+            error_for: None,
+            error_string: None,
+            error_status: None,
+            error_for_str: None,
+            certified_delivery_version: None,
+            certified_delivery_receipt: None,
+            verification_failed: false,
+            topic: "com.apple.private.alloy.fmf",
+        };
+        let record = Ids242Record::read(Ids242Topic::Fmf, &msg, wire_p);
+        let leaked = format!("{record:?}").contains(SECRET);
+        (record, leaked)
+    }
+
+    fn bplist_bytes(value: &plist::Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, value).unwrap();
+        buf
+    }
+
+    #[test]
+    fn wire_plaintext_is_presence_only() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            format!("{}-key", SECRET),
+            plist::Value::String(format!("{}-value", SECRET)),
+        );
+        let (record, leaked) = envelope(
+            Some(MessageBody::Plist(plist::Value::Dictionary(dict))),
+            true,
+        );
+        assert!(!record.shaped);
+        assert!(matches!(record.body, Ids242Body::Skipped));
+        assert!(record.presence.sender);
+        assert!(!leaked);
+    }
+
+    #[test]
+    fn shaped_bytes_report_length_bucket_only() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("T".to_string(), plist::to_value(&10).unwrap());
+        let bytes = bplist_bytes(&plist::Value::Dictionary(dict));
+        let (record, leaked) = envelope(Some(MessageBody::Bytes(bytes)), false);
+        assert!(record.shaped);
+        assert!(matches!(record.body, Ids242Body::Bytes(_)));
+        assert!(!leaked);
+        assert!(format!("{record:?}").len() < 1024);
+    }
+
+    #[test]
+    fn missing_envelope_stays_unshaped() {
+        let msg = IDSRecvMessage {
+            command: 242,
+            ns_since_epoch: None,
+            uuid: None,
+            sender: None,
+            token: None,
+            target: None,
+            no_reply: None,
+            is_typing: None,
+            send_delivered: None,
+            message_unenc: None,
+            message: None,
+            encryption: None,
+            status: None,
+            error_for: None,
+            error_string: None,
+            error_status: None,
+            error_for_str: None,
+            certified_delivery_version: None,
+            certified_delivery_receipt: None,
+            verification_failed: true,
+            topic: "com.apple.private.alloy.fmf",
+        };
+        let record = Ids242Record::read(Ids242Topic::Fmf, &msg, false);
+        assert!(!record.shaped);
+        assert!(matches!(record.body, Ids242Body::Skipped));
+    }
+
+    #[test]
+    fn command_and_topic_gate() {
+        assert!(admit_observe_ids242(100, "com.apple.private.alloy.fmf").is_none());
+        assert!(admit_observe_ids242(242, "com.apple.private.alloy.unknown").is_none());
+        assert_eq!(
+            admit_observe_ids242(242, "com.apple.private.alloy.fmd"),
+            Some(Ids242Topic::Fmd)
+        );
+    }
+
+    #[test]
+    fn budget_caps_records() {
+        let budget = AtomicUsize::new(0);
+        for _ in 0..REQUEST_LIMIT {
+            assert!(admit_ids242_envelope(&budget));
+        }
+        assert!(!admit_ids242_envelope(&budget));
+    }
+
+    #[test]
+    fn length_buckets_cover_boundaries() {
+        assert_eq!(len_bucket(0), LenBucket::Empty);
+        assert_eq!(len_bucket(32), LenBucket::Tiny);
+        assert_eq!(len_bucket(64), LenBucket::Small);
+        assert_eq!(len_bucket(256), LenBucket::Medium);
+        assert_eq!(len_bucket(1024), LenBucket::Large);
+        assert_eq!(len_bucket(65536), LenBucket::XLarge);
+        assert_eq!(len_bucket(65537), LenBucket::Over);
     }
 }

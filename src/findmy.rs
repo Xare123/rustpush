@@ -2283,16 +2283,10 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         &self,
         msg: APSMessage,
     ) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
-        if let Some(IDSRecvMessage {
-            message_unenc: Some(message),
-            topic,
-            token: Some(token),
-            target: Some(target),
-            sender: Some(sender),
-            uuid: Some(uuid),
-            ns_since_epoch: Some(ns_since_epoch),
-            ..
-        }) = self
+        // Cheap wire marker before the existing decrypt: a preexisting `p`
+        // must never be described as decrypted below.
+        let wire_had_plaintext = findmy_242_wire_had_plaintext(&msg);
+        let incoming = self
             .identity
             .receive_message(
                 msg,
@@ -2302,7 +2296,20 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     "com.apple.private.alloy.findmy.itemsharing-crossaccount",
                 ],
             )
-            .await?
+            .await?;
+        // Single-pass, default-off, value-free prefix on the already-decrypted
+        // result. Sync only, no early return, normal handle flow unchanged.
+        diagnostics::observe_ids242_single_pass(incoming.as_ref(), wire_had_plaintext);
+        if let Some(IDSRecvMessage {
+            message_unenc: Some(message),
+            topic,
+            token: Some(token),
+            target: Some(target),
+            sender: Some(sender),
+            uuid: Some(uuid),
+            ns_since_epoch: Some(ns_since_epoch),
+            ..
+        }) = incoming
         {
             let do_app_ack = || async {
                 let targets = self.identity.cache.lock().await.get_targets(
@@ -2422,6 +2429,47 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             }
         }
         Ok(vec![])
+    }
+}
+
+/// Cheap wire marker: true when the inbound APS payload already carries `p`.
+/// Sync only, no network or cache access. A preexisting `p` must never be
+/// described as decrypted content by the single-pass prefix below.
+fn findmy_242_wire_had_plaintext(msg: &APSMessage) -> bool {
+    match msg {
+        APSMessage::Notification { payload, .. } => match payload {
+            Value::Dictionary(dict) => dict.contains_key("p"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod findmy_wire_tests {
+    use super::*;
+
+    #[test]
+    fn wire_probe_sees_p_key_only() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("p".to_string(), plist::Value::String("wire".to_string()));
+        let with_p = APSMessage::Notification {
+            id: 1,
+            topic: [0u8; 20],
+            token: None,
+            payload: Value::Dictionary(dict),
+            channel: None,
+        };
+        assert!(findmy_242_wire_had_plaintext(&with_p));
+        let empty = APSMessage::Notification {
+            id: 1,
+            topic: [0u8; 20],
+            token: None,
+            payload: Value::Dictionary(plist::Dictionary::new()),
+            channel: None,
+        };
+        assert!(!findmy_242_wire_had_plaintext(&empty));
+        assert!(!findmy_242_wire_had_plaintext(&APSMessage::Ping));
     }
 }
 
