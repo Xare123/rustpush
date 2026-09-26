@@ -1451,12 +1451,23 @@ pub struct MMCSFile {
 // counter. This bounds writes too, before surplus plaintext reaches the file.
 struct MMCSExactLengthWriter<T> {
     inner: T,
+    advertised: usize,
     remaining: usize,
+    mismatch_reported: bool,
 }
 
 impl<T: Write> Write for MMCSExactLengthWriter<T> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.remaining {
+            if !self.mismatch_reported {
+                let (advertised, prior_written, rejected_write) =
+                    self.mismatch_diagnostics(bytes.len());
+                self.mismatch_reported = true;
+                warn!(
+                    "MMCS plaintext length mismatch advertised_bytes={} prior_written_bytes={} rejected_write_bytes={}",
+                    advertised, prior_written, rejected_write
+                );
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "MMCS size mismatch",
@@ -1475,6 +1486,16 @@ impl<T: Write> Write for MMCSExactLengthWriter<T> {
 }
 
 impl<T> MMCSExactLengthWriter<T> {
+    fn mismatch_diagnostics(&self, rejected_write: usize) -> (usize, usize, usize) {
+        (
+            self.advertised,
+            self.advertised
+                .checked_sub(self.remaining)
+                .unwrap_or_default(),
+            rejected_write,
+        )
+    }
+
     fn verify_complete(&self) -> Result<(), PushError> {
         if self.remaining != 0 {
             return Err(PushError::VerificationFailed);
@@ -1668,7 +1689,9 @@ impl MMCSFile {
 
         let mut exact_writer = MMCSExactLengthWriter {
             inner: writer,
+            advertised: self.size,
             remaining: self.size,
+            mismatch_reported: false,
         };
         let recieve_container = IMessageContainer::new(&self.key, &mut exact_writer, true);
 
@@ -1804,16 +1827,22 @@ mod mmcs_exact_length_tests {
     fn exact_length_rejects_missing_and_extra_bytes() {
         let mut writer = MMCSExactLengthWriter {
             inner: Vec::new(),
+            advertised: 3,
             remaining: 3,
+            mismatch_reported: false,
         };
         assert!(writer.verify_complete().is_err());
         writer.write_all(b"ab").unwrap();
         assert!(writer.verify_complete().is_err());
+        assert_eq!(writer.mismatch_diagnostics(2), (3, 2, 2));
+        assert!(!writer.mismatch_reported);
         assert!(writer.write_all(b"cd").is_err());
+        assert!(writer.mismatch_reported);
         assert_eq!(writer.inner, b"ab");
         writer.write_all(b"c").unwrap();
         writer.verify_complete().unwrap();
         assert!(writer.write_all(b"d").is_err());
+        assert!(writer.mismatch_reported);
         assert_eq!(writer.inner, b"abc");
     }
 
@@ -1821,11 +1850,29 @@ mod mmcs_exact_length_tests {
     fn exact_length_accounts_for_short_sink_writes() {
         let mut writer = MMCSExactLengthWriter {
             inner: ShortWriter(Vec::new()),
+            advertised: 3,
             remaining: 3,
+            mismatch_reported: false,
         };
         writer.write_all(b"abc").unwrap();
         writer.verify_complete().unwrap();
         assert_eq!(writer.inner.0, b"abc");
+    }
+
+    #[test]
+    fn one_mib_mismatch_reports_lengths_without_writing_surplus() {
+        const MIB: usize = 1024 * 1024;
+        let mut writer = MMCSExactLengthWriter {
+            inner: Vec::new(),
+            advertised: MIB,
+            remaining: MIB,
+            mismatch_reported: false,
+        };
+        let synthetic_body = vec![0u8; MIB + 384 * 1024];
+        assert!(writer.write_all(&synthetic_body).is_err());
+        assert!(writer.mismatch_reported);
+        assert_eq!(writer.inner.len(), 0);
+        assert_eq!(writer.remaining, MIB);
     }
 
     #[tokio::test]
@@ -1837,7 +1884,9 @@ mod mmcs_exact_length_tests {
                 .unwrap();
         let mut writer = MMCSExactLengthWriter {
             inner: ShortWriter(Vec::new()),
+            advertised: plaintext.len(),
             remaining: plaintext.len(),
+            mismatch_reported: false,
         };
         let mut container = IMessageContainer::new(&key, &mut writer, true);
         WriteContainer::write(&mut container, &encrypted)

@@ -736,6 +736,44 @@ fn response_chunk<'a>(
         .ok_or(PushError::VerificationFailed)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SelectedReferenceDiagnostics {
+    selected_count: usize,
+    unique_count: usize,
+    repeated_count: usize,
+    wire_extent: Option<u64>,
+    ford_present: bool,
+}
+
+/// Content-free observation only. Repeated references can represent legitimate
+/// deduplicated content, and wire extent is not a plaintext-length claim
+/// (especially for Ford). This result must never participate in admission.
+fn selected_reference_diagnostics(
+    selected: &authorize_get_response::f1::ChunkReferences,
+    containers: &[ProtoContainer],
+) -> SelectedReferenceDiagnostics {
+    let selected_count = selected.chunk_references.len();
+    let mut unique = HashSet::new();
+    let mut wire_extent = Some(0u64);
+    for reference in &selected.chunk_references {
+        unique.insert((reference.container_index, reference.chunk_index));
+        wire_extent = wire_extent.and_then(|total| {
+            response_chunk(containers, reference.container_index, reference.chunk_index)
+                .ok()
+                .and_then(|chunk| chunk.meta.as_ref())
+                .and_then(|meta| total.checked_add(meta.size))
+        });
+    }
+    let unique_count = unique.len();
+    SelectedReferenceDiagnostics {
+        selected_count,
+        unique_count,
+        repeated_count: selected_count.checked_sub(unique_count).unwrap_or_default(),
+        wire_extent,
+        ford_present: selected.ford_reference.is_some(),
+    }
+}
+
 fn validate_preauthorized_container_segment(
     offset: u64,
     size: u64,
@@ -3124,6 +3162,17 @@ async fn get_mmcs_with_network_policy(
         if target_chunks.is_empty() {
             return Err(PushError::VerificationFailed);
         }
+        if log::log_enabled!(log::Level::Debug) {
+            let diagnostics = selected_reference_diagnostics(wanted_chunks, containers);
+            debug!(
+                "MMCS selected target shape selected_references={} unique_references={} repeated_references={} wire_extent_bytes={:?} ford_present={}",
+                diagnostics.selected_count,
+                diagnostics.unique_count,
+                diagnostics.repeated_count,
+                diagnostics.wire_extent,
+                diagnostics.ford_present
+            );
+        }
         if wanted_chunks.ford_reference.is_some() {
             let ford_key = files
                 .get(file_index)
@@ -4168,6 +4217,48 @@ mod download_only_tests {
         assert_verification_failed(validate_preauthorized_download_response(
             &response, &requested,
         ));
+    }
+
+    #[test]
+    fn selected_reference_diagnostics_are_neutral_content_free_and_overflow_safe() {
+        let (response, _) = valid_download_response();
+        let mut selected = response.references[0].clone();
+        // Repeated references are observed, not classified: they can be a
+        // legitimate representation of deduplicated file content.
+        selected
+            .chunk_references
+            .push(selected.chunk_references[0].clone());
+        let chunk_size = response.containers[0].chunks[0].meta.as_ref().unwrap().size;
+        assert_eq!(
+            selected_reference_diagnostics(&selected, &response.containers),
+            SelectedReferenceDiagnostics {
+                selected_count: 2,
+                unique_count: 1,
+                repeated_count: 1,
+                wire_extent: chunk_size.checked_mul(2),
+                ford_present: false,
+            }
+        );
+
+        selected.ford_reference = Some(chunk_reference(0, 0));
+        assert!(selected_reference_diagnostics(&selected, &response.containers).ford_present);
+
+        let mut overflowing = response.clone();
+        overflowing.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .size = u64::MAX;
+        assert_eq!(
+            selected_reference_diagnostics(&selected, &overflowing.containers).wire_extent,
+            None
+        );
+
+        selected.chunk_references[1] = chunk_reference(99, 99);
+        assert_eq!(
+            selected_reference_diagnostics(&selected, &response.containers).wire_extent,
+            None
+        );
     }
 
     #[test]
