@@ -865,7 +865,7 @@ fn legacy_attachment_recovery_plan_from_response(
         .iter()
         .enumerate()
         .filter(|(_, reference)| {
-            reference.file_checksum.as_slice() == requested_signature.as_slice()
+            reference.file_checksum.as_slice() == requested_signature
         })
         .collect::<Vec<_>>();
     let (reference_index, selected) = candidates
