@@ -75,6 +75,7 @@ pub struct MMCSConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MMCSGetNetworkPolicy {
     Standard,
+    StandardBoundedLegacyRecovery,
     PreauthorizedDownloadOnly,
 }
 
@@ -94,14 +95,23 @@ const MAX_PREAUTHORIZED_DOWNLOAD_PATH_BYTES: usize = 16 * 1024;
 const MAX_PREAUTHORIZED_DOWNLOAD_HEADER_NAME_BYTES: usize = 256;
 const MAX_PREAUTHORIZED_DOWNLOAD_HEADER_VALUE_BYTES: usize = 16 * 1024;
 const MMCS_BOUNDED_SKIP_BYTES: usize = 64 * 1024;
+const MAX_IDS_LEGACY_RECOVERY_BYTES: usize = 512 * 1024 * 1024;
 
 impl MMCSGetNetworkPolicy {
     fn sends_completion(self) -> bool {
-        self == Self::Standard
+        self != Self::PreauthorizedDownloadOnly
     }
 
     fn collects_completion_receipts(self) -> bool {
-        self == Self::Standard
+        self != Self::PreauthorizedDownloadOnly
+    }
+
+    fn filters_source_chunks(self) -> bool {
+        self != Self::Standard
+    }
+
+    fn bounds_response_bytes(self) -> bool {
+        self != Self::Standard
     }
 }
 
@@ -637,10 +647,7 @@ fn validate_preauthorized_authorization_body(body: &[u8]) -> Result<(), PushErro
     )
 }
 
-fn record_preauthorized_response_bytes(
-    counter: &AtomicU64,
-    byte_count: usize,
-) -> Result<(), PushError> {
+fn record_bounded_response_bytes(counter: &AtomicU64, byte_count: usize) -> Result<(), PushError> {
     let byte_count = u64::try_from(byte_count).map_err(|_| PushError::VerificationFailed)?;
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -691,7 +698,7 @@ fn select_source_chunks(
     network_policy: MMCSGetNetworkPolicy,
     required_chunk_ids: &HashSet<[u8; 21]>,
 ) -> Vec<ChunkDesc> {
-    if network_policy == MMCSGetNetworkPolicy::Standard {
+    if !network_policy.filters_source_chunks() {
         return chunks;
     }
     chunks
@@ -734,6 +741,178 @@ fn response_chunk<'a>(
         .get(container_index as usize)
         .and_then(|container| container.chunks.get(chunk_index as usize))
         .ok_or(PushError::VerificationFailed)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LegacyAttachmentRecoveryPlan {
+    requested_signature: [u8; 21],
+    advertised_size: usize,
+    expected_size: usize,
+    reference_index: usize,
+}
+
+impl LegacyAttachmentRecoveryPlan {
+    pub(crate) fn expected_size(&self) -> usize {
+        self.expected_size
+    }
+}
+
+fn legacy_reference_extent(
+    reference: &authorize_get_response::f1::ChunkReferences,
+    containers: &[ProtoContainer],
+) -> Result<usize, PushError> {
+    if reference.chunk_references.is_empty() {
+        return Err(PushError::VerificationFailed);
+    }
+    reference
+        .chunk_references
+        .iter()
+        .try_fold(0usize, |total, chunk_reference| {
+            let chunk = response_chunk(
+                containers,
+                chunk_reference.container_index,
+                chunk_reference.chunk_index,
+            )?;
+            let meta = chunk.meta.as_ref().ok_or(PushError::VerificationFailed)?;
+            let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+            total.checked_add(size).ok_or(PushError::VerificationFailed)
+        })
+}
+
+fn validate_legacy_recovery_bounds(
+    authorization_len: usize,
+    response: &authorize_get_response::F1,
+    selected: &authorize_get_response::f1::ChunkReferences,
+    expected_size: usize,
+) -> Result<(), PushError> {
+    if authorization_len > MAX_PREAUTHORIZED_DOWNLOAD_AUTHORIZATION_BYTES
+        || response.containers.is_empty()
+        || response.containers.len() > MAX_PREAUTHORIZED_DOWNLOAD_CONTAINERS
+        || response.references.is_empty()
+        || response.references.len() > MAX_PREAUTHORIZED_DOWNLOAD_REFERENCES
+        || response.references.iter().any(|reference| {
+            reference.chunk_references.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES
+        })
+        || selected.chunk_references.is_empty()
+        || selected.chunk_references.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_REFERENCES
+        || expected_size > MAX_IDS_LEGACY_RECOVERY_BYTES
+    {
+        return Err(PushError::VerificationFailed);
+    }
+
+    let total_chunks = response
+        .containers
+        .iter()
+        .try_fold(0usize, |total, container| {
+            if container.chunks.is_empty()
+                || container.chunks.len() > MAX_PREAUTHORIZED_DOWNLOAD_CHUNKS_PER_CONTAINER
+            {
+                return Err(PushError::VerificationFailed);
+            }
+            total
+                .checked_add(container.chunks.len())
+                .filter(|count| *count <= MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNKS)
+                .ok_or(PushError::VerificationFailed)
+        })?;
+    if total_chunks == 0 {
+        return Err(PushError::VerificationFailed);
+    }
+    response
+        .references
+        .iter()
+        .try_fold(0usize, |total, reference| {
+            total
+                .checked_add(reference.chunk_references.len())
+                .and_then(|count| {
+                    count.checked_add(usize::from(reference.ford_reference.is_some()))
+                })
+                .filter(|count| *count <= MAX_PREAUTHORIZED_DOWNLOAD_TOTAL_CHUNK_REFERENCES)
+                .ok_or(PushError::VerificationFailed)
+        })?;
+
+    for chunk_reference in &selected.chunk_references {
+        let chunk = response_chunk(
+            &response.containers,
+            chunk_reference.container_index,
+            chunk_reference.chunk_index,
+        )?;
+        let meta = chunk.meta.as_ref().ok_or(PushError::VerificationFailed)?;
+        fixed_bytes::<21>(&meta.checksum)?;
+        if meta.size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES {
+            return Err(PushError::VerificationFailed);
+        }
+        let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+        let offset = usize::try_from(meta.offset).map_err(|_| PushError::VerificationFailed)?;
+        offset
+            .checked_add(size)
+            .filter(|end| *end <= MAX_IDS_LEGACY_RECOVERY_BYTES)
+            .ok_or(PushError::VerificationFailed)?;
+        if let Some(key) = &meta.encryption_key {
+            fixed_bytes::<17>(key)?;
+        }
+    }
+    Ok(())
+}
+
+fn legacy_attachment_recovery_plan_from_response(
+    authorization_len: usize,
+    response: &authorize_get_response::F1,
+    requested_signature: &[u8],
+    advertised_size: usize,
+) -> Result<Option<LegacyAttachmentRecoveryPlan>, PushError> {
+    let candidates = response
+        .references
+        .iter()
+        .enumerate()
+        .filter(|(_, reference)| {
+            reference.file_checksum.as_slice() == requested_signature.as_slice()
+        })
+        .collect::<Vec<_>>();
+    let (reference_index, selected) = candidates
+        .first()
+        .copied()
+        .ok_or(PushError::VerificationFailed)?;
+    let expected_size = legacy_reference_extent(selected, &response.containers)?;
+
+    // Matching sizes retain the established standard transfer composition.
+    // Recovery-only signature rules and caps apply only to a mismatch.
+    if expected_size == advertised_size {
+        return Ok(None);
+    }
+    let requested_signature = fixed_bytes::<21>(requested_signature)?;
+    if requested_signature[0] != 0x81 || candidates.len() != 1 || selected.ford_reference.is_some() {
+        return Err(PushError::VerificationFailed);
+    }
+    validate_legacy_recovery_bounds(authorization_len, response, selected, expected_size)?;
+
+    Ok(Some(LegacyAttachmentRecoveryPlan {
+        requested_signature,
+        advertised_size,
+        expected_size,
+        reference_index,
+    }))
+}
+
+pub(crate) fn legacy_attachment_recovery_plan(
+    authorization_body: &[u8],
+    requested_signature: &[u8],
+    advertised_size: usize,
+) -> Result<Option<LegacyAttachmentRecoveryPlan>, PushError> {
+    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(authorization_body))?;
+    let Some(response_data) = response.f1.as_ref() else {
+        let reason = response
+            .error
+            .as_ref()
+            .and_then(|error| error.f2.as_ref())
+            .map(|error| error.reason.clone());
+        return Err(PushError::MMCSGetFailed(reason));
+    };
+    legacy_attachment_recovery_plan_from_response(
+        authorization_body.len(),
+        response_data,
+        requested_signature,
+        advertised_size,
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2500,6 +2679,7 @@ struct ChunkedContainer<T: Container> {
     // only used when writing
     cached_chunks: HashMap<[u8; 21], Vec<u8>>,
     container: T,
+    replay_repeated_chunks: bool,
 }
 
 impl<T: Container + Send + Sync> ChunkedContainer<T> {
@@ -2510,6 +2690,14 @@ impl<T: Container + Send + Sync> ChunkedContainer<T> {
             current_offset: 0,
             cached_chunks: HashMap::new(),
             container,
+            replay_repeated_chunks: false,
+        }
+    }
+
+    fn new_replaying_repeated_chunks(chunks: Vec<ChunkDesc>, container: T) -> Self {
+        Self {
+            replay_repeated_chunks: true,
+            ..Self::new(chunks, container)
         }
     }
 
@@ -2572,6 +2760,24 @@ impl<T: WriteContainer + Send + Sync> ChunkedContainer<T> {
             .ok_or(PushError::VerificationFailed)?;
 
         let chunk_value = reading_chunk.encrypt(chunk_value)?;
+
+        if self.replay_repeated_chunks {
+            self.cached_chunks.insert(chunk_id, chunk_value);
+            while let Some(wanted) = self.wanted_chunk() {
+                let Some(cached) = self.cached_chunks.remove(&wanted) else {
+                    break;
+                };
+                self.container.write(&cached).await?;
+                self.current_chunk += 1;
+                if self.chunks[self.current_chunk..]
+                    .iter()
+                    .any(|candidate| candidate.id == wanted)
+                {
+                    self.cached_chunks.insert(wanted, cached);
+                }
+            }
+            return Ok(());
+        }
 
         // are we current chunk?
         if Some(chunk_id) == self.wanted_chunk() {
@@ -2671,6 +2877,13 @@ where
                     }
                 }
                 for target in &mut self.targets {
+                    // Recovery can satisfy repeated manifest occurrences from
+                    // one authenticated physical chunk. Later sibling copies
+                    // of that ID must not write or finalize the completed
+                    // recovery target again. Other target behavior is unchanged.
+                    if target.replay_repeated_chunks && target.complete() {
+                        continue;
+                    }
                     if !target.chunks.iter().any(|c| c.id == chunk.0) {
                         continue;
                     }
@@ -2757,9 +2970,7 @@ impl MMCSGetContainer {
         network_policy: MMCSGetNetworkPolicy,
         response_byte_counter: Option<Arc<AtomicU64>>,
     ) -> Result<MMCSGetContainer, PushError> {
-        if (network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly)
-            != response_byte_counter.is_some()
-        {
+        if network_policy.bounds_response_bytes() != response_byte_counter.is_some() {
             return Err(PushError::VerificationFailed);
         }
         if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
@@ -2794,6 +3005,20 @@ impl MMCSGetContainer {
                 continue;
             };
             let id = fixed_bytes::<21>(&meta.checksum)?;
+            if network_policy.filters_source_chunks() && !required_chunk_ids.contains(&id) {
+                continue;
+            }
+            if network_policy == MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery {
+                if meta.size > MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES
+                    || meta
+                        .offset
+                        .checked_add(meta.size)
+                        .filter(|end| *end <= MAX_IDS_LEGACY_RECOVERY_BYTES as u64)
+                        .is_none()
+                {
+                    return Err(PushError::VerificationFailed);
+                }
+            }
             let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
             let offset = usize::try_from(meta.offset).map_err(|_| PushError::VerificationFailed)?;
             let key = if let Some((key, len)) = keys.get(&meta.checksum) {
@@ -2874,7 +3099,7 @@ impl MMCSGetContainer {
                     response.status().as_u16()
                 ))));
             }
-            if self.network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly
+            if self.network_policy.bounds_response_bytes()
                 && response
                     .content_length()
                     .is_some_and(|length| length > MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES)
@@ -2913,7 +3138,7 @@ impl ReadContainer for MMCSGetContainer {
                 return Ok(self.cacher.read_all());
             };
             if let Some(counter) = &self.response_byte_counter {
-                record_preauthorized_response_bytes(counter, bytes.len())?;
+                record_bounded_response_bytes(counter, bytes.len())?;
             }
             self.cacher.data_avail(&bytes);
             received = self.cacher.read_exact(len);
@@ -2987,6 +3212,7 @@ async fn get_mmcs_with_network_policy(
     progress: impl FnMut(usize, usize) + Send + Sync,
     _ford: bool,
     network_policy: MMCSGetNetworkPolicy,
+    legacy_recovery: Option<&LegacyAttachmentRecoveryPlan>,
     asset_evidence: &[PreauthorizedAssetEvidence],
     mut on_ford_lengths: impl FnMut(&[Option<VerifiedPlaintextLength>]) -> Result<(), PushError>
         + Send
@@ -3010,14 +3236,15 @@ async fn get_mmcs_with_network_policy(
     if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
         validate_preauthorized_authorization_body(&body)?;
     }
-    let response_byte_counter = (network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly)
+    let response_byte_counter = network_policy
+        .bounds_response_bytes()
         .then(|| Arc::new(AtomicU64::new(0)));
 
     debug!(
         "Received MMCS authorize-get response (bytes={})",
         body.len()
     );
-    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body))?;
+    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body.as_slice()))?;
 
     let Some(response_data) = response.f1.as_ref() else {
         let reason = response
@@ -3033,7 +3260,26 @@ async fn get_mmcs_with_network_policy(
         response_data.references.len()
     );
 
-    let mut selected_references = None;
+    let mut selected_references = if let Some(plan) = legacy_recovery {
+        if network_policy != MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery
+            || files.len() != 1
+            || files[0].0.as_slice() != plan.requested_signature.as_slice()
+        {
+            return Err(PushError::VerificationFailed);
+        }
+        let validated = legacy_attachment_recovery_plan_from_response(
+            body.len(),
+            response_data,
+            &files[0].0,
+            plan.advertised_size,
+        )?;
+        if validated.as_ref() != Some(plan) {
+            return Err(PushError::VerificationFailed);
+        }
+        Some(vec![plan.reference_index])
+    } else {
+        None
+    };
     if network_policy == MMCSGetNetworkPolicy::PreauthorizedDownloadOnly {
         let requested_files = files
             .iter()
@@ -3111,17 +3357,23 @@ async fn get_mmcs_with_network_policy(
         );
     }
 
-    let mut total_bytes = 0usize;
-    for container in &response_data.containers {
-        for chunk in &container.chunks {
-            if let Some(meta) = &chunk.meta {
-                let size = usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
-                total_bytes = total_bytes
-                    .checked_add(size)
-                    .ok_or(PushError::VerificationFailed)?;
+    let total_bytes = if let Some(plan) = legacy_recovery {
+        plan.expected_size
+    } else {
+        let mut total = 0usize;
+        for container in &response_data.containers {
+            for chunk in &container.chunks {
+                if let Some(meta) = &chunk.meta {
+                    let size =
+                        usize::try_from(meta.size).map_err(|_| PushError::VerificationFailed)?;
+                    total = total
+                        .checked_add(size)
+                        .ok_or(PushError::VerificationFailed)?;
+                }
             }
         }
-    }
+        total
+    };
 
     let mut ford_containers = vec![];
     let containers = &response_data.containers;
@@ -3186,7 +3438,11 @@ async fn get_mmcs_with_network_policy(
             .2
             .take()
             .ok_or(PushError::VerificationFailed)?;
-        targets.push(ChunkedContainer::new(target_chunks, writer));
+        targets.push(if legacy_recovery.is_some() {
+            ChunkedContainer::new_replaying_repeated_chunks(target_chunks, writer)
+        } else {
+            ChunkedContainer::new(target_chunks, writer)
+        });
     }
     debug!(
         "Prepared MMCS download targets (targets={}, ford_containers={})",
@@ -3417,6 +3673,33 @@ pub async fn get_mmcs(
         progress,
         ford,
         MMCSGetNetworkPolicy::Standard,
+        None,
+        &[],
+        |_| Ok(()),
+    )
+    .await
+}
+
+pub(crate) async fn get_mmcs_legacy_attachment(
+    config: &MMCSConfig,
+    authorized: AuthorizedOperation,
+    files: Vec<(
+        Vec<u8>,
+        &str,
+        impl WriteContainer + Send + Sync,
+        Option<Vec<u8>>,
+    )>,
+    progress: impl FnMut(usize, usize) + Send + Sync,
+    recovery: &LegacyAttachmentRecoveryPlan,
+) -> Result<(), PushError> {
+    get_mmcs_with_network_policy(
+        config,
+        authorized,
+        files,
+        progress,
+        false,
+        MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+        Some(recovery),
         &[],
         |_| Ok(()),
     )
@@ -3495,6 +3778,7 @@ pub async fn get_mmcs_pre_authorized_download_only_with_verified_sizes(
         progress,
         false,
         MMCSGetNetworkPolicy::PreauthorizedDownloadOnly,
+        None,
         asset_evidence,
         &mut on_ford_lengths,
     )
@@ -4261,6 +4545,209 @@ mod download_only_tests {
         );
     }
 
+    fn legacy_authorization_body(response: authorize_get_response::F1) -> Vec<u8> {
+        crate::mmcsp::AuthorizeGetResponse {
+            f1: Some(response),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn legacy_recovery_response(signature: &[u8], chunk_size: u64) -> authorize_get_response::F1 {
+        let (mut response, _) = valid_download_response();
+        response.references[0].file_checksum = signature.to_vec();
+        response.containers[0].chunks[0].meta.as_mut().unwrap().size = chunk_size;
+        response
+    }
+
+    #[test]
+    fn legacy_recovery_uses_unique_non_ford_manifest_extent_only_on_mismatch() {
+        const ADVERTISED: usize = 1024 * 1024;
+        const ACTUAL: usize = 1_748_288;
+        let signature = [0x81; 21];
+        let response = legacy_recovery_response(&signature, ACTUAL as u64);
+        let body = legacy_authorization_body(response.clone());
+        let plan = legacy_attachment_recovery_plan(&body, &signature, ADVERTISED)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.expected_size(), ACTUAL);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body,
+            &[0x81; 20],
+            ADVERTISED,
+        ));
+        let mut wrong_prefix = signature;
+        wrong_prefix[0] = 0x04;
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body,
+            &wrong_prefix,
+            ADVERTISED,
+        ));
+        let matching_wrong_prefix = legacy_recovery_response(&wrong_prefix, ADVERTISED as u64);
+        let body = legacy_authorization_body(matching_wrong_prefix);
+        assert!(
+            legacy_attachment_recovery_plan(&body, &wrong_prefix, ADVERTISED)
+                .unwrap()
+                .is_none()
+        );
+        let short_signature = [0x04; 20];
+        let matching_short_signature =
+            legacy_recovery_response(&short_signature, ADVERTISED as u64);
+        let body = legacy_authorization_body(matching_short_signature);
+        assert!(
+            legacy_attachment_recovery_plan(&body, &short_signature, ADVERTISED)
+                .unwrap()
+                .is_none()
+        );
+
+        // Matching-size standard downloads do not enter recovery or inherit
+        // its 512 MiB cap, even when the existing path handles a larger file.
+        let matching_large = MAX_IDS_LEGACY_RECOVERY_BYTES + 1;
+        let response = legacy_recovery_response(&signature, matching_large as u64);
+        let body = legacy_authorization_body(response);
+        assert!(
+            legacy_attachment_recovery_plan(&body, &signature, matching_large)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut ambiguous = legacy_recovery_response(&signature, ACTUAL as u64);
+        ambiguous.references.push(ambiguous.references[0].clone());
+        let body = legacy_authorization_body(ambiguous);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body, &signature, ADVERTISED,
+        ));
+
+        let mut ford = legacy_recovery_response(&signature, ACTUAL as u64);
+        ford.references[0].ford_reference = Some(chunk_reference(0, 0));
+        let body = legacy_authorization_body(ford);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body, &signature, ADVERTISED,
+        ));
+    }
+
+    #[test]
+    fn legacy_recovery_counts_repeated_references_and_rejects_overflow_and_caps() {
+        const ADVERTISED: usize = 1024 * 1024;
+        const ACTUAL: usize = 1_748_288;
+        let signature = [0x81; 21];
+        let mut repeated = legacy_recovery_response(&signature, (ACTUAL / 2) as u64);
+        let repeated_reference = repeated.references[0].chunk_references[0].clone();
+        repeated.references[0]
+            .chunk_references
+            .push(repeated_reference);
+        let body = legacy_authorization_body(repeated);
+        let plan = legacy_attachment_recovery_plan(&body, &signature, ADVERTISED)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.expected_size(), ACTUAL);
+
+        let mut over_cap =
+            legacy_recovery_response(&signature, MAX_PREAUTHORIZED_DOWNLOAD_CHUNK_BYTES);
+        let over_cap_reference = over_cap.references[0].chunk_references[0].clone();
+        over_cap.references[0].chunk_references = vec![over_cap_reference; 9];
+        let body = legacy_authorization_body(over_cap);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body, &signature, ADVERTISED,
+        ));
+
+        let mut overflowing = legacy_recovery_response(&signature, u64::MAX);
+        let overflowing_reference = overflowing.references[0].chunk_references[0].clone();
+        overflowing.references[0]
+            .chunk_references
+            .push(overflowing_reference);
+        let body = legacy_authorization_body(overflowing);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body, &signature, ADVERTISED,
+        ));
+
+        let mut excessive_skip = legacy_recovery_response(&signature, 1);
+        excessive_skip.containers[0].chunks[0]
+            .meta
+            .as_mut()
+            .unwrap()
+            .offset = MAX_IDS_LEGACY_RECOVERY_BYTES as u64;
+        let body = legacy_authorization_body(excessive_skip);
+        assert_verification_failed(legacy_attachment_recovery_plan(
+            &body, &signature, ADVERTISED,
+        ));
+    }
+
+    #[test]
+    fn legacy_recovery_source_composition_filters_oversized_unrelated_siblings() {
+        const ADVERTISED: usize = 1024 * 1024;
+        const ACTUAL: usize = 1_748_288;
+        let signature = [0x81; 21];
+        let mut response = legacy_recovery_response(&signature, ACTUAL as u64);
+        response.containers[0].chunks.push(ChunkWrapper {
+            meta: Some(ChunkMeta {
+                checksum: vec![0x99; 21],
+                size: u64::MAX,
+                offset: u64::MAX,
+                ..Default::default()
+            }),
+            encryption: None,
+        });
+        let body = legacy_authorization_body(response.clone());
+        let plan = legacy_attachment_recovery_plan(&body, &signature, ADVERTISED)
+            .unwrap()
+            .unwrap();
+        let required = HashSet::from([fixed_bytes::<21>(
+            &response.containers[0].chunks[0]
+                .meta
+                .as_ref()
+                .unwrap()
+                .checksum,
+        )
+        .unwrap()]);
+        let container = MMCSGetContainer::new(
+            response.containers.remove(0),
+            "test-agent".to_owned(),
+            MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+            Some(Arc::new(AtomicU64::new(0))),
+        )
+        .unwrap();
+        let selected = container
+            .get_chunks(
+                &HashMap::new(),
+                MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+                &required,
+            )
+            .unwrap();
+        assert_eq!(plan.expected_size(), ACTUAL);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].size, ACTUAL);
+
+        let mut unsafe_duplicate = legacy_recovery_response(&signature, ACTUAL as u64);
+        let required_id = unsafe_duplicate.containers[0].chunks[0]
+            .meta
+            .as_ref()
+            .unwrap()
+            .checksum
+            .clone();
+        unsafe_duplicate.containers[0].chunks.push(ChunkWrapper {
+            meta: Some(ChunkMeta {
+                checksum: required_id,
+                size: 1,
+                offset: MAX_IDS_LEGACY_RECOVERY_BYTES as u64,
+                ..Default::default()
+            }),
+            encryption: None,
+        });
+        let container = MMCSGetContainer::new(
+            unsafe_duplicate.containers.remove(0),
+            "test-agent".to_owned(),
+            MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+            Some(Arc::new(AtomicU64::new(0))),
+        )
+        .unwrap();
+        assert_verification_failed(container.get_chunks(
+            &HashMap::new(),
+            MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+            &required,
+        ));
+    }
+
     #[test]
     fn download_target_gate_rejects_missing_zero_and_leftover() {
         // Zero targets and missing references fail, even with no writers left.
@@ -4307,6 +4794,179 @@ mod download_only_tests {
         partial.write_chunk(&([0x11; 21], vec![9u8])).await.unwrap();
         assert!(!partial.complete());
         assert_verification_failed(validate_download_targets(1, 1, false, !partial.complete()));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_target_replays_a_verified_reference_per_occurrence() {
+        let chunk = ChunkDesc {
+            id: [0x81; 21],
+            size: 3,
+            key: ChunkEncryption::VerifiedRemotePlaintext,
+            offset: None,
+        };
+        let mut target = ChunkedContainer::new_replaying_repeated_chunks(
+            vec![chunk, chunk],
+            FileContainer::new(Cursor::new(Vec::new())),
+        );
+        target
+            .write_chunk(&([0x81; 21], b"abc".to_vec()))
+            .await
+            .unwrap();
+        assert!(target.complete());
+        assert_eq!(target.container.inner.get_ref(), b"abcabc");
+    }
+
+    struct FinalizeOnceSink {
+        bytes: Vec<u8>,
+        expected: Vec<u8>,
+        finalize_calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Container for FinalizeOnceSink {}
+
+    #[async_trait::async_trait]
+    impl WriteContainer for FinalizeOnceSink {
+        async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
+            self.bytes.extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn finalize(
+            &mut self,
+            _config: &MMCSConfig,
+        ) -> Result<Option<MMCSReceipt>, PushError> {
+            if self.finalize_calls.fetch_add(1, Ordering::SeqCst) != 0
+                || self.bytes != self.expected
+            {
+                return Err(PushError::VerificationFailed);
+            }
+            Ok(None)
+        }
+    }
+
+    fn matcher_test_config() -> MMCSConfig {
+        MMCSConfig {
+            mme_client_info: String::new(),
+            user_agent: String::new(),
+            dataclass: "com.apple.Dataclass.Messenger",
+            mini_ua: String::new(),
+            dsid: None,
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_matcher_finalizes_once_with_duplicate_physical_sources() {
+        let data = b"abc".to_vec();
+        let (id, _) = gen_chunk_sig(&data, 0x01);
+        let source_chunk = ChunkDesc {
+            id,
+            size: data.len(),
+            key: ChunkEncryption::None,
+            offset: None,
+        };
+        let target_chunk = ChunkDesc {
+            key: ChunkEncryption::VerifiedRemotePlaintext,
+            ..source_chunk
+        };
+        let finalize_calls = Arc::new(AtomicU64::new(0));
+        let mut matcher = MMCSMatcher {
+            sources: vec![
+                ChunkedContainer::new(
+                    vec![source_chunk],
+                    FileContainer::new(Cursor::new(data.clone())),
+                ),
+                ChunkedContainer::new(
+                    vec![source_chunk],
+                    FileContainer::new(Cursor::new(data.clone())),
+                ),
+            ],
+            targets: vec![ChunkedContainer::new_replaying_repeated_chunks(
+                vec![target_chunk, target_chunk],
+                FinalizeOnceSink {
+                    bytes: Vec::new(),
+                    expected: b"abcabc".to_vec(),
+                    finalize_calls: finalize_calls.clone(),
+                },
+            )],
+            reciepts: Vec::new(),
+            total: 6,
+        };
+        matcher
+            .transfer_chunks(&matcher_test_config(), |_, _| {})
+            .await
+            .unwrap();
+        assert!(matcher.sources.iter().all(|source| source.complete()));
+        assert!(matcher.targets[0].complete());
+        assert_eq!(matcher.targets[0].container.bytes.as_slice(), b"abcabc");
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_matcher_rejects_corruption_and_incomplete_targets() {
+        let data = b"abc".to_vec();
+        let (id, _) = gen_chunk_sig(&data, 0x01);
+        let source_chunk = ChunkDesc {
+            id,
+            size: data.len(),
+            key: ChunkEncryption::None,
+            offset: None,
+        };
+        let target_chunk = ChunkDesc {
+            key: ChunkEncryption::VerifiedRemotePlaintext,
+            ..source_chunk
+        };
+        let mut corrupted = MMCSMatcher {
+            sources: vec![ChunkedContainer::new(
+                vec![source_chunk],
+                FileContainer::new(Cursor::new(b"abd".to_vec())),
+            )],
+            targets: vec![ChunkedContainer::new_replaying_repeated_chunks(
+                vec![target_chunk],
+                FileContainer::new(Cursor::new(Vec::new())),
+            )],
+            reciepts: Vec::new(),
+            total: data.len(),
+        };
+        assert_verification_failed(
+            corrupted
+                .transfer_chunks(&matcher_test_config(), |_, _| {})
+                .await,
+        );
+
+        let (missing_id, _) = gen_chunk_sig(b"missing", 0x01);
+        let mut incomplete = MMCSMatcher {
+            sources: vec![ChunkedContainer::new(
+                vec![source_chunk],
+                FileContainer::new(Cursor::new(data)),
+            )],
+            targets: vec![ChunkedContainer::new_replaying_repeated_chunks(
+                vec![
+                    target_chunk,
+                    ChunkDesc {
+                        id: missing_id,
+                        size: 7,
+                        ..target_chunk
+                    },
+                ],
+                FileContainer::new(Cursor::new(Vec::new())),
+            )],
+            reciepts: Vec::new(),
+            total: 10,
+        };
+        incomplete
+            .transfer_chunks(&matcher_test_config(), |_, _| {})
+            .await
+            .unwrap();
+        assert_verification_failed(validate_download_targets(
+            1,
+            1,
+            false,
+            !incomplete.targets[0].complete(),
+        ));
     }
 
     #[test]
@@ -4734,6 +5394,8 @@ mod download_only_tests {
         assert!(!policy.sends_completion());
         assert!(MMCSGetNetworkPolicy::Standard.collects_completion_receipts());
         assert!(MMCSGetNetworkPolicy::Standard.sends_completion());
+        assert!(MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery.collects_completion_receipts());
+        assert!(MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery.sends_completion());
     }
 
     #[test]
@@ -4775,6 +5437,14 @@ mod download_only_tests {
             &required,
         );
         assert_eq!(standard.len(), 3);
+
+        let recovery = select_source_chunks(
+            vec![chunk(1), chunk(2), chunk(3)],
+            MMCSGetNetworkPolicy::StandardBoundedLegacyRecovery,
+            &required,
+        );
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].id, [2; 21]);
     }
 
     #[test]
@@ -5513,14 +6183,14 @@ mod download_only_tests {
     }
 
     #[test]
-    fn download_only_actual_response_bytes_have_one_shared_hard_ceiling() {
+    fn bounded_download_actual_response_bytes_have_one_shared_hard_ceiling() {
         let counter = AtomicU64::new(MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES - 1);
-        assert!(record_preauthorized_response_bytes(&counter, 1).is_ok());
+        assert!(record_bounded_response_bytes(&counter, 1).is_ok());
         assert_eq!(
             counter.load(Ordering::Relaxed),
             MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES
         );
-        assert_verification_failed(record_preauthorized_response_bytes(&counter, 1));
+        assert_verification_failed(record_bounded_response_bytes(&counter, 1));
         assert_eq!(
             counter.load(Ordering::Relaxed),
             MAX_PREAUTHORIZED_DOWNLOAD_RESPONSE_BYTES

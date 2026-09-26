@@ -12,7 +12,7 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use openssl::{
-    sha::{self, sha256},
+    sha::{self, sha256, Sha1},
     symm::{Cipher, Crypter},
 };
 use plist::{Data, Dictionary, Value};
@@ -1447,11 +1447,13 @@ pub struct MMCSFile {
 }
 
 // CTR preserves byte length. A successful download must consume exactly the
-// length in the original sent MMCS descriptor, not just the server's progress
-// counter. This bounds writes too, before surplus plaintext reaches the file.
+// admitted length: normally the original descriptor, or the separately
+// validated legacy recovery manifest extent. This bounds writes before surplus
+// plaintext reaches the file.
 struct MMCSExactLengthWriter<T> {
     inner: T,
     advertised: usize,
+    expected: usize,
     remaining: usize,
     mismatch_reported: bool,
 }
@@ -1489,7 +1491,7 @@ impl<T> MMCSExactLengthWriter<T> {
     fn mismatch_diagnostics(&self, rejected_write: usize) -> (usize, usize, usize) {
         (
             self.advertised,
-            self.advertised
+            self.expected
                 .checked_sub(self.remaining)
                 .unwrap_or_default(),
             rejected_write,
@@ -1501,6 +1503,69 @@ impl<T> MMCSExactLengthWriter<T> {
             return Err(PushError::VerificationFailed);
         }
         Ok(())
+    }
+}
+
+struct MMCSLegacySignatureWriter<T> {
+    inner: T,
+    expected_signature: [u8; 21],
+    hasher: Option<Sha1>,
+    remaining: usize,
+}
+
+impl<T> MMCSLegacySignatureWriter<T> {
+    fn new(inner: T, signature: &[u8], expected_size: usize) -> Result<Self, PushError> {
+        let expected_signature: [u8; 21] = signature
+            .try_into()
+            .map_err(|_| PushError::VerificationFailed)?;
+        if expected_signature[0] != 0x81 {
+            return Err(PushError::VerificationFailed);
+        }
+        let mut hasher = Sha1::new();
+        hasher.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        Ok(Self {
+            inner,
+            expected_signature,
+            hasher: Some(hasher),
+            remaining: expected_size,
+        })
+    }
+}
+
+#[async_trait]
+impl<T: Send + Sync> Container for MMCSLegacySignatureWriter<T> {}
+
+#[async_trait]
+impl<T: WriteContainer + Send + Sync> WriteContainer for MMCSLegacySignatureWriter<T> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
+        if data.len() > self.remaining {
+            return Err(PushError::VerificationFailed);
+        }
+        self.hasher
+            .as_mut()
+            .ok_or(PushError::VerificationFailed)?
+            .update(data);
+        self.remaining = self
+            .remaining
+            .checked_sub(data.len())
+            .ok_or(PushError::VerificationFailed)?;
+        self.inner.write(data).await
+    }
+
+    async fn finalize(&mut self, config: &MMCSConfig) -> Result<Option<MMCSReceipt>, PushError> {
+        if self.remaining != 0 {
+            return Err(PushError::VerificationFailed);
+        }
+        let digest = self
+            .hasher
+            .take()
+            .ok_or(PushError::VerificationFailed)?
+            .finish();
+        let actual_signature = [vec![0x81], digest.to_vec()].concat();
+        if actual_signature.as_slice() != self.expected_signature.as_slice() {
+            return Err(PushError::VerificationFailed);
+        }
+        self.inner.finalize(config).await
     }
 }
 
@@ -1687,14 +1752,6 @@ impl MMCSFile {
             extra_2: None,
         };
 
-        let mut exact_writer = MMCSExactLengthWriter {
-            inner: writer,
-            advertised: self.size,
-            remaining: self.size,
-            mismatch_reported: false,
-        };
-        let recieve_container = IMessageContainer::new(&self.key, &mut exact_writer, true);
-
         let domain = self.url.replace(&format!("/{}", &self.object), "");
         let msg_id = new_aps_id();
         let header = format!("x-mme-client-info:{}", mmcs_config.mme_client_info);
@@ -1748,27 +1805,67 @@ impl MMCSFile {
             .await?;
         let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
 
+        // Recovery changes only this download's admitted sink length. `self`
+        // remains the original descriptor, so verify_plaintext_source retains
+        // its original size/signature gate for any later upload attempt.
+        let recovery = mmcs::legacy_attachment_recovery_plan(
+            apns_response.response.as_ref(),
+            &self.signature,
+            self.size,
+        )?;
         let authorized = AuthorizedOperation {
             body: apns_response.response.clone().into(),
             url: self.url.clone(),
             dsid: apns_response.object,
         };
 
-        get_mmcs(
-            &mmcs_config,
-            authorized,
-            vec![(
-                self.signature.clone(),
-                &self.object,
-                recieve_container,
-                None,
-            )],
-            progress,
-            false,
-        )
-        .await?;
-
-        exact_writer.verify_complete()?;
+        match recovery.as_ref() {
+            Some(plan) => {
+                let expected_size = plan.expected_size();
+                let mut exact_writer = MMCSExactLengthWriter {
+                    inner: writer,
+                    advertised: self.size,
+                    expected: expected_size,
+                    remaining: expected_size,
+                    mismatch_reported: false,
+                };
+                let decrypt_container =
+                    IMessageContainer::new(&self.key, &mut exact_writer, true);
+                let receive_container = MMCSLegacySignatureWriter::new(
+                    decrypt_container,
+                    &self.signature,
+                    expected_size,
+                )?;
+                let files = vec![(
+                    self.signature.clone(),
+                    self.object.as_str(),
+                    receive_container,
+                    None,
+                )];
+                mmcs::get_mmcs_legacy_attachment(&mmcs_config, authorized, files, progress, plan)
+                    .await?;
+                exact_writer.verify_complete()?;
+            }
+            None => {
+                let mut exact_writer = MMCSExactLengthWriter {
+                    inner: writer,
+                    advertised: self.size,
+                    expected: self.size,
+                    remaining: self.size,
+                    mismatch_reported: false,
+                };
+                let receive_container =
+                    IMessageContainer::new(&self.key, &mut exact_writer, true);
+                let files = vec![(
+                    self.signature.clone(),
+                    self.object.as_str(),
+                    receive_container,
+                    None,
+                )];
+                get_mmcs(&mmcs_config, authorized, files, progress, false).await?;
+                exact_writer.verify_complete()?;
+            }
+        }
         Ok(())
     }
 }
@@ -1811,6 +1908,39 @@ impl MMCSFile {
 mod mmcs_exact_length_tests {
     use super::*;
 
+    fn legacy_signature(data: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha1::new();
+        hasher.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hasher.update(data);
+        [vec![0x81], hasher.finish().to_vec()].concat()
+    }
+
+    fn test_config() -> MMCSConfig {
+        MMCSConfig {
+            mme_client_info: String::new(),
+            user_agent: String::new(),
+            dataclass: "com.apple.Dataclass.Messenger",
+            mini_ua: String::new(),
+            dsid: None,
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
+        }
+    }
+
+    struct RecordingContainer(Vec<u8>);
+
+    #[async_trait]
+    impl Container for RecordingContainer {}
+
+    #[async_trait]
+    impl WriteContainer for RecordingContainer {
+        async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
     struct ShortWriter(Vec<u8>);
     impl Write for ShortWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1828,6 +1958,7 @@ mod mmcs_exact_length_tests {
         let mut writer = MMCSExactLengthWriter {
             inner: Vec::new(),
             advertised: 3,
+            expected: 3,
             remaining: 3,
             mismatch_reported: false,
         };
@@ -1851,6 +1982,7 @@ mod mmcs_exact_length_tests {
         let mut writer = MMCSExactLengthWriter {
             inner: ShortWriter(Vec::new()),
             advertised: 3,
+            expected: 3,
             remaining: 3,
             mismatch_reported: false,
         };
@@ -1865,6 +1997,7 @@ mod mmcs_exact_length_tests {
         let mut writer = MMCSExactLengthWriter {
             inner: Vec::new(),
             advertised: MIB,
+            expected: MIB,
             remaining: MIB,
             mismatch_reported: false,
         };
@@ -1876,7 +2009,7 @@ mod mmcs_exact_length_tests {
     }
 
     #[tokio::test]
-    async fn decrypted_container_does_not_drop_short_sink_writes() {
+    async fn matching_size_composition_keeps_original_decrypt_and_short_write_behavior() {
         let key = [0x42u8; 32];
         let plaintext = b"synthetic short-write fixture";
         let encrypted =
@@ -1885,6 +2018,7 @@ mod mmcs_exact_length_tests {
         let mut writer = MMCSExactLengthWriter {
             inner: ShortWriter(Vec::new()),
             advertised: plaintext.len(),
+            expected: plaintext.len(),
             remaining: plaintext.len(),
             mismatch_reported: false,
         };
@@ -1892,12 +2026,93 @@ mod mmcs_exact_length_tests {
         WriteContainer::write(&mut container, &encrypted)
             .await
             .unwrap();
-        // AES-CTR has no final payload or authentication tag. The production
-        // matcher checks chunks; this test isolates decrypted sink integrity.
-        assert!(container.finish().is_empty());
+        WriteContainer::finalize(&mut container, &test_config())
+            .await
+            .unwrap();
         drop(container);
         writer.verify_complete().unwrap();
         assert_eq!(writer.inner.0, plaintext);
+    }
+
+    #[tokio::test]
+    async fn one_mib_claim_accepts_verified_1748288_byte_legacy_stream() {
+        const ADVERTISED: usize = 1024 * 1024;
+        const ACTUAL: usize = 1_748_288;
+        let key = [0x24u8; 32];
+        let plaintext = (0..ACTUAL)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let encrypted =
+            openssl::symm::encrypt(Cipher::aes_256_ctr(), &key, Some(&ZERO_NONCE), &plaintext)
+                .unwrap();
+        let signature = legacy_signature(&encrypted);
+        let mut writer = MMCSExactLengthWriter {
+            inner: Vec::new(),
+            advertised: ADVERTISED,
+            expected: ACTUAL,
+            remaining: ACTUAL,
+            mismatch_reported: false,
+        };
+        let decrypt_container = IMessageContainer::new(&key, &mut writer, true);
+        let mut container =
+            MMCSLegacySignatureWriter::new(decrypt_container, &signature, ACTUAL).unwrap();
+        for part in encrypted.chunks(333_333) {
+            WriteContainer::write(&mut container, part).await.unwrap();
+        }
+        WriteContainer::finalize(&mut container, &test_config())
+            .await
+            .unwrap();
+        drop(container);
+        writer.verify_complete().unwrap();
+        assert_eq!(writer.inner, plaintext);
+        assert_eq!(writer.advertised, ADVERTISED);
+        assert_eq!(writer.expected, ACTUAL);
+    }
+
+    #[tokio::test]
+    async fn whole_stream_signature_rejects_corruption_truncation_extra_and_bad_order() {
+        let data = b"ordered outer encrypted stream".to_vec();
+        let signature = legacy_signature(&data);
+
+        let mut corrupted = data.clone();
+        corrupted[3] ^= 0x40;
+        let mut verifier =
+            MMCSLegacySignatureWriter::new(RecordingContainer(Vec::new()), &signature, data.len())
+                .unwrap();
+        verifier.write(&corrupted).await.unwrap();
+        assert!(verifier.finalize(&test_config()).await.is_err());
+
+        let mut verifier =
+            MMCSLegacySignatureWriter::new(RecordingContainer(Vec::new()), &signature, data.len())
+                .unwrap();
+        verifier.write(&data[..data.len() - 1]).await.unwrap();
+        assert!(verifier.finalize(&test_config()).await.is_err());
+
+        let mut verifier =
+            MMCSLegacySignatureWriter::new(RecordingContainer(Vec::new()), &signature, data.len())
+                .unwrap();
+        verifier.write(&data).await.unwrap();
+        assert!(verifier.write(b"extra").await.is_err());
+
+        let split = data.len() / 2;
+        let mut verifier =
+            MMCSLegacySignatureWriter::new(RecordingContainer(Vec::new()), &signature, data.len())
+                .unwrap();
+        verifier.write(&data[split..]).await.unwrap();
+        verifier.write(&data[..split]).await.unwrap();
+        assert!(verifier.finalize(&test_config()).await.is_err());
+
+        let third = data.len() / 3;
+        let mut duplicated = Vec::with_capacity(data.len());
+        duplicated.extend_from_slice(&data[..third]);
+        duplicated.extend_from_slice(&data[..third]);
+        duplicated.extend_from_slice(&data[third * 2..]);
+        duplicated.resize(data.len(), 0);
+        let mut verifier =
+            MMCSLegacySignatureWriter::new(RecordingContainer(Vec::new()), &signature, data.len())
+                .unwrap();
+        verifier.write(&duplicated).await.unwrap();
+        assert!(verifier.finalize(&test_config()).await.is_err());
     }
 }
 
@@ -1981,6 +2196,21 @@ mod verify_plaintext_source_tests {
         longer.extend_from_slice(b"0123456789abcdef");
         let err = file
             .verify_plaintext_source(Cursor::new(longer))
+            .await
+            .unwrap_err();
+        assert!(is_verification_failed(err));
+    }
+
+    #[tokio::test]
+    async fn recovered_larger_file_does_not_authorize_stale_descriptor_reuse() {
+        const ADVERTISED: usize = 1024 * 1024;
+        const ACTUAL: usize = 1_748_288;
+        let plaintext = vec![0x5au8; ACTUAL];
+        let (mut stale, _) = original_fixture(&plaintext).await;
+        assert_eq!(stale.size, ACTUAL);
+        stale.size = ADVERTISED;
+        let err = stale
+            .verify_plaintext_source(Cursor::new(plaintext))
             .await
             .unwrap_err();
         assert!(is_verification_failed(err));
