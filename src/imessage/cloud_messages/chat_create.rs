@@ -1,4 +1,5 @@
-//! Create-only direct-chat operations. This is a native primitive, not upload
+//! Create-only chat operations with separate direct and historical-group lanes.
+//! This is a native primitive, not upload
 //! admission: the caller must persist one immutable payload/record name, prove
 //! there is no existing chat owner, and retain an unknown outcome for lookup.
 //! The app does not expose this lane until that durable orchestration is wired.
@@ -80,6 +81,22 @@ fn validate_chat_input(
     input: &CloudChatSaveInput,
     request_identity: &CloudKitRequestIdentity,
 ) -> Result<(), PushError> {
+    validate_chat_operation_identity(input, request_identity)?;
+    validate_direct_chat_create(&input.chat)
+}
+
+fn validate_group_chat_input(
+    input: &CloudChatSaveInput,
+    request_identity: &CloudKitRequestIdentity,
+) -> Result<(), PushError> {
+    validate_chat_operation_identity(input, request_identity)?;
+    validate_group_chat_create(&input.chat)
+}
+
+fn validate_chat_operation_identity(
+    input: &CloudChatSaveInput,
+    request_identity: &CloudKitRequestIdentity,
+) -> Result<(), PushError> {
     // Deliberately one chat, not a cross-zone batch or a generic update lane.
     if !valid_identifier(&input.local_operation_id)
         || !valid_allocated_uuid(&input.server_record_name)
@@ -88,7 +105,7 @@ fn validate_chat_input(
     {
         return Err(PushError::BadMsg);
     }
-    validate_direct_chat_create(&input.chat)
+    Ok(())
 }
 
 /// Group-parent wire validation only, not a new writer or ownership proof.
@@ -227,11 +244,50 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         request_identity: CloudKitRequestIdentity,
         request_timeout: Duration,
     ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        self.prepare_validated_chat_submission(
+            writer_binding,
+            input,
+            request_identity,
+            request_timeout,
+            validate_chat_input,
+        )
+        .await
+    }
+
+    /// Historical group-parent primitive. It shares the same create-only PCS
+    /// operation and one-attempt owner, not the legacy update/save path. The app
+    /// must separately prove snapshot ownership, complete identity discovery,
+    /// durable stage/admission and readback before using this entry point.
+    pub async fn prepare_historical_group_chat_save_submission(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        input: CloudChatSaveInput,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        self.prepare_validated_chat_submission(
+            writer_binding,
+            input,
+            request_identity,
+            request_timeout,
+            validate_group_chat_input,
+        )
+        .await
+    }
+
+    async fn prepare_validated_chat_submission(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        input: CloudChatSaveInput,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+        validate: fn(&CloudChatSaveInput, &CloudKitRequestIdentity) -> Result<(), PushError>,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
         with_cloudkit_writer_operation(async move {
             if request_timeout.is_zero() || request_timeout > Duration::from_secs(5 * 60) {
                 return Err(PushError::BadMsg);
             }
-            validate_chat_input(&input, &request_identity)?;
+            validate(&input, &request_identity)?;
             let container = self
                 .get_writer_container_for_binding(writer_binding)
                 .await?;
@@ -559,6 +615,84 @@ mod tests {
         validate_group_chat_create(&retained).unwrap();
         // The direct validator keeps rejecting groups by construction.
         assert!(validate_direct_chat_create(&group_input()).is_err());
+    }
+
+    #[test]
+    fn historical_group_submission_keeps_exact_correlation_and_lane() {
+        let group = || CloudChatSaveInput {
+            chat: group_input(),
+            ..input()
+        };
+        validate_group_chat_input(&group(), &identity()).unwrap();
+        assert!(validate_chat_input(&group(), &identity()).is_err());
+        assert!(validate_group_chat_input(&input(), &identity()).is_err());
+        let mut changed = group();
+        changed.apple_operation_uuid = REQUEST.into();
+        assert!(validate_group_chat_input(&changed, &identity()).is_err());
+        changed = group();
+        changed.server_record_name = "invalid-record".into();
+        assert!(validate_group_chat_input(&changed, &identity()).is_err());
+        changed = group();
+        changed.local_operation_id.clear();
+        assert!(validate_group_chat_input(&changed, &identity()).is_err());
+        let extra =
+            CloudKitRequestIdentity::new(REQUEST.into(), vec![OPERATION.into(), RECORD.into()])
+                .unwrap();
+        assert!(validate_group_chat_input(&group(), &extra).is_err());
+    }
+
+    #[test]
+    fn historical_group_create_only_wire_preserves_full_encrypted_payload() {
+        fn encoded(chat: &CloudChat) -> Vec<u8> {
+            let mut bytes = vec![];
+            plist::to_writer_binary(&mut bytes, chat).unwrap();
+            bytes
+        }
+        let zone = RecordZoneIdentifier {
+            value: Some(cloudkit_proto::Identifier {
+                name: Some(CHAT_CREATE_ZONE.into()),
+                r#type: Some(cloudkit_proto::identifier::Type::RecordZone as i32),
+            }),
+            owner_identifier: Some(cloudkit_proto::Identifier {
+                name: Some("fixture-owner".into()),
+                r#type: Some(cloudkit_proto::identifier::Type::User as i32),
+            }),
+            ..Default::default()
+        };
+        let keys = vec![PCSKey::random()];
+        let key =
+            crate::cloudkit::PCSZoneConfig::with_record_keys_for_test(zone.clone(), keys.clone());
+        let candidate = CloudChat {
+            properties: Some(CloudProp {
+                pv: Some(7),
+                last_seen_message_guid: Some("last-read-message".into()),
+                legacy_group_identifiers: vec!["older-group-identity".into()],
+                ..Default::default()
+            }),
+            ..group_input()
+        };
+        let expected = encoded(&candidate);
+        let operation = build_chat_create_operation(
+            zone.clone(),
+            CloudChatSaveInput {
+                chat: candidate,
+                ..input()
+            },
+            &key,
+        )
+        .unwrap();
+        assert_eq!(operation.0.save_semantics, Some(2));
+        let record = operation.0.record.unwrap();
+        let identifier = record_identifier(zone, RECORD);
+        assert_eq!(record.record_identifier.as_ref(), Some(&identifier));
+        let decoded = CloudChat::from_record_encrypted(
+            &record.record_field,
+            Some(&crate::pcs::PCSEncryptor {
+                keys,
+                record_id: identifier,
+            }),
+        );
+        assert_eq!(encoded(&decoded), expected);
     }
 
     #[test]
