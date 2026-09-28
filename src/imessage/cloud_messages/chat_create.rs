@@ -91,6 +91,94 @@ fn validate_chat_input(
     validate_direct_chat_create(&input.chat)
 }
 
+/// Group-parent wire validation only, not a new writer or ownership proof.
+/// Stable group/original IDs may differ and are never replaced or normalized.
+/// A retained style43 group remains a group with one current participant;
+/// current membership is not membership at each historical message's time.
+/// Group photos need a separately qualified asset path and are not admitted by
+/// supplying an asset object or a GUID alone. Direct validation stays separate.
+pub fn validate_group_chat_create(chat: &CloudChat) -> Result<(), PushError> {
+    if chat.style != 43
+        || chat.service_name != "iMessage"
+        || chat.state != 3
+        || chat.successful_query != 1
+        || chat.is_filtered != 0
+        || !valid_group_identifier(&chat.chat_identifier)
+        || !valid_group_identifier(&chat.guid)
+        || normalized_group_handle(&chat.last_addressed_handle).is_none()
+        || chat.guid != format!("iMessage;+;{}", chat.chat_identifier)
+        || chat.participants.is_empty()
+        || chat.participants.len() > 4096
+        || chat.last_read_message_timestamp < 0
+        || !valid_group_identifier(&chat.group_id)
+        || !valid_group_identifier(&chat.original_group_id)
+        || chat.group_photo.is_some()
+        || chat.group_photo_guid.is_some()
+    {
+        return Err(PushError::BadMsg);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for participant in &chat.participants {
+        let identity = normalized_group_handle(&participant.uri).ok_or(PushError::BadMsg)?;
+        if !seen.insert(identity) {
+            return Err(PushError::BadMsg);
+        }
+    }
+    if let Some(name) = chat.display_name.as_deref() {
+        // A cleared title is valid metadata, not an empty routing identifier.
+        if name.len() > 4096 || name.contains('\0') {
+            return Err(PushError::BadMsg);
+        }
+    }
+    if chat.properties.as_ref().is_some_and(|properties| {
+        properties.should_force_to_sms == Some(true)
+            || properties.legacy_group_identifiers.len() > 4096
+            || properties
+                .legacy_group_identifiers
+                .iter()
+                .any(|identifier| !valid_group_identifier(identifier))
+            || properties
+                .last_seen_message_guid
+                .as_deref()
+                .is_some_and(|identifier| !valid_group_identifier(identifier))
+            || properties.group_photo_guid.is_some()
+    }) {
+        return Err(PushError::BadMsg);
+    }
+    Ok(())
+}
+
+fn valid_group_identifier(value: &str) -> bool {
+    valid_identifier(value) && value.trim() == value
+}
+
+/// Comparison spelling only; never rewrite the candidate's saved addresses.
+fn normalized_group_handle(value: &str) -> Option<String> {
+    if !valid_group_identifier(value) || value.len() > 1024 {
+        return None;
+    }
+    let lower = value.to_lowercase();
+    let bare = lower
+        .strip_prefix("mailto:")
+        .or_else(|| lower.strip_prefix("tel:"))
+        .unwrap_or(&lower);
+    if let Some(digits) = bare.strip_prefix('+') {
+        return (!digits.is_empty()
+            && digits.len() <= 15
+            && !digits.starts_with('0')
+            && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| bare.to_owned());
+    }
+    let (local, domain) = bare.split_once('@')?;
+    (!local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && !bare
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ':' | ';' | '/' | '\\')))
+    .then(|| bare.to_owned())
+}
+
 fn build_chat_create_operation(
     zone: RecordZoneIdentifier,
     input: CloudChatSaveInput,
@@ -430,5 +518,152 @@ mod tests {
                 "unexpected chat-create primitive: {forbidden}"
             );
         }
+    }
+
+    fn group_input() -> CloudChat {
+        CloudChat {
+            style: 43,
+            successful_query: 1,
+            state: 3,
+            chat_identifier: "team-alpha@example.invalid".to_owned(),
+            guid: "iMessage;+;team-alpha@example.invalid".to_owned(),
+            // Restored groups legitimately carry distinct group and
+            // original IDs; only presence and bounds are required.
+            group_id: "group-record-alpha".to_owned(),
+            original_group_id: "original-group-alpha".to_owned(),
+            service_name: "iMessage".to_owned(),
+            last_addressed_handle: "owner@example.invalid".to_owned(),
+            last_read_message_timestamp: 0,
+            participants: vec![
+                CloudParticipant {
+                    uri: "mailto:peer@example.invalid".to_owned(),
+                },
+                CloudParticipant {
+                    uri: "tel:+15555550100".to_owned(),
+                },
+                CloudParticipant {
+                    uri: "owner@example.invalid".to_owned(),
+                },
+            ],
+            display_name: Some("Team Alpha".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn group_chat_create_accepts_valid_historical_style_group() {
+        validate_group_chat_create(&group_input()).unwrap();
+        let mut retained = group_input();
+        retained.participants.truncate(1);
+        retained.display_name = Some(String::new());
+        validate_group_chat_create(&retained).unwrap();
+        // The direct validator keeps rejecting groups by construction.
+        assert!(validate_direct_chat_create(&group_input()).is_err());
+    }
+
+    #[test]
+    fn group_chat_create_rejects_changed_routes_and_ids() {
+        let changes: &[fn(&mut CloudChat)] = &[
+            |c| c.guid = "iMessage;-;team-alpha@example.invalid".to_owned(),
+            |c| c.guid = "iMessage;+;other@example.invalid".to_owned(),
+            |c| c.chat_identifier = String::new(),
+            |c| c.group_id.clear(),
+            |c| c.original_group_id.clear(),
+            |c| c.last_addressed_handle.clear(),
+        ];
+        for change in changes {
+            let mut candidate = group_input();
+            change(&mut candidate);
+            assert!(validate_group_chat_create(&candidate).is_err());
+        }
+    }
+
+    #[test]
+    fn group_chat_create_rejects_duplicate_or_invalid_participants() {
+        let mut candidate = group_input();
+        candidate.participants.clear();
+        assert!(validate_group_chat_create(&candidate).is_err());
+        candidate = group_input();
+        candidate
+            .participants
+            .push(candidate.participants[0].clone());
+        assert!(validate_group_chat_create(&candidate).is_err());
+        candidate = group_input();
+        candidate.participants[1].uri.clear();
+        assert!(validate_group_chat_create(&candidate).is_err());
+        candidate = group_input();
+        candidate.participants[1].uri = "bad\u{0}uri".to_owned();
+        assert!(validate_group_chat_create(&candidate).is_err());
+        for invalid in [
+            "future:opaque",
+            "tel:",
+            "tel:+0123",
+            "not-an-address",
+            "a@@example.invalid",
+            " peer@example.invalid",
+        ] {
+            candidate = group_input();
+            candidate.participants[1].uri = invalid.to_owned();
+            assert!(validate_group_chat_create(&candidate).is_err(), "{invalid}");
+        }
+        candidate = group_input();
+        candidate.participants.push(CloudParticipant {
+            uri: "PEER@EXAMPLE.INVALID".into(),
+        });
+        assert!(validate_group_chat_create(&candidate).is_err());
+        candidate = group_input();
+        candidate.participants = (0..4097)
+            .map(|i| CloudParticipant {
+                uri: format!("member{i}@example.invalid"),
+            })
+            .collect();
+        assert!(validate_group_chat_create(&candidate).is_err());
+    }
+
+    #[test]
+    fn group_chat_create_rejects_incompatible_fields() {
+        let changes: &[fn(&mut CloudChat)] = &[
+            |c| c.style = 45,
+            |c| c.service_name = "SMS".to_owned(),
+            |c| c.state = 0,
+            |c| c.successful_query = 0,
+            |c| c.is_filtered = 1,
+            |c| c.last_read_message_timestamp = -1,
+            |c| c.display_name = Some("x".repeat(4097)),
+            |c| c.group_photo_guid = Some(String::new()),
+            |c| {
+                c.group_photo = Some(Asset::default());
+                c.group_photo_guid = None;
+            },
+            |c| {
+                c.properties = Some(CloudProp {
+                    should_force_to_sms: Some(true),
+                    ..Default::default()
+                })
+            },
+            |c| {
+                c.properties = Some(CloudProp {
+                    legacy_group_identifiers: vec!["".to_owned()],
+                    ..Default::default()
+                })
+            },
+            |c| {
+                c.properties = Some(CloudProp {
+                    group_photo_guid: Some(RECORD.to_owned()),
+                    ..Default::default()
+                })
+            },
+        ];
+        for change in changes {
+            let mut candidate = group_input();
+            change(&mut candidate);
+            assert!(validate_group_chat_create(&candidate).is_err());
+        }
+        // A GUID alone does not prove the group-photo asset exists or belongs
+        // to this candidate. Never silently drop it from the saved payload.
+        let mut with_photo = group_input();
+        with_photo.group_photo = Some(Asset::default());
+        with_photo.group_photo_guid = Some(RECORD.to_owned());
+        assert!(validate_group_chat_create(&with_photo).is_err());
     }
 }
