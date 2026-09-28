@@ -641,4 +641,41 @@ mod tests {
             assert!(!method.contains(forbidden));
         }
     }
+
+    fn fixture_with_dcid(dcid: &str) -> Record {
+        // Re-encrypt through the real record encoding instead of hand-editing
+        // wire bytes, so the bytes under test match production serialization.
+        let mut message = read(&fixture()).unwrap().message;
+        message.destination_caller_id = dcid.into();
+        Record {
+            r#type: Some(RecordType {
+                name: Some("MessageEncryptedV3".into()),
+                ..Default::default()
+            }),
+            record_field: message.to_record_encrypted(Some(&IdentityCipher)),
+            pcs_key: Some(vec![1; 4]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_empty_dcid_roundtrips_as_empty_while_missing_dcid_rejects() {
+        // An explicitly empty endpoint is a present scalar, not a missing
+        // field: it must survive the strict read unchanged. This pins decoder
+        // behavior only and asserts nothing about Apple acceptance, display,
+        // or write authority.
+        let empty = fixture_with_dcid("");
+        assert_eq!(read(&empty).unwrap().message.destination_caller_id, "");
+        // A missing field is a different shape and must still reject.
+        let mut missing = empty.clone();
+        missing
+            .record_field
+            .retain(|v| v.identifier.as_ref().and_then(|v| v.name.as_deref()) != Some("dcId"));
+        assert!(read(&missing).is_err());
+        // The untouched fixture still carries its endpoint.
+        assert_eq!(
+            read(&fixture()).unwrap().message.destination_caller_id,
+            "owner@example.test"
+        );
+    }
 }
