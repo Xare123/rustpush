@@ -7,6 +7,21 @@ use super::*;
 const ATTACHMENT_CREATE_ZONE: &str = "attachmentManateeZone";
 const MAX_ATTACHMENT_METADATA_BYTES: usize = 2 * 1024 * 1024;
 
+/// Expected provenance supplied by the committed caller, never inferred from
+/// remote metadata. This is shape validation, not admission or write authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloudAttachmentRecordOrigin {
+    IdsSent,
+    HistoricalSent,
+    HistoricalReceived,
+}
+
+impl CloudAttachmentRecordOrigin {
+    pub fn is_outgoing(self) -> bool {
+        self != Self::HistoricalReceived
+    }
+}
+
 pub struct CloudAttachmentSaveInput {
     pub local_operation_id: String,
     pub server_record_name: String,
@@ -41,11 +56,14 @@ fn allocated_record_name(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random))
 }
 
-fn validate_attachment(attachment: &CloudAttachment) -> Result<(), PushError> {
+pub fn validate_cloud_attachment_record_content(
+    attachment: &CloudAttachment,
+    origin: CloudAttachmentRecordOrigin,
+) -> Result<(), PushError> {
     let metadata = &attachment.cm.0;
     let asset = &attachment.lqa;
     if !valid_identifier(&metadata.guid)
-        || !metadata.is_outgoing
+        || metadata.is_outgoing != origin.is_outgoing()
         || metadata.version != 1
         || metadata.total_bytes < 0
         || asset.size != Some(metadata.total_bytes as u64)
@@ -75,6 +93,7 @@ fn validate_attachment(attachment: &CloudAttachment) -> Result<(), PushError> {
 fn decode_attachment(
     fields: &[cloudkit_proto::record::Field],
     decryptor: &crate::pcs::PCSEncryptor,
+    origin: CloudAttachmentRecordOrigin,
 ) -> Result<CloudAttachment, PushError> {
     use cloudkit_proto::record::field::value::Type;
     let mut metadata = None;
@@ -165,15 +184,16 @@ fn decode_attachment(
         cm: GZipWrapper(metadata.ok_or(PushError::BadMsg)?),
         lqa: asset.ok_or(PushError::BadMsg)?,
     };
-    validate_attachment(&attachment)?;
+    validate_cloud_attachment_record_content(&attachment, origin)?;
     Ok(attachment)
 }
 
 fn validate_input(
     input: &CloudAttachmentSaveInput,
     request_identity: &CloudKitRequestIdentity,
+    origin: CloudAttachmentRecordOrigin,
 ) -> Result<(), PushError> {
-    validate_attachment(&input.attachment)?;
+    validate_cloud_attachment_record_content(&input.attachment, origin)?;
     // Leave room for gzip/PCS overhead within the bounded readback decoder.
     if input.attachment.cm.0.to_bytes().len() > MAX_ATTACHMENT_METADATA_BYTES / 2 {
         return Err(PushError::BadMsg);
@@ -242,11 +262,32 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         request_identity: CloudKitRequestIdentity,
         request_timeout: Duration,
     ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        self.prepare_attachment_save_submission_for_origin(
+            writer_binding,
+            input,
+            request_identity,
+            request_timeout,
+            CloudAttachmentRecordOrigin::IdsSent,
+        )
+        .await
+    }
+
+    /// Same one-shot save path for an explicitly retained historical origin.
+    /// The caller must bind this origin to the original source and upload plan;
+    /// neither a direction flag nor a completed asset proves that authority.
+    pub async fn prepare_attachment_save_submission_for_origin(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        input: CloudAttachmentSaveInput,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+        origin: CloudAttachmentRecordOrigin,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
         with_cloudkit_writer_operation(async move {
             if request_timeout.is_zero() || request_timeout > Duration::from_secs(5 * 60) {
                 return Err(PushError::BadMsg);
             }
-            validate_input(&input, &request_identity)?;
+            validate_input(&input, &request_identity, origin)?;
             let container = self
                 .get_writer_container_for_binding(writer_binding)
                 .await?;
@@ -282,6 +323,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         &self,
         writer_binding: &CloudMessagesWriterPreparationBinding<P>,
         server_record_name: &str,
+    ) -> Result<CloudAttachmentRecordLookup, PushError> {
+        self.lookup_attachment_record_for_origin(
+            writer_binding,
+            server_record_name,
+            CloudAttachmentRecordOrigin::IdsSent,
+        )
+        .await
+    }
+
+    /// Exact-name reconciliation with a caller-bound expected direction.
+    /// Historical readback is not an IDS receipt or upload-retry permission.
+    pub async fn lookup_attachment_record_for_origin(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        server_record_name: &str,
+        origin: CloudAttachmentRecordOrigin,
     ) -> Result<CloudAttachmentRecordLookup, PushError> {
         if !allocated_record_name(server_record_name) {
             return Err(PushError::BadMsg);
@@ -340,7 +397,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                     });
                 };
                 let decryptor = pcs_keys_for_record(raw, &key)?;
-                let attachment = decode_attachment(&raw.record_field, &decryptor)?;
+                let attachment = decode_attachment(&raw.record_field, &decryptor, origin)?;
                 Ok(CloudAttachmentRecordLookup::Found(attachment, receipt))
             }
             Err(error) if is_cloudkit_record_not_found(&error) => {
@@ -634,6 +691,7 @@ impl<P: AnisetteProvider, R: Read + Send + Sync> CloudMessagesPreparedUploadSubm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use CloudAttachmentRecordOrigin::IdsSent;
 
     const RECORD: &str = "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD";
     const OPERATION: &str = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB";
@@ -689,7 +747,7 @@ mod tests {
 
     #[test]
     fn attachment_create_requires_exact_identity_and_completed_asset_shape() {
-        validate_input(&input(), &identity()).unwrap();
+        validate_input(&input(), &identity(), IdsSent).unwrap();
         let changes: &[fn(&mut CloudAttachmentSaveInput)] = &[
             |i| i.server_record_name.clear(),
             |i| i.local_operation_id.clear(),
@@ -716,7 +774,7 @@ mod tests {
         for change in changes {
             let mut candidate = input();
             change(&mut candidate);
-            assert!(validate_input(&candidate, &identity()).is_err());
+            assert!(validate_input(&candidate, &identity(), IdsSent).is_err());
         }
     }
 
@@ -741,6 +799,7 @@ mod tests {
                 keys,
                 record_id: identifier,
             },
+            IdsSent,
         )
         .unwrap();
         assert_eq!(decoded.cm.0.guid, input().attachment.cm.0.guid);
@@ -755,6 +814,86 @@ mod tests {
             decoded.lqa.protection_info,
             input().attachment.lqa.protection_info
         );
+    }
+
+    #[test]
+    fn historical_attachment_create_preserves_direction_and_all_asset_checks() {
+        use CloudAttachmentRecordOrigin::{HistoricalReceived, HistoricalSent};
+        for origin in [HistoricalSent, HistoricalReceived] {
+            let mut candidate = input();
+            candidate.attachment.cm.0.is_outgoing = origin.is_outgoing();
+            assert!(validate_input(&candidate, &identity(), origin).is_ok());
+            if origin == HistoricalReceived {
+                assert!(validate_input(&candidate, &identity(), IdsSent).is_err());
+            }
+            let changes: &[fn(&mut CloudAttachmentSaveInput)] = &[
+                |i| i.attachment.cm.0.is_outgoing = !i.attachment.cm.0.is_outgoing,
+                |i| i.attachment.cm.0.guid.clear(),
+                |i| i.attachment.cm.0.version = 0,
+                |i| i.attachment.lqa.size = Some(4),
+                |i| i.attachment.lqa.signature = Some(vec![4; 20]),
+                |i| i.attachment.lqa.reference_signature = Some(vec![1; 20]),
+                |i| i.attachment.lqa.protection_info = None,
+                |i| i.attachment.lqa.upload_receipt = None,
+                |i| i.apple_operation_uuid = REQUEST.into(),
+            ];
+            for change in changes {
+                let mut broken = input();
+                broken.attachment.cm.0.is_outgoing = origin.is_outgoing();
+                change(&mut broken);
+                assert!(validate_input(&broken, &identity(), origin).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn historical_attachment_encrypted_readback_keeps_direction_without_new_wire_fields() {
+        for origin in [
+            CloudAttachmentRecordOrigin::HistoricalSent,
+            CloudAttachmentRecordOrigin::HistoricalReceived,
+        ] {
+            let zone = zone();
+            let keys = vec![PCSKey::random()];
+            let key = crate::cloudkit::PCSZoneConfig::with_record_keys_for_test(
+                zone.clone(),
+                keys.clone(),
+            );
+            let mut candidate = input();
+            candidate.attachment.cm.0.is_outgoing = origin.is_outgoing();
+            validate_input(&candidate, &identity(), origin).unwrap();
+            let operation = build_create_operation(zone.clone(), candidate, &key).unwrap();
+            assert_eq!(operation.0.save_semantics, Some(2));
+            let record = operation.0.record.unwrap();
+            let decryptor = crate::pcs::PCSEncryptor {
+                keys,
+                record_id: record_identifier(zone, RECORD),
+            };
+            let decoded = decode_attachment(&record.record_field, &decryptor, origin).unwrap();
+            assert_eq!(decoded.cm.0.is_outgoing, origin.is_outgoing());
+            assert_eq!(decoded.cm.0.guid, input().attachment.cm.0.guid);
+            assert_eq!(
+                decoded.lqa.protection_info,
+                input().attachment.lqa.protection_info
+            );
+            assert!(record.record_field.iter().all(|field| matches!(
+                field.identifier.as_ref().and_then(|id| id.name.as_deref()),
+                Some("cm" | "lqa")
+            )));
+            if origin == CloudAttachmentRecordOrigin::HistoricalReceived {
+                assert!(decode_attachment(&record.record_field, &decryptor, IdsSent).is_err());
+            }
+            let wrong_origin = if origin.is_outgoing() {
+                CloudAttachmentRecordOrigin::HistoricalReceived
+            } else {
+                CloudAttachmentRecordOrigin::HistoricalSent
+            };
+            assert!(decode_attachment(&record.record_field, &decryptor, wrong_origin).is_err());
+            let mut corrupt = record.record_field.clone();
+            corrupt.retain(|field| {
+                field.identifier.as_ref().and_then(|id| id.name.as_deref()) != Some("cm")
+            });
+            assert!(decode_attachment(&corrupt, &decryptor, origin).is_err());
+        }
     }
 
     #[test]
@@ -773,15 +912,15 @@ mod tests {
             record_id: record_identifier(zone, RECORD),
         };
         let fields = record.record_field;
-        assert!(decode_attachment(&fields, &decryptor).is_ok());
-        assert!(decode_attachment(&[], &decryptor).is_err());
+        assert!(decode_attachment(&fields, &decryptor, IdsSent).is_ok());
+        assert!(decode_attachment(&[], &decryptor, IdsSent).is_err());
         for index in 0..fields.len() {
             let mut omitted = fields.clone();
             omitted.remove(index);
-            assert!(decode_attachment(&omitted, &decryptor).is_err());
+            assert!(decode_attachment(&omitted, &decryptor, IdsSent).is_err());
             let mut duplicate = fields.clone();
             duplicate.push(fields[index].clone());
-            assert!(decode_attachment(&duplicate, &decryptor).is_err());
+            assert!(decode_attachment(&duplicate, &decryptor, IdsSent).is_err());
             let mut corrupt = fields.clone();
             let value = corrupt[index].value.as_mut().unwrap();
             if let Some(bytes) = &mut value.bytes_value {
@@ -789,7 +928,7 @@ mod tests {
             } else if let Some(asset) = &mut value.asset_value {
                 asset.protection_info = None;
             }
-            assert!(decode_attachment(&corrupt, &decryptor).is_err());
+            assert!(decode_attachment(&corrupt, &decryptor, IdsSent).is_err());
         }
     }
 
@@ -797,7 +936,7 @@ mod tests {
     fn attachment_metadata_is_bounded_before_save_and_after_decryption() {
         let mut oversized = input();
         oversized.attachment.cm.0.filename = Some("x".repeat(MAX_ATTACHMENT_METADATA_BYTES + 1));
-        assert!(validate_input(&oversized, &identity()).is_err());
+        assert!(validate_input(&oversized, &identity(), IdsSent).is_err());
         let zone = zone();
         let keys = vec![PCSKey::random()];
         let key =
@@ -813,7 +952,7 @@ mod tests {
             keys,
             record_id: record_identifier(zone, RECORD),
         };
-        assert!(decode_attachment(&record.record_field, &decryptor).is_err());
+        assert!(decode_attachment(&record.record_field, &decryptor, IdsSent).is_err());
     }
 
     #[test]

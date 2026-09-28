@@ -70,6 +70,7 @@ mod attachment_create;
 mod received_inspection;
 pub use received_inspection::CloudMessageRecordInspection;
 pub use attachment_create::{
+    validate_cloud_attachment_record_content, CloudAttachmentRecordOrigin,
     CloudAttachmentNativeUploadInput, CloudAttachmentNativeUploadOutcome,
     CloudAttachmentNativeUploadResult, CloudAttachmentRecordLookup, CloudAttachmentSaveInput,
     CloudAttachmentUploadConsumeError, CloudMessagesPreparedUploadSubmission,
