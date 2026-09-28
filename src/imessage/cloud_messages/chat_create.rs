@@ -1,4 +1,4 @@
-//! Create-only chat operations with separate direct and historical-group lanes.
+//! Create-only chat operations with separate new-direct and historical lanes.
 //! This is a native primitive, not upload
 //! admission: the caller must persist one immutable payload/record name, prove
 //! there is no existing chat owner, and retain an unknown outcome for lookup.
@@ -83,6 +83,57 @@ fn validate_chat_input(
 ) -> Result<(), PushError> {
     validate_chat_operation_identity(input, request_identity)?;
     validate_direct_chat_create(&input.chat)
+}
+
+/// An archived one-to-one parent may retain non-UUID lineage and a saved title.
+/// Keep the ordinary new-direct validator unchanged. Historical callers must
+/// separately bind the immutable source and prove exact remote absence.
+pub fn validate_historical_direct_chat_create(chat: &CloudChat) -> Result<(), PushError> {
+    if chat.style != 45
+        || chat.service_name != "iMessage"
+        || chat.state != 3
+        || chat.successful_query != 1
+        || chat.is_filtered != 0
+        || normalized_group_handle(&chat.chat_identifier).is_none()
+        || normalized_group_handle(&chat.last_addressed_handle).is_none()
+        || chat.guid != format!("iMessage;-;{}", chat.chat_identifier)
+        || chat.participants.len() != 1
+        || normalized_group_handle(&chat.participants[0].uri)
+            != normalized_group_handle(&chat.chat_identifier)
+        || !valid_group_identifier(&chat.group_id)
+        || !valid_group_identifier(&chat.original_group_id)
+        || chat.last_read_message_timestamp < 0
+        || chat.group_photo.is_some()
+        || chat.group_photo_guid.is_some()
+        || chat
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.len() > 4096 || name.contains('\0'))
+        || chat.properties.as_ref().is_some_and(|properties| {
+            properties.should_force_to_sms == Some(true)
+                || properties.group_photo_guid.is_some()
+                || properties.legacy_group_identifiers.len() > 4096
+                || properties
+                    .legacy_group_identifiers
+                    .iter()
+                    .any(|id| !valid_group_identifier(id))
+                || properties
+                    .last_seen_message_guid
+                    .as_deref()
+                    .is_some_and(|id| !valid_group_identifier(id))
+        })
+    {
+        return Err(PushError::BadMsg);
+    }
+    Ok(())
+}
+
+fn validate_historical_direct_chat_input(
+    input: &CloudChatSaveInput,
+    request_identity: &CloudKitRequestIdentity,
+) -> Result<(), PushError> {
+    validate_chat_operation_identity(input, request_identity)?;
+    validate_historical_direct_chat_create(&input.chat)
 }
 
 fn validate_group_chat_input(
@@ -250,6 +301,25 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             request_identity,
             request_timeout,
             validate_chat_input,
+        )
+        .await
+    }
+
+    /// Snapshot-bound direct history uses the same create-only PCS owner, but
+    /// preserves saved lineage instead of pretending this is a new local send.
+    pub async fn prepare_historical_direct_chat_save_submission(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        input: CloudChatSaveInput,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        self.prepare_validated_chat_submission(
+            writer_binding,
+            input,
+            request_identity,
+            request_timeout,
+            validate_historical_direct_chat_input,
         )
         .await
     }
@@ -486,6 +556,49 @@ mod tests {
     }
 
     #[test]
+    fn historical_direct_validator_preserves_lineage_without_widening_new_send_scope() {
+        let mut candidate = input();
+        candidate.chat.group_id = "iMessage;-;recipient@example.invalid".into();
+        candidate.chat.original_group_id = "older-stable-lineage".into();
+        candidate.chat.display_name = Some("Saved label".into());
+        candidate.chat.properties = Some(CloudProp {
+            legacy_group_identifiers: vec!["original-identity".into()],
+            last_seen_message_guid: Some("last-read".into()),
+            ..Default::default()
+        });
+        validate_historical_direct_chat_input(&candidate, &identity()).unwrap();
+        assert!(validate_chat_input(&candidate, &identity()).is_err());
+        let changes: &[fn(&mut CloudChat)] = &[
+            |c| c.style = 43,
+            |c| c.service_name = "SMS".into(),
+            |c| c.participants.clear(),
+            |c| c.participants.push(c.participants[0].clone()),
+            |c| c.participants[0].uri = "other@example.invalid".into(),
+            |c| c.guid = "iMessage;-;other@example.invalid".into(),
+            |c| c.last_addressed_handle.clear(),
+            |c| c.group_id.clear(),
+            |c| c.original_group_id.clear(),
+            |c| c.group_photo = Some(Asset::default()),
+            |c| c.group_photo_guid = Some("photo".into()),
+            |c| c.properties.as_mut().unwrap().should_force_to_sms = Some(true),
+            |c| {
+                c.properties
+                    .as_mut()
+                    .unwrap()
+                    .legacy_group_identifiers
+                    .push("".into())
+            },
+        ];
+        for change in changes {
+            let mut changed = candidate.chat.clone();
+            change(&mut changed);
+            assert!(validate_historical_direct_chat_create(&changed).is_err());
+        }
+        candidate.server_record_name = "not-allocated".into();
+        assert!(validate_historical_direct_chat_input(&candidate, &identity()).is_err());
+    }
+
+    #[test]
     fn chat_create_refuses_missing_pcs_material_and_wrong_zone() {
         let zone = RecordZoneIdentifier {
             value: Some(cloudkit_proto::Identifier {
@@ -642,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_group_create_only_wire_preserves_full_encrypted_payload() {
+    fn historical_chat_create_only_wire_preserves_full_encrypted_payload() {
         fn encoded(chat: &CloudChat) -> Vec<u8> {
             let mut bytes = vec![];
             plist::to_writer_binary(&mut bytes, chat).unwrap();
@@ -671,28 +784,36 @@ mod tests {
             }),
             ..group_input()
         };
-        let expected = encoded(&candidate);
-        let operation = build_chat_create_operation(
-            zone.clone(),
-            CloudChatSaveInput {
-                chat: candidate,
-                ..input()
-            },
-            &key,
-        )
-        .unwrap();
-        assert_eq!(operation.0.save_semantics, Some(2));
-        let record = operation.0.record.unwrap();
-        let identifier = record_identifier(zone, RECORD);
-        assert_eq!(record.record_identifier.as_ref(), Some(&identifier));
-        let decoded = CloudChat::from_record_encrypted(
-            &record.record_field,
-            Some(&crate::pcs::PCSEncryptor {
-                keys,
-                record_id: identifier,
-            }),
-        );
-        assert_eq!(encoded(&decoded), expected);
+        let mut direct = input().chat;
+        direct.group_id = "iMessage;-;recipient@example.invalid".into();
+        direct.original_group_id = "older-direct-lineage".into();
+        direct.display_name = Some("Saved direct label".into());
+        direct.properties = candidate.properties.clone();
+        validate_historical_direct_chat_create(&direct).unwrap();
+        for candidate in [candidate, direct] {
+            let expected = encoded(&candidate);
+            let operation = build_chat_create_operation(
+                zone.clone(),
+                CloudChatSaveInput {
+                    chat: candidate,
+                    ..input()
+                },
+                &key,
+            )
+            .unwrap();
+            assert_eq!(operation.0.save_semantics, Some(2));
+            let record = operation.0.record.unwrap();
+            let identifier = record_identifier(zone.clone(), RECORD);
+            assert_eq!(record.record_identifier.as_ref(), Some(&identifier));
+            let decoded = CloudChat::from_record_encrypted(
+                &record.record_field,
+                Some(&crate::pcs::PCSEncryptor {
+                    keys: keys.clone(),
+                    record_id: identifier,
+                }),
+            );
+            assert_eq!(encoded(&decoded), expected);
+        }
     }
 
     #[test]

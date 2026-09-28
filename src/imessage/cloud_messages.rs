@@ -63,7 +63,7 @@ use cloudkit_proto::CloudKitEncryptor;
 
 mod chat_create;
 pub use chat_create::{
-    validate_direct_chat_create, validate_group_chat_create, CloudChatRecordLookup,
+    validate_direct_chat_create, validate_group_chat_create, validate_historical_direct_chat_create, CloudChatRecordLookup,
     CloudChatSaveInput,
 };
 mod attachment_create;
