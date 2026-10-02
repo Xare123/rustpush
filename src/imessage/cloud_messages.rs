@@ -68,6 +68,9 @@ pub use chat_create::{
 };
 mod attachment_create;
 mod received_inspection;
+mod change_notifications;
+use change_notifications::ChangeNotificationState;
+use crate::aps::{APSConnection, APSInterestToken, APSMessage};
 pub use received_inspection::CloudMessageRecordInspection;
 pub use attachment_create::{
     validate_cloud_attachment_record_content, CloudAttachmentRecordOrigin,
@@ -2687,11 +2690,21 @@ mod cloud_message_save_tests {
     }
 }
 
+struct MessagesNotificationBinding {
+    account_dsid: String,
+    cloudkit_user_id: String,
+    aps_token: [u8; 32],
+    conn: APSConnection,
+    _interest: APSInterestToken,
+}
+
 pub struct CloudMessagesClient<P: AnisetteProvider> {
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
     container_initialization: Mutex<()>,
     read_authentication_container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
     read_authentication_container_initialization: Mutex<()>,
+    change_notifications: std::sync::Mutex<ChangeNotificationState<MessagesNotificationBinding>>,
+    change_notification_setup: Mutex<()>,
     pub client: Arc<CloudKitClient<P>>,
     pub keychain: Arc<KeychainClient<P>>,
 }
@@ -2729,6 +2742,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             container_initialization: Mutex::new(()),
             read_authentication_container: Mutex::new(None),
             read_authentication_container_initialization: Mutex::new(()),
+            change_notifications: std::sync::Mutex::new(ChangeNotificationState::default()),
+            change_notification_setup: Mutex::new(()),
             client,
             keychain,
         }
@@ -2745,9 +2760,88 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             container_initialization: Mutex::new(()),
             read_authentication_container: Mutex::new(Some(container)),
             read_authentication_container_initialization: Mutex::new(()),
+            change_notifications: std::sync::Mutex::new(ChangeNotificationState::default()),
+            change_notification_setup: Mutex::new(()),
             client,
             keychain,
         }
+    }
+
+    pub fn begin_change_notifications(&self) -> String {
+        self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).begin()
+    }
+
+    pub fn disable_change_notifications(&self, expected: Option<&str>) -> bool {
+        self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).disable(expected)
+    }
+
+    pub fn change_notifications_current(&self, nonce: &str) -> bool {
+        self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).current(nonce)
+    }
+
+    fn change_notification_requested(&self, nonce: &str) -> bool {
+        self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).requested(nonce)
+    }
+
+    /// Explicit opt-in metadata registration, separate from semantic read auth.
+    /// No zones, records, PCS keys, cursors, or outgoing messages are mutated.
+    /// The API caller owns the account-lifecycle gate and bounded writer permit.
+    pub async fn configure_change_notifications(
+        &self, conn: &APSConnection, nonce: &str,
+    ) -> Result<bool, PushError> {
+        let _setup = self.change_notification_setup.lock().await;
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        let (account_dsid, _) = self.validated_persisted_native_account_identifiers().await?;
+        let aps_token = conn.get_token().await;
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        {
+            let mut notifications = self.change_notifications.lock().unwrap_or_else(|e| e.into_inner());
+            let warm = notifications.active.as_ref().is_some_and(|(_, binding)| {
+                binding.account_dsid == account_dsid && binding.aps_token == aps_token
+                    && Arc::ptr_eq(&binding.conn, conn)
+            });
+            if warm { return Ok(notifications.adopt_warm(nonce)); }
+        }
+        let container = self.get_container().await?;
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        // A cold init may refresh authentication. Require its current GSA
+        // account to agree with the persisted client before server metadata.
+        if self.validated_native_account_identifier().await? != account_dsid {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        if container.user_id.is_empty() { return Err(PushError::UnauthorizedAccountError); }
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        container.create_sync_subscription().await?;
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        container.register_token(conn).await?;
+        if !self.change_notification_requested(nonce) { return Ok(false); }
+        let topic = format!("com.apple.icloud-container.{}", MESSAGES_CONTAINER.bundleid);
+        let interest = conn.request_topics(&[topic.as_str()]).await;
+        if self.validated_native_account_identifier().await? != account_dsid
+            || conn.get_token().await != aps_token {
+            return Err(PushError::UnauthorizedAccountError);
+        }
+        Ok(self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).install(
+            nonce,
+            MessagesNotificationBinding {
+                account_dsid, cloudkit_user_id: container.user_id.clone(),
+                aps_token, conn: conn.clone(), _interest: interest,
+            },
+        ))
+    }
+
+    /// Cached, synchronous invalidation matching. Never await the generic
+    /// watcher's debounce on the IDS receive loop or trust notification content.
+    pub fn change_notification_nonce(&self, conn: &APSConnection, message: &APSMessage) -> Option<String> {
+        let APSMessage::Notification { topic, payload: Value::Data(payload), .. } = message
+        else { return None; };
+        let notifications = self.change_notifications.lock().unwrap_or_else(|e| e.into_inner());
+        let (nonce, binding) = notifications.active.as_ref()?;
+        if !notifications.current(nonce) || !Arc::ptr_eq(&binding.conn, conn) { return None; }
+        crate::cloudkit::cloudkit_notification_matches_scope(
+            topic, payload, MESSAGES_CONTAINER.bundleid,
+            MESSAGES_CONTAINER.containerid, &binding.cloudkit_user_id,
+        ).then(|| nonce.clone())
     }
 
     /// Returns the persisted CloudKit and keychain account identifiers only
@@ -5894,5 +5988,31 @@ mod cloud_message_identity_tests {
         assert!(!prepared.chunk_sigs.is_empty());
         assert!(!prepared.total_sig.is_empty());
         assert_eq!(engram_boundary_key_count(&fixture).await, 1);
+    }
+
+    #[tokio::test]
+    async fn notification_nonce_alone_never_warms_or_authorizes_a_container() {
+        let fixture = valid_fixture();
+        let nonce = fixture.messages.begin_change_notifications();
+        assert!(fixture.messages.change_notification_requested(&nonce));
+        assert!(!fixture.messages.change_notifications_current(&nonce));
+        assert!(fixture.messages.container.lock().await.is_none());
+        assert!(fixture.messages.read_authentication_container.lock().await.is_none());
+        assert_eq!(fixture.messages.validated_persisted_native_account_identifiers().await.unwrap().0, "123");
+        assert!(fixture.messages.disable_change_notifications(Some(&nonce)));
+        assert!(!fixture.messages.change_notification_requested(&nonce));
+    }
+
+    #[tokio::test]
+    async fn notification_client_rejects_late_failure_for_a_successor_request() {
+        let fixture = valid_fixture();
+        let old = fixture.messages.begin_change_notifications();
+        let current = fixture.messages.begin_change_notifications();
+        assert_ne!(old, current);
+        assert!(!fixture.messages.disable_change_notifications(Some(&old)));
+        assert!(fixture.messages.change_notification_requested(&current));
+        assert!(!fixture.messages.change_notifications_current(&current));
+        assert!(fixture.messages.disable_change_notifications(None));
+        assert!(!fixture.messages.change_notification_requested(&current));
     }
 }

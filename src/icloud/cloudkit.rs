@@ -2080,6 +2080,274 @@ pub struct CloudKitChangeNotif {
     cloudkit: CloudKitChangeNotifCloudkit,
 }
 
+/// Synchronous, side-effect-free CloudKit notification scope check.
+///
+/// Returns true only when topic equals SHA1 of
+/// com.apple.icloud-container.<bundle_id> and the JSON payload
+/// carries a minimal ck object whose cid and ckuserid exactly match the
+/// expected container and user while nid is a non-empty string. Unknown
+/// fields (including aps, met/fet, and zone details) are ignored without
+/// extracting content. A true result is an invalidation hint only; the caller
+/// owns the account/lifetime and must perform the later authoritative read.
+pub fn cloudkit_notification_matches_scope(
+    topic: &[u8; 20],
+    payload: &[u8],
+    bundle_id: &str,
+    container_id: &str,
+    cloudkit_user_id: &str,
+) -> bool {
+    const CLOUDKIT_NOTIFICATION_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+    if payload.len() > CLOUDKIT_NOTIFICATION_MAX_PAYLOAD_BYTES {
+        return false;
+    }
+    if bundle_id.is_empty() || container_id.is_empty() || cloudkit_user_id.is_empty() {
+        return false;
+    }
+    let expected_topic = sha1(format!("com.apple.icloud-container.{}", bundle_id).as_bytes());
+    if *topic != expected_topic {
+        return false;
+    }
+
+    // Derived struct visitors can also accept positional arrays. APNs must
+    // carry the actual object envelope and named ck fields, not that alternate
+    // representation. Unknown fields are still ignored and never forwarded.
+    let Ok(serde_json::Value::Object(envelope)) = serde_json::from_slice(payload) else {
+        return false;
+    };
+    let Some(serde_json::Value::Object(ck)) = envelope.get("ck") else {
+        return false;
+    };
+    let string_field = |name| ck.get(name).and_then(serde_json::Value::as_str);
+    string_field("cid") == Some(container_id)
+        && string_field("ckuserid") == Some(cloudkit_user_id)
+        && string_field("nid").is_some_and(|id| !id.is_empty())
+}
+
+#[cfg(test)]
+mod cloudkit_notification_scope_tests {
+    use super::*;
+
+    #[test]
+    fn positional_arrays_are_not_notification_objects() {
+        let topic = scope_topic("com.apple.imagent");
+        for payload in [
+            br#"[{"cid":"com.apple.messages.cloud","ckuserid":"test-user","nid":"test-notification"}]"#.as_slice(),
+            br#"{"ck":["com.apple.messages.cloud","test-user","test-notification"]}"#.as_slice(),
+        ] {
+            assert!(!cloudkit_notification_matches_scope(
+                &topic, payload, "com.apple.imagent", "com.apple.messages.cloud", "test-user",
+            ));
+        }
+    }
+
+    fn scope_topic(bundle_id: &str) -> [u8; 20] {
+        sha1(format!("com.apple.icloud-container.{}", bundle_id).as_bytes())
+    }
+
+    fn scope_payload(variant: &str) -> Vec<u8> {
+        match variant {
+            "met" => br#"{"aps":{"content-available":1},"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":"notif-1","met":{"zid":"zone-a","zoid":"owner-a","sid":"sub-a"}}}"#.to_vec(),
+            "fet" => br#"{"aps":{"content-available":1},"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":"notif-2","fet":{"zid":"zone-a","zoid":"owner-a","sid":"sub-a"}}}"#.to_vec(),
+            _ => br#"{"aps":{"content-available":1},"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":"notif-3"}}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn exact_match_with_met_hint_is_in_scope() {
+        let topic = scope_topic("com.apple.foo");
+        assert!(cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("met"),
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+    }
+
+    #[test]
+    fn fet_hint_is_in_scope() {
+        let topic = scope_topic("com.apple.foo");
+        assert!(cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("fet"),
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+    }
+
+    #[test]
+    fn database_wide_hint_without_zone_fields_is_in_scope() {
+        let topic = scope_topic("com.apple.foo");
+        assert!(cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("db-wide"),
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+    }
+
+    #[test]
+    fn wrong_topic_is_out_of_scope() {
+        let topic = scope_topic("com.apple.other");
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("met"),
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+    }
+
+    #[test]
+    fn wrong_user_or_container_is_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("met"),
+            "com.apple.foo",
+            "iCloud.com.apple.other",
+            "user-123"
+        ));
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &scope_payload("met"),
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-999"
+        ));
+    }
+
+    #[test]
+    fn empty_expected_identifiers_are_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        let payload = scope_payload("met");
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &payload,
+            "",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &payload,
+            "com.apple.foo",
+            "",
+            "user-123"
+        ));
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &payload,
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            ""
+        ));
+    }
+
+    #[test]
+    fn empty_payload_metadata_is_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        for payload in [
+            br#"{"ck":{"cid":"","ckuserid":"user-123","nid":"notif-1"}}"#.as_slice(),
+            br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"","nid":"notif-1"}}"#.as_slice(),
+            br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":""}}"#.as_slice(),
+            br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123"}}"#.as_slice(),
+            br#"{"ck":{"ckuserid":"user-123","nid":"notif-1"}}"#.as_slice(),
+            br#"{"aps":{"content-available":1}}"#.as_slice(),
+        ] {
+            assert!(
+                !cloudkit_notification_matches_scope(
+                    &topic,
+                    payload,
+                    "com.apple.foo",
+                    "iCloud.com.apple.foo",
+                    "user-123"
+                ),
+                "payload should be out of scope");
+        }
+    }
+
+    #[test]
+    fn non_string_metadata_is_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        for payload in [
+            br#"{"ck":{"cid":123,"ckuserid":"user-123","nid":"notif-1"}}"#.as_slice(),
+            br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":null,"nid":"notif-1"}}"#.as_slice(),
+            br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":7}}"#.as_slice(),
+            br#"{"ck":[]}"#.as_slice(),
+        ] {
+            assert!(!cloudkit_notification_matches_scope(
+                &topic,
+                payload,
+                "com.apple.foo",
+                "iCloud.com.apple.foo",
+                "user-123"
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_or_non_object_json_is_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        for payload in [
+            br#"{"ck":{"cid":"iCloud.com.apple.foo",}}"#.as_slice(),
+            br#"not json"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#""string""#.as_slice(),
+            br#"null"#.as_slice(),
+            br#""#.as_slice(),
+        ] {
+            assert!(!cloudkit_notification_matches_scope(
+                &topic,
+                payload,
+                "com.apple.foo",
+                "iCloud.com.apple.foo",
+                "user-123"
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_payload_is_out_of_scope() {
+        let topic = scope_topic("com.apple.foo");
+        let mut payload = br#"{"ck":{"cid":"iCloud.com.apple.foo","ckuserid":"user-123","nid":"notif-1","pad":""#.to_vec();
+        payload.extend(std::iter::repeat(b'x').take(70 * 1024));
+        payload.extend(br#""}}"#.iter().copied());
+        assert!(payload.len() > 64 * 1024);
+        assert!(!cloudkit_notification_matches_scope(
+            &topic,
+            &payload,
+            "com.apple.foo",
+            "iCloud.com.apple.foo",
+            "user-123"
+        ));
+    }
+
+    #[test]
+    fn exact_payload_limit_accepts_valid_hint_but_one_byte_over_rejects() {
+        let topic = scope_topic("com.apple.foo");
+        let mut payload = scope_payload("db-wide");
+        payload.resize(64 * 1024, b' ');
+        assert!(cloudkit_notification_matches_scope(
+            &topic, &payload, "com.apple.foo", "iCloud.com.apple.foo", "user-123",
+        ));
+        payload.push(b' ');
+        assert!(!cloudkit_notification_matches_scope(
+            &topic, &payload, "com.apple.foo", "iCloud.com.apple.foo", "user-123",
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_does_not_admit_a_hint() {
+        assert!(!cloudkit_notification_matches_scope(
+            &scope_topic("com.apple.foo"), &[0xff, 0xfe],
+            "com.apple.foo", "iCloud.com.apple.foo", "user-123",
+        ));
+    }
+}
+
 pub struct CloudKitNotifWatcher {
     _interest_token: APSInterestToken,
     for_topic: [u8; 20],

@@ -1577,9 +1577,10 @@ pub struct APSInterestToken {
 impl Drop for APSInterestToken {
     fn drop(&mut self) {
         // we don't care if it succeeds or not; we want to decrement no matter what
-        self.topics_channel
-            .try_send((self.topics.clone(), false))
-            .expect("APS backed up??");
+        match self.topics_channel.try_send((self.topics.clone(), false)) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => panic!("APS backed up??"),
+        }
     }
 }
 
@@ -2342,6 +2343,30 @@ mod transport_tests {
         APNS_CONNECT_TIMEOUT, APNS_MAX_RESOLVED_ADDRESSES, APNS_PORTS,
     };
     use crate::PushError;
+
+    #[test]
+    fn topic_interest_drops_cleanly_after_connection_receiver_has_closed() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let interest = super::APSInterestToken {
+            topics: vec!["com.apple.icloud-container.com.apple.imagent".to_owned()],
+            topics_channel: sender,
+        };
+        drop(receiver);
+        drop(interest);
+    }
+
+    #[test]
+    fn topic_interest_drop_removes_only_its_own_topics() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let interest = super::APSInterestToken {
+            topics: vec!["com.apple.icloud-container.com.apple.imagent".to_owned()],
+            topics_channel: sender,
+        };
+        drop(interest);
+        assert_eq!(receiver.try_recv().unwrap(), (
+            vec!["com.apple.icloud-container.com.apple.imagent".to_owned()], false,
+        ));
+    }
 
     #[test]
     fn tries_standard_apns_before_https_fallback() {
