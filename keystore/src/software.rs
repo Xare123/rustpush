@@ -313,11 +313,20 @@ pub(crate) fn contained_gcm_decrypt(key: &[u8], text: &[u8]) -> Result<Vec<u8>, 
 
 impl<T: SoftwareKeystoreEncryptor> SoftwareKeystore<T> {
     fn get_key(&self, alias: &str) -> Result<SoftwareKeystoreKey, KeystoreError> {
-        let state = self.state.read().expect("Failed to read!");
-        let key = state.keys.get(alias).ok_or(KeystoreError::KeyNotFound)?;
+        self.get_key_if_present(alias)?
+            .ok_or(KeystoreError::KeyNotFound)
+    }
 
+    fn get_key_if_present(&self, alias: &str) -> Result<Option<SoftwareKeystoreKey>, KeystoreError> {
+        let state = self.state.read().expect("Failed to read!");
+        let Some(key) = state.keys.get(alias) else {
+            return Ok(None);
+        };
+
+        // A missing wrapping key is an error for a present entry, not permission to replace it.
         let cipher = self.encryptor.decrypt(&key.as_ref())?;
         plist::from_bytes(&cipher)
+            .map(Some)
             .map_err(|_| KeystoreError::KeystoreError("Invalid software key entry".to_string()))
     }
 
@@ -481,9 +490,7 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
     }
 
     fn get_key_type(&self, alias: &str) -> Result<Option<KeyType>, KeystoreError> {
-        let state = self.get_key(alias).ok();
-
-        Ok(state.map(|k| k.get_type()))
+        Ok(self.get_key_if_present(alias)?.map(|key| key.get_type()))
     }
 
     fn get_public_key(&self, alias: &str) -> Result<Vec<u8>, KeystoreError> {
@@ -576,6 +583,128 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LookupOnlyEncryptor<T>(T);
+
+    impl<T: SoftwareKeystoreEncryptor> SoftwareKeystoreEncryptor for LookupOnlyEncryptor<T> {
+        fn encrypt(&self, _data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            panic!("lookup must not wrap a replacement key")
+        }
+
+        fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            self.0.decrypt(data)
+        }
+    }
+
+    struct MissingWrappingKey;
+
+    impl SoftwareKeystoreEncryptor for MissingWrappingKey {
+        fn encrypt(&self, _data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            panic!("missing wrapping key must not be replaced")
+        }
+
+        fn decrypt(&self, _data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            Err(KeystoreError::KeyNotFound)
+        }
+    }
+
+    fn lookup_store<T: SoftwareKeystoreEncryptor>(
+        wrapped: Vec<u8>,
+        encryptor: T,
+    ) -> SoftwareKeystore<LookupOnlyEncryptor<T>> {
+        SoftwareKeystore {
+            state: RwLock::new(SoftwareKeystoreState {
+                keys: HashMap::from([("test:restored".to_string(), wrapped.into())]),
+                secrets: HashMap::new(),
+            }),
+            update_state: Box::new(|_| panic!("lookup must not persist replacement state")),
+            encryptor: LookupOnlyEncryptor(encryptor),
+        }
+    }
+
+    #[test]
+    fn get_key_type_returns_none_only_for_absent_alias() {
+        let store = lookup_store(vec![1, 2, 3], MissingWrappingKey);
+        assert!(matches!(store.get_key_type("test:absent"), Ok(None)));
+        assert!(matches!(
+            store.get_key("test:absent"),
+            Err(KeystoreError::KeyNotFound)
+        ));
+        assert!(matches!(
+            store.get_key_type("test:restored"),
+            Err(KeystoreError::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn missing_wrapping_key_does_not_trigger_replacement() {
+        let encoded = plist_to_bin(&SoftwareKeystoreKey::Aes(vec![9; 32])).unwrap();
+        let wrapped = SoftwareEncryptor([1; 32]).encrypt(&encoded).unwrap();
+        let store = lookup_store(wrapped, MissingWrappingKey);
+        let before = plist_to_bin(&*store.state.read().unwrap()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                store.ensure_exists("test:restored", KeyType::Aes(256), Default::default()),
+                Err(KeystoreError::KeyNotFound)
+            ));
+        }
+        assert_eq!(plist_to_bin(&*store.state.read().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn unreadable_software_entries_do_not_trigger_replacement() {
+        let encoded = plist_to_bin(&SoftwareKeystoreKey::Aes(vec![9; 32])).unwrap();
+        let cases = [
+            (
+                SoftwareEncryptor([1; 32]).encrypt(&encoded).unwrap(),
+                "Software-encryption authentication failed",
+            ),
+            (
+                SoftwareEncryptor([2; 32])
+                    .encrypt(b"invalid plist")
+                    .unwrap(),
+                "Invalid software key entry",
+            ),
+        ];
+        for (wrapped, expected) in cases {
+            let store = lookup_store(wrapped, SoftwareEncryptor([2; 32]));
+            let before = plist_to_bin(&*store.state.read().unwrap()).unwrap();
+            assert!(matches!(
+                store.get_key_type("test:restored"),
+                Err(KeystoreError::KeystoreError(message)) if message == expected
+            ));
+            for _ in 0..2 {
+                assert!(matches!(
+                    store.ensure_exists("test:restored", KeyType::Aes(256), Default::default()),
+                    Err(KeystoreError::KeystoreError(message)) if message == expected
+                ));
+            }
+            assert_eq!(plist_to_bin(&*store.state.read().unwrap()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn valid_software_entry_is_reused() {
+        let encoded = plist_to_bin(&SoftwareKeystoreKey::Aes(vec![9; 32])).unwrap();
+        let encryptor = SoftwareEncryptor([1; 32]);
+        let store = lookup_store(encryptor.encrypt(&encoded).unwrap(), encryptor);
+        let before = plist_to_bin(&*store.state.read().unwrap()).unwrap();
+        assert!(matches!(
+            store.get_key_type("test:restored"),
+            Ok(Some(KeyType::Aes(256)))
+        ));
+        store
+            .ensure_exists("test:restored", KeyType::Aes(256), Default::default())
+            .unwrap();
+        let ciphertext =
+            Keystore::encrypt(&store, "test:restored", b"synthetic", &mut EncryptMode::Gcm)
+                .unwrap();
+        assert_eq!(
+            Keystore::decrypt(&store, "test:restored", &ciphertext, &EncryptMode::Gcm).unwrap(),
+            b"synthetic"
+        );
+        assert_eq!(plist_to_bin(&*store.state.read().unwrap()).unwrap(), before);
+    }
 
     #[test]
     fn contained_gcm_rejects_truncated_and_tampered_payloads() {
