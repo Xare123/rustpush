@@ -39,6 +39,13 @@ pub enum PushError {
     SSLError(#[from] ErrorStack),
     #[error("Plist parsing error: {0}")]
     PlistError(#[from] plist::Error),
+    #[error("Apple sign-in received an unusable response (stage={stage}; status={status}; reason={reason}; bytes={bytes}). No sign-in data was accepted from this response.")]
+    AppleAuthResponse {
+        stage: &'static str,
+        status: u16,
+        reason: &'static str,
+        bytes: usize,
+    },
     #[error("HTTP error: {0}")]
     RequestError(#[from] reqwest::Error),
     #[error("Authentication error error: {0:?}")]

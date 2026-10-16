@@ -69,18 +69,25 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
             return Err(PushError::StatusError(content.status()));
         }
 
-        #[derive(Deserialize)]
-        struct BagBody {
-            bag: Data,
-        }
-        let parsed: BagBody = plist::from_bytes(&content.bytes().await?)?;
-        let dict: Dictionary = plist::from_bytes(parsed.bag.as_ref())?;
+        let response = crate::auth::auth_response::AuthResponse::read("apple-service-bag", content).await?;
+        let dict = parse_service_bag(&response)?;
 
         locked.insert(url.to_string(), dict);
     }
 
     let bag = locked.get(url).unwrap();
     bag.get(item).cloned().ok_or(PushError::BagKeyNotFound)
+}
+
+pub(crate) fn parse_service_bag(
+    response: &crate::auth::auth_response::AuthResponse,
+) -> Result<Dictionary, PushError> {
+    let bag = response.dictionary.get("bag").and_then(Value::as_data)
+        .ok_or_else(|| response.failure("missing-bag"))?;
+    if bag.is_empty() {
+        return Err(response.failure("empty-bag"));
+    }
+    plist::from_bytes(bag).map_err(|_| response.failure("invalid-bag"))
 }
 
 pub struct DebugGuard<'a, T>(MutexGuard<'a, T>, Location<'a>, u16, u16);

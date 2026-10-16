@@ -81,6 +81,10 @@ use crate::{
     APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError,
 };
 
+#[path = "auth_response.rs"]
+pub(crate) mod auth_response;
+use auth_response::AuthResponse;
+
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct AuthRequest {
@@ -1202,13 +1206,15 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
         .body(plist_to_string(&request)?)
         .send()
         .await?;
-    let text = resp.text().await?;
+    let response = AuthResponse::read("icloud-delegates", resp).await?;
+    parse_apple_delegates(&response)
+}
 
-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-    let parsed_dict = parsed.as_dictionary().unwrap();
+fn parse_apple_delegates(response: &AuthResponse) -> Result<DelegateResponses, PushError> {
+    let parsed_dict = &response.dictionary;
 
     if let Some(error) = parsed_dict.get("localizedError") {
-        let error = error.as_string().unwrap();
+        let error = error.as_string().ok_or_else(|| response.failure("invalid-localized-error"))?;
         if error == "UNAUTHORIZED" {
             return Err(PushError::UnauthorizedAccountError);
         }
@@ -1220,19 +1226,17 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
         ));
     }
 
-    if parsed_dict
-        .get("status")
-        .unwrap()
-        .as_unsigned_integer()
-        .unwrap()
-        != 0
-    {
-        return Err(PushError::AuthError(parsed.clone()));
+    let status = parsed_dict.get("status").and_then(Value::as_signed_integer)
+        .ok_or_else(|| response.failure("invalid-status"))?;
+    if status != 0 {
+        return Err(PushError::AuthError(Value::Dictionary(parsed_dict.clone())));
     }
+    response.require_http_success()?;
 
     fn get_delegate<T: DeserializeOwned>(
         delegates: &Dictionary,
         delegate: &str,
+        auth_response: &AuthResponse,
     ) -> Result<Option<T>, PushError> {
         let Some(value) = delegates.get(delegate) else {
             return Ok(None);
@@ -1246,30 +1250,38 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
             status_message: Option<String>,
         }
 
-        let response: DelegateResponse = plist::from_value(&value)?;
+        let response: DelegateResponse = plist::from_value(&value)
+            .map_err(|_| auth_response.failure("invalid-delegate-response"))?;
+
+        if response.status != 0 {
+            return Err(PushError::DelegateLoginFailed(
+                delegate.to_string(), response.status,
+                response.status_message.unwrap_or("No msg".to_string()),
+            ));
+        }
 
         let data = response.service_data.ok_or(PushError::DelegateLoginFailed(
             delegate.to_string(),
             response.status,
             response.status_message.unwrap_or("No msg".to_string()),
         ))?;
-        Ok(Some(plist::from_value(&data)?))
+        Ok(Some(plist::from_value(&data)
+            .map_err(|_| auth_response.failure("invalid-delegate-data"))?))
     }
 
     let delegates = parsed_dict
         .get("delegates")
-        .unwrap()
-        .as_dictionary()
-        .unwrap();
+        .and_then(Value::as_dictionary)
+        .ok_or_else(|| response.failure("invalid-delegates"))?;
 
-    let mut mme: Option<MobileMeDelegateResponse> = get_delegate(delegates, "com.apple.mobileme")?;
+    let mut mme: Option<MobileMeDelegateResponse> = get_delegate(delegates, "com.apple.mobileme", response)?;
 
     if let Some(mme) = &mut mme {
-        mme.config = get_delegate(delegates, "com.apple.mobileme")?.expect("No MME??");
+        mme.config = get_delegate(delegates, "com.apple.mobileme", response)?.expect("No MME??");
     }
 
     Ok(DelegateResponses {
-        ids: get_delegate(delegates, "com.apple.private.ids")?,
+        ids: get_delegate(delegates, "com.apple.private.ids", response)?,
         mobileme: mme,
     })
 }
@@ -1284,8 +1296,25 @@ struct AuthCertRequest {
 
 #[derive(Deserialize)]
 struct AuthCertResponse {
-    status: u64,
-    cert: Data,
+    status: i64,
+    cert: Option<Data>,
+}
+
+fn parse_auth_certificate(response: &AuthResponse) -> Result<Vec<u8>, PushError> {
+    let parsed: AuthCertResponse = plist::from_value(&Value::Dictionary(response.dictionary.clone()))
+        .map_err(|_| response.failure("invalid-certificate-response"))?;
+    if parsed.status != 0 {
+        return Err(PushError::CertError(response.dictionary.clone()));
+    }
+    response.require_http_success()?;
+    if response.dictionary.contains_key("localizedError") {
+        return Err(response.failure("unexpected-certificate-error"));
+    }
+    let cert: Vec<u8> = parsed.cert.ok_or_else(|| response.failure("missing-certificate"))?.into();
+    if cert.is_empty() {
+        return Err(response.failure("empty-certificate"));
+    }
+    Ok(cert)
 }
 
 fn generate_auth_csr(user_id: &str) -> Result<(RsaKey, Vec<u8>), PushError> {
@@ -1364,17 +1393,13 @@ async fn authenticate(
         .header("content-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&auth_cert)?)?)
         .send()
-        .await?
-        .bytes()
         .await?;
 
-    let parsed: AuthCertResponse = plist::from_bytes(&resp)?;
-    if parsed.status != 0 {
-        return Err(PushError::CertError(plist::from_bytes(&resp)?));
-    }
+    let response = AuthResponse::read("ids-auth-certificate", resp).await?;
+    let cert = parse_auth_certificate(&response)?;
 
     let keypair = KeyPairNew {
-        cert: parsed.cert.into(),
+        cert,
         private: key,
     };
 
