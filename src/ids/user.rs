@@ -1138,6 +1138,7 @@ impl IDSUser {
             spam_messages: Vec<IDSReportedMessage>,
         }
 
+        let push_token = aps.try_get_token().await.ok_or(PushError::NotConnected)?;
         let request = SignedRequest::new("id-report-spam", Method::POST)
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header(
@@ -1148,7 +1149,7 @@ impl IDSUser {
                 ),
             )
             .header("x-id-self-uri", handle)
-            .header("x-push-token", &base64_encode(&aps.get_token().await))
+            .header("x-push-token", &base64_encode(&push_token))
             .header("content-encoding", "gzip")
             .body(gzip(&plist_to_buf(&IDSReport {
                 spam_messages: messages
@@ -1229,13 +1230,15 @@ impl IDSUser {
             uris: query.to_vec(),
         })?;
 
+        let push_token = aps.try_get_token().await.ok_or(PushError::NotConnected)?;
+
         let mut request = options
             .add_headers(SignedRequest::new(
                 "id-query",
                 Method::GET, /* unused */
             ))
             .header("x-id-self-uri", handle)
-            .header("x-push-token", &base64_encode(&aps.get_token().await))
+            .header("x-push-token", &base64_encode(&push_token))
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header(
                 "user-agent",

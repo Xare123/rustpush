@@ -965,12 +965,13 @@ impl EntitlementAuthState {
             })
         };
 
+        let client_nonce = base64_encode(&aps.try_get_token().await.ok_or(PushError::NotConnected)?);
         let response = entitlements
             .invoke(
                 &[
                     auth_challenge,
                     json!({
-                        "client-nonce": base64_encode(&aps.get_token().await),
+                        "client-nonce": client_nonce,
                         "action-name": "getPhoneNumber",
                         "request-id": starting_id + 1,
                     }),

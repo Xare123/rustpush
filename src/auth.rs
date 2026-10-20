@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aes::{cipher::consts::U16, Aes128};
@@ -1141,6 +1141,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
     os_config: &dyn OSConfig,
     delegates: &[LoginDelegate],
 ) -> Result<DelegateResponses, PushError> {
+    let started = Instant::now();
     let Some(pet) = account.get_pet() else {
         panic!("No pet!")
     };
@@ -1164,7 +1165,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
     //     password: pet.to_string()
     // };
 
-    let request = V2AuthRequest {
+    let mut request = V2AuthRequest {
         delegates: Value::Dictionary(Dictionary::from_iter(
             delegates.iter().map(|d| d.delegate()),
         )),
@@ -1176,19 +1177,37 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
         },
     };
 
-    let validation_data = os_config.generate_validation_data().await?;
+    // Account signing is separate from IDS/device NAC. Generate the account
+    // qualifier first so the fresh authentication headers do not age while it runs.
+    let validation_data = account_delegate_validation(&account.anisette, os_config.generate_validation_data()).await?;
 
-    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
-    let mut anisette_headers: HeaderMap = base_headers
-        .into_iter()
-        .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
-        .collect();
+    // Request fresh proof for this service-authorization exchange, keeping the
+    // same provider and identity used by password authentication.
+    let (base_headers, provider_client_info, provider_client_id, omit_validation) = {
+        let mut anisette = account.anisette.lock().await;
+        let headers = anisette.get_fresh_headers().await?.clone();
+        let context = anisette.provider.delegate_client_info(&os_config.get_aoskit_version());
+        let client_id = anisette.provider.delegate_client_id();
+        let omit_validation = anisette.provider.omit_delegate_validation();
+        (headers, context, client_id, omit_validation)
+    };
+    apply_delegate_client_id(&mut request, provider_client_id);
+    let body = plist_to_string(&request)?;
+    let client_info = delegate_client_info(
+        provider_client_info, os_config.get_mme_clientinfo(&os_config.get_aoskit_version()));
+    let mut anisette_headers = delegate_anisette_headers(base_headers);
 
     if let Some(cookie) = cookie {
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
-    let resp = REQWEST
+    // Fixed metadata only. Never log credentials, headers, identity, or body.
+    info!(target: "rustpush::auth::delegate_diagnostic",
+        "delegate_request pet_remaining_s={} validation_bytes={} preparation_ms={}",
+        account.pet_remaining_lifetime().map(|value| value.as_secs()).unwrap_or(0),
+        validation_data.len(), started.elapsed().as_millis());
+
+    let mut request_builder = REQWEST
         .post(os_config.get_login_url())
         .header("Accept-Encoding", "gzip")
         .header(
@@ -1197,21 +1216,245 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(
         )
         .header(
             "X-Mme-Client-Info",
-            os_config.get_mme_clientinfo(&os_config.get_aoskit_version()),
-        )
-        .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
+            client_info,
+        );
+    if !omit_validation {
+        request_builder = request_builder
+            .header("X-Mme-Nas-Qualify", base64_encode(&validation_data));
+    }
+    let request_builder = request_builder
         .header("X-Apple-ADSID", adsid)
         .headers(anisette_headers.clone())
-        .basic_auth(username, Some(pet))
-        .body(plist_to_string(&request)?)
+        .basic_auth(username, Some(pet));
+    let resp = delegate_serialized_plist_body(request_builder, body)
         .send()
         .await?;
+    info!(target: "rustpush::auth::delegate_diagnostic",
+        "delegate_response status={} origin={} elapsed_ms={}",
+        resp.status().as_u16(), delegate_response_origin(resp.url()), started.elapsed().as_millis());
     let response = AuthResponse::read("icloud-delegates", resp).await?;
     parse_apple_delegates(&response)
 }
 
+async fn account_delegate_validation<T: AnisetteProvider>(
+    anisette: &omnisette::ArcAnisetteClient<T>,
+    legacy_nac: impl std::future::Future<Output = Result<Vec<u8>, PushError>>,
+) -> Result<Vec<u8>, PushError> {
+    let native = anisette.lock().await.provider.native_account_validation_data().await?;
+    match native {
+        Some(proof) if !proof.is_empty() && proof.len() <= 4096 => Ok(proof),
+        Some(_) => Err(omnisette::AnisetteError::NativeRelayUnavailable("invalid-account-qualifier").into()),
+        None => legacy_nac.await,
+    }
+}
+
+fn delegate_client_info(provider: Option<String>, activation: String) -> String {
+    provider.unwrap_or(activation)
+}
+
+fn apply_delegate_client_id(request: &mut V2AuthRequest, provider: Option<String>) {
+    if let Some(client_id) = provider {
+        request.user_info.client_id = client_id;
+    }
+}
+
+#[cfg(test)]
+fn delegate_plist_body(builder: RequestBuilder, request: &V2AuthRequest) -> Result<RequestBuilder, PushError> {
+    Ok(delegate_serialized_plist_body(builder, plist_to_string(request)?))
+}
+
+fn delegate_serialized_plist_body(builder: RequestBuilder, body: String) -> RequestBuilder {
+    builder
+        .header("Content-Type", "text/plist")
+        .header("Accept", "application/x-plist")
+        .body(body)
+}
+
+fn delegate_anisette_headers(base_headers: HashMap<String, String>) -> HeaderMap {
+    base_headers.into_iter()
+        // The service owns its AOSKit context. Generic AuthKit/ADI metadata must
+        // not replace it when reqwest merges headers; retain every proof field.
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("X-Mme-Client-Info"))
+        .map(|(name, value)| (HeaderName::from_str(&name).unwrap(), value.parse().unwrap()))
+        .collect()
+}
+
+fn delegate_response_origin(url: &reqwest::Url) -> &'static str {
+    if url.scheme() == "https" && url.host_str() == Some("setup.icloud.com")
+        && url.port_or_known_default() == Some(443) {
+        "expected"
+    } else {
+        "changed"
+    }
+}
+
+#[cfg(test)]
+mod delegate_diagnostic_tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    struct NativeValidationProvider { result: u8 }
+    impl AnisetteProvider for NativeValidationProvider {
+        async fn get_anisette_headers(&mut self) -> Result<HashMap<String,String>,omnisette::AnisetteError> {
+            panic!("This selection test must not generate headers or contact a device")
+        }
+        async fn native_account_validation_data(&mut self) -> Result<Option<Vec<u8>>,omnisette::AnisetteError> {
+            match self.result {
+                0 => Ok(None), 1 => Ok(Some(vec![7;261])), 2 => Ok(Some(Vec::new())),
+                _ => Err(omnisette::AnisetteError::NativeRelayUnavailable("synthetic-failure")),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_account_qualifier_never_polls_nac_fallback() {
+        let anisette=Arc::new(Mutex::new(omnisette::AnisetteClient::new(NativeValidationProvider {result:1})));
+        let proof=account_delegate_validation(&anisette,async {panic!("NAC must remain separate")}).await.unwrap();
+        assert_eq!(proof.len(),261);
+    }
+    #[tokio::test]
+    async fn legacy_provider_keeps_the_original_nac_path() {
+        let anisette=Arc::new(Mutex::new(omnisette::AnisetteClient::new(NativeValidationProvider {result:0})));
+        assert_eq!(account_delegate_validation(&anisette,async {Ok(vec![9;4])}).await.unwrap(),vec![9;4]);
+    }
+    #[tokio::test]
+    async fn native_failure_or_empty_proof_cannot_fall_back_to_nac() {
+        for result in [2,3] {
+            let anisette=Arc::new(Mutex::new(omnisette::AnisetteClient::new(NativeValidationProvider {result})));
+            assert!(account_delegate_validation(&anisette,async {panic!("Must not change proof source after failure")}).await.is_err());
+        }
+    }
+
+    #[test]
+    fn provider_client_id_changes_only_the_explicit_request_body_field() {
+        let mut request = V2AuthRequest {
+            delegates: Value::Dictionary(Dictionary::from_iter(
+                [LoginDelegate::IDS, LoginDelegate::MobileMe].iter().map(|d| d.delegate()))),
+            protocol_version: "1.0".into(),
+            user_info: V2AuthUserInfo {
+                client_id: "SYNTHETIC-PER-REQUEST".into(),
+                language: "en-US".into(), timezone: "America/New_York".into(),
+            },
+        };
+        let original = plist_to_string(&request).unwrap();
+        apply_delegate_client_id(&mut request, None);
+        assert_eq!(plist_to_string(&request).unwrap(), original);
+        let id = "C71605D9-4E49-401A-8B9F-AD8BE80F766C";
+        apply_delegate_client_id(&mut request, Some(id.into()));
+        let mut expected: Value = plist::from_bytes(original.as_bytes()).unwrap();
+        expected.as_dictionary_mut().unwrap().get_mut("userInfo").unwrap()
+            .as_dictionary_mut().unwrap().insert("client-id".into(), Value::String(id.into()));
+        let actual: Value = plist::from_bytes(plist_to_string(&request).unwrap().as_bytes()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn explicit_provider_delegate_context_preserves_default_and_proof_headers() {
+        assert_eq!(delegate_client_info(None, "synthetic-activation".into()), "synthetic-activation");
+        let context = delegate_client_info(Some("synthetic-provider-service".into()), "synthetic-activation".into());
+        let base = HashMap::from_iter([
+            ("X-Mme-Client-Info".into(), "synthetic-generic-context".into()),
+            ("X-Apple-I-MD".into(), "synthetic-proof".into()),
+            ("X-Mme-Device-Id".into(), "synthetic-existing-identity".into()),
+        ]);
+        let request = Client::new().post("https://example.invalid/setup/signin/v2/login")
+            .header("X-Mme-Client-Info", context)
+            .header("X-Mme-Nas-Qualify", "synthetic-validation")
+            .header("X-Apple-ADSID", "synthetic-account")
+            .headers(delegate_anisette_headers(base))
+            .basic_auth("fixture@example.invalid", Some("synthetic-pet"))
+            .build().unwrap();
+        assert_eq!(request.headers()["X-Mme-Client-Info"], "synthetic-provider-service");
+        assert_eq!(request.headers().get_all("X-Mme-Client-Info").iter().count(), 1);
+        assert_eq!(request.headers()["X-Apple-I-MD"], "synthetic-proof");
+        assert_eq!(request.headers()["X-Mme-Device-Id"], "synthetic-existing-identity");
+        assert_eq!(request.headers()["X-Mme-Nas-Qualify"], "synthetic-validation");
+        assert_eq!(request.headers()["X-Apple-ADSID"], "synthetic-account");
+        assert!(request.headers().contains_key("Authorization"));
+    }
+
+    #[test]
+    fn delegate_request_declares_plist_without_changing_auth_or_payload() {
+        let payload = V2AuthRequest {
+            delegates: Value::Dictionary(Dictionary::from_iter(
+                [LoginDelegate::IDS, LoginDelegate::MobileMe].iter().map(|d| d.delegate()))),
+            protocol_version: "1.0".into(),
+            user_info: V2AuthUserInfo {
+                client_id: "SYNTHETIC-CLIENT".into(),
+                language: "en-US".into(),
+                timezone: "America/New_York".into(),
+            },
+        };
+        let request = delegate_plist_body(Client::new()
+            .post("https://example.invalid/setup/signin/v2/login")
+            .header("X-Mme-Nas-Qualify", "synthetic-validation")
+            .header("X-Apple-ADSID", "synthetic-account")
+            .basic_auth("fixture@example.invalid", Some("synthetic-pet")), &payload)
+            .unwrap().build().unwrap();
+        assert_eq!(request.headers().get("Content-Type").and_then(|v| v.to_str().ok()), Some("text/plist"));
+        assert_eq!(request.headers().get("Accept").and_then(|v| v.to_str().ok()), Some("application/x-plist"));
+        assert_eq!(request.headers()["X-Mme-Nas-Qualify"], "synthetic-validation");
+        assert_eq!(request.headers()["X-Apple-ADSID"], "synthetic-account");
+        assert!(request.headers().contains_key("Authorization"));
+        let body = request.body().unwrap().as_bytes().unwrap();
+        assert_eq!(body, plist_to_string(&payload).unwrap().as_bytes());
+        let parsed: Value = plist::from_bytes(body).unwrap();
+        let delegates = parsed.as_dictionary().unwrap()["delegates"].as_dictionary().unwrap();
+        assert!(delegates.contains_key("com.apple.private.ids"));
+        assert!(delegates.contains_key("com.apple.mobileme"));
+    }
+
+    #[test]
+    fn delegate_headers_preserve_explicit_service_context_and_proofs() {
+        for name in ["X-Mme-Client-Info", "x-mme-client-info", "X-MME-CLIENT-INFO"] {
+            let base = HashMap::from_iter([
+                (name.into(), "synthetic-authkit-context".into()),
+                ("X-Apple-I-MD".into(), "synthetic-onetime-proof".into()),
+                ("X-Apple-I-MD-M".into(), "synthetic-machine-proof".into()),
+                ("X-Apple-I-MD-LU".into(), "synthetic-local-id".into()),
+                ("X-Apple-I-MD-RINFO".into(), "synthetic-routing".into()),
+                ("X-Mme-Device-Id".into(), "synthetic-device-id".into()),
+            ]);
+            let headers = delegate_anisette_headers(base.clone());
+            let request = Client::new().post("https://example.invalid")
+                .header("X-Mme-Client-Info", "synthetic-aoskit-context")
+                .header("X-Mme-Nas-Qualify", "synthetic-validation")
+                .headers(headers)
+                .basic_auth("fixture@example.invalid", Some("synthetic-pet"))
+                .build().unwrap();
+            assert_eq!(request.headers()["X-Mme-Client-Info"], "synthetic-aoskit-context");
+            assert_eq!(request.headers().get_all("X-Mme-Client-Info").iter().count(), 1);
+            for (name, value) in base {
+                if !name.eq_ignore_ascii_case("X-Mme-Client-Info") {
+                    assert_eq!(request.headers()[name], value);
+                }
+            }
+            assert_eq!(request.headers()["X-Mme-Nas-Qualify"], "synthetic-validation");
+            assert!(request.headers().contains_key("Authorization"));
+        }
+    }
+
+    #[test]
+    fn origin_is_classified_without_logging_any_url_data() {
+        for url in ["https://setup.icloud.com/setup/signin/v2/login", "https://setup.icloud.com:443/private?secret=do-not-log"] {
+            assert_eq!(delegate_response_origin(&url.parse().unwrap()), "expected");
+        }
+        for url in ["http://setup.icloud.com", "https://setup.icloud.com:444", "https://example.com/?account=private", "https://setup.icloud.com.example.com"] {
+            assert_eq!(delegate_response_origin(&url.parse().unwrap()), "changed");
+        }
+    }
+}
+
 fn parse_apple_delegates(response: &AuthResponse) -> Result<DelegateResponses, PushError> {
     let parsed_dict = &response.dictionary;
+
+    // Fixed numeric metadata only. The localized error text and description
+    // are server-controlled strings and stay out of diagnostic logs.
+    info!(target: "rustpush::auth::delegate_diagnostic",
+        "delegate_body status={} localized_error_present={} description_present={}",
+        parsed_dict.get("status").and_then(Value::as_signed_integer)
+            .map(|status| status.to_string()).unwrap_or_else(|| "absent".to_string()),
+        parsed_dict.contains_key("localizedError"),
+        parsed_dict.contains_key("description"));
 
     if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().ok_or_else(|| response.failure("invalid-localized-error"))?;
@@ -1512,7 +1755,7 @@ pub async fn authenticate_smsless(
     }
 
     let users = AuthMultipleUsers {
-        push_token: aps.get_token().await.to_vec().into(),
+        push_token: aps.try_get_token().await.ok_or(PushError::NotConnected)?.to_vec().into(),
         authentication_requests: vec![request],
     };
 

@@ -1947,9 +1947,12 @@ impl APSConnectionResource {
                         let Some(upgrade) = ack_ref.upgrade() else {
                             break;
                         };
+                        let Some(token) = upgrade.try_get_token().await else {
+                            continue;
+                        };
                         let _ = upgrade
                             .send(APSMessage::Ack {
-                                token: Some(upgrade.get_token().await),
+                                token: Some(token),
                                 for_id: id,
                                 status: 0,
                             })
@@ -2029,11 +2032,13 @@ impl APSConnectionResource {
         (resource, err)
     }
 
+    pub async fn try_get_token(&self) -> Option<[u8; 32]> {
+        self.state.read().await.token
+    }
+
     pub async fn get_token(&self) -> [u8; 32] {
-        self.state
-            .read()
+        self.try_get_token()
             .await
-            .token
             .expect("Token not found; re-enter device details if persistent")
     }
 
@@ -2097,6 +2102,13 @@ impl APSConnectionResource {
             state.token = Some(token);
         }
 
+        // A connect response can report success without issuing a token.
+        // Fail closed instead of entering a half-connected state whose
+        // later token reads panic across the FFI boundary.
+        if state.token.is_none() {
+            return Err(PushError::NotConnected);
+        }
+
         drop(state);
         info!("Sending");
         self.send(APSMessage::SetState { state: 1 }).await?;
@@ -2123,7 +2135,7 @@ impl APSConnectionResource {
         self.send(APSMessage::Notification {
             id: my_id,
             topic: sha1(topic.as_bytes()),
-            token: Some(self.get_token().await),
+            token: Some(self.try_get_token().await.ok_or(PushError::NotConnected)?),
             payload: plist::to_value(&data)?,
             channel: None,
         })
@@ -2274,7 +2286,7 @@ impl APSConnectionResource {
         };
 
         let receiver = self.subscribe().await;
-        let token = self.get_token().await;
+        let token = self.try_get_token().await.ok_or(PushError::NotConnected)?;
         let my_index = self.sub_counter.fetch_add(1, Ordering::Relaxed);
         self.send(APSMessage::SubscribeToChannels {
             token,
@@ -2312,7 +2324,7 @@ impl APSConnectionResource {
     ) -> Result<(), PushError> {
         debug!("Filtering to {enabled:?} {ignored:?} {opportunistic:?} {paused:?}");
         self.send(APSMessage::Filter {
-            token: Some(self.get_token().await),
+            token: Some(self.try_get_token().await.ok_or(PushError::NotConnected)?),
             enabled: enabled.iter().map(|i| sha1(i.as_bytes())).collect(),
             ignored: ignored.iter().map(|i| sha1(i.as_bytes())).collect(),
             opportunistic: opportunistic.iter().map(|i| sha1(i.as_bytes())).collect(),

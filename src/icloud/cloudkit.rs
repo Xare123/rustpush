@@ -4523,7 +4523,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     }
 
     pub async fn register_token(&self, conn: &APSConnection) -> Result<(), PushError> {
-        let token = conn.get_token().await;
+        let token = conn.try_get_token().await.ok_or(PushError::NotConnected)?;
         let op = TokenRegistrationOperation(TokenRegistrationRequest {
             registration: Some(TokenRegistration {
                 token: Some(token.to_vec()),

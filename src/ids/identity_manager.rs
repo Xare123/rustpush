@@ -133,7 +133,12 @@ impl CachedHandle {
         let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
         env.update(&user.registration[main_service].id_keypair.cert)
             .unwrap();
-        env.update(&conn.get_token().await).unwrap();
+        // Without a token the environment cannot match a connected
+        // session, so the resulting hash invalidates the cache instead
+        // of panicking.
+        if let Some(token) = conn.try_get_token().await {
+            env.update(&token).unwrap();
+        }
         let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
         if hash != self.env_hash {
             // invalidate cache
@@ -1451,9 +1456,10 @@ impl IdentityResource {
         );
 
         if ids_message.queue_id.is_none() {
-            // do not send to self
-            let my_token = self.aps.get_token().await;
-            message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
+            // do not send to self; without a token we cannot identify
+            // self, and the send itself requires a live APS connection.
+            let my_token = self.aps.try_get_token().await.ok_or(PushError::NotConnected)?;
+            message_targets.retain(|target| target.delivery_data.push_token != my_token);
         }
 
         let confirmation = SendConfirmation::new(

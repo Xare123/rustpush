@@ -5,10 +5,11 @@ use std::{
 
 use crate::{
     activation::ActivationInfo,
-    util::{base64_decode, REQWEST},
+    util::REQWEST,
     DebugMeta, OSConfig, PushError, RegisterMeta,
 };
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -44,6 +45,9 @@ pub struct RelayConfig {
     pub code: String,
     pub beeper_token: Option<String>,
     pub udid: Option<String>,
+    /// Persist the capability only, never the transient headers or signature.
+    #[serde(default)]
+    pub native_auth_v1: bool,
 }
 
 impl RelayConfig {
@@ -52,6 +56,14 @@ impl RelayConfig {
         code: &str,
         beeper_token: &Option<String>,
     ) -> Result<Versions, PushError> {
+        Ok(Self::get_versions_with_native_auth(host, code, beeper_token).await?.0)
+    }
+
+    pub async fn get_versions_with_native_auth(
+        host: &str,
+        code: &str,
+        beeper_token: &Option<String>,
+    ) -> Result<(Versions, bool), PushError> {
         let mut data = REQWEST
             .post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code)
@@ -69,9 +81,123 @@ impl RelayConfig {
             _status => return Err(PushError::RelayError(_status, result.text().await?)),
         }
 
-        let result: VersionsResp = result.json().await?;
+        // Extract only capability presence before deserializing the original
+        // six-field persistent type. Unknown proof fields are intentionally lost.
+        let value: serde_json::Value = result.json().await?;
+        let native_auth = has_native_auth_capability(&value);
+        let result: VersionsResp = serde_json::from_value(value)?;
+        Ok((result.versions, native_auth))
+    }
 
-        Ok(result.versions)
+    pub fn native_auth_config(&self) -> Option<omnisette::native_relay::NativeRelayConfig> {
+        self.native_auth_v1.then(|| omnisette::native_relay::NativeRelayConfig {
+            host: self.host.clone(), code: self.code.clone(), beeper_token: self.beeper_token.clone(),
+            identity: omnisette::native_relay::NativeRelayIdentity {
+                device_id: self.version.unique_device_id.clone(),
+                serial_number: self.version.serial_number.clone(),
+                hardware_version: self.version.hardware_version.clone(),
+            },
+        })
+    }
+
+    /// Replace only the relay transport for the same physical iPhone. Keep the
+    /// locally generated device UUID/UDID and protocol context. A new ticket
+    /// must not silently become a new activation identity.
+    pub fn native_replacement(&self, replacement: &Self) -> Option<Self> {
+        let old = &self.version;
+        let new = &replacement.version;
+        if !replacement.native_auth_v1
+            || old.unique_device_id.is_empty()
+            || old.serial_number.is_empty()
+            || old.hardware_version.is_empty()
+            || !old.unique_device_id.eq_ignore_ascii_case(&new.unique_device_id)
+            || old.serial_number != new.serial_number
+            || old.hardware_version != new.hardware_version
+        {
+            return None;
+        }
+        let mut retained = self.clone();
+        retained.version = replacement.version.clone();
+        retained.host = replacement.host.clone();
+        retained.code = replacement.code.clone();
+        retained.beeper_token = replacement.beeper_token.clone();
+        retained.native_auth_v1 = true;
+        Some(retained)
+    }
+}
+
+fn has_native_auth_capability(value: &serde_json::Value) -> bool {
+    value.pointer("/versions/ob_auth_capabilities").and_then(serde_json::Value::as_str) == Some("native-account-v1")
+        || value.pointer("/versions/ob_auth_bundle_v1").is_some()
+}
+
+fn decode_relay_validation(data: &str) -> Result<Vec<u8>, PushError> {
+    let invalid = || omnisette::AnisetteError::InvalidArgument("unusable relay device-validation data; saved device details were not reset".into());
+    if data.is_empty() || data.len() > 65_536 { return Err(invalid().into()); }
+    let bytes = STANDARD.decode(data).map_err(|_| invalid())?;
+    if bytes.is_empty() { return Err(invalid().into()); }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod native_auth_persistence_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn versions() -> serde_json::Value {
+        json!({"software_build_id":"synthetic-build","software_name":"iPhone OS",
+            "software_version":"synthetic-version","serial_number":"synthetic-serial",
+            "hardware_version":"synthetic-model","unique_device_id":"synthetic-device"})
+    }
+
+    #[test]
+    fn legacy_versions_discard_native_auth_extension_before_persistence() {
+        let mut wire=versions();
+        wire["ob_auth_bundle_v1"]=json!("synthetic-proof-must-not-persist");
+        wire["ob_auth_capabilities"]=json!("native-account-v1");
+        let response:VersionsResp=serde_json::from_value(json!({"versions":wire})).unwrap();
+        let saved=serde_json::to_value(response.versions).unwrap();
+        assert_eq!(saved,versions());
+        assert!(!saved.to_string().contains("synthetic-proof-must-not-persist"));
+    }
+
+    #[test]
+    fn native_capability_survives_temporary_proof_unavailability_without_legacy_fallback() {
+        let mut wire=json!({"versions":versions()});
+        assert!(!has_native_auth_capability(&wire));
+        wire["versions"]["ob_auth_capabilities"]=json!("native-account-v1");
+        assert!(has_native_auth_capability(&wire));
+        // No bundle was returned, but a native-capable helper must still select
+        // native mode so its failure occurs before SRP, not on another provider.
+        assert!(wire["versions"].get("ob_auth_bundle_v1").is_none());
+        wire["versions"].as_object_mut().unwrap().remove("ob_auth_capabilities");
+        wire["versions"]["ob_auth_bundle_v1"]=json!("");
+        assert!(has_native_auth_capability(&wire));
+    }
+
+    #[test]
+    fn device_validation_bytes_are_unchanged_and_bad_base64_returns_an_error_not_a_panic() {
+        let bytes=vec![1,2,3,4,5];
+        assert_eq!(decode_relay_validation(&STANDARD.encode(&bytes)).unwrap(),bytes);
+        for value in [String::new(),"not-base64".into(),"A".repeat(65_537)] {
+            assert!(decode_relay_validation(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn old_relay_config_defaults_to_legacy_and_new_config_persists_only_capability() {
+        let mut value=json!({"version":versions(),"icloud_ua":"synthetic-agent","aoskit_version":"synthetic-kit",
+            "dev_uuid":"synthetic-uuid","protocol_version":1660,"host":"https://relay.example",
+            "code":"synthetic-code","beeper_token":null,"udid":"synthetic-udid"});
+        let old:RelayConfig=serde_json::from_value(value.clone()).unwrap();
+        assert!(!old.native_auth_v1);
+        assert!(old.native_auth_config().is_none());
+        value["native_auth_v1"]=json!(true);
+        let new:RelayConfig=serde_json::from_value(value).unwrap();
+        assert!(new.native_auth_config().is_some());
+        let saved=serde_json::to_value(new).unwrap();
+        assert_eq!(saved["native_auth_v1"],json!(true));
+        assert!(saved["version"].get("ob_auth_bundle_v1").is_none());
     }
 }
 
@@ -185,7 +311,7 @@ impl OSConfig for RelayConfig {
 
         let result: DataResp = result.json().await?;
 
-        Ok(base64_decode(&result.data))
+        decode_relay_validation(&result.data)
     }
 
     fn get_register_meta(&self) -> RegisterMeta {

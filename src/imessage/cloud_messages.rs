@@ -2792,7 +2792,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let _setup = self.change_notification_setup.lock().await;
         if !self.change_notification_requested(nonce) { return Ok(false); }
         let (account_dsid, _) = self.validated_persisted_native_account_identifiers().await?;
-        let aps_token = conn.get_token().await;
+        let aps_token = conn.try_get_token().await.ok_or(PushError::NotConnected)?;
         if !self.change_notification_requested(nonce) { return Ok(false); }
         {
             let mut notifications = self.change_notifications.lock().unwrap_or_else(|e| e.into_inner());
@@ -2818,7 +2818,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let topic = format!("com.apple.icloud-container.{}", MESSAGES_CONTAINER.bundleid);
         let interest = conn.request_topics(&[topic.as_str()]).await;
         if self.validated_native_account_identifier().await? != account_dsid
-            || conn.get_token().await != aps_token {
+            || conn.try_get_token().await != Some(aps_token) {
             return Err(PushError::UnauthorizedAccountError);
         }
         Ok(self.change_notifications.lock().unwrap_or_else(|e| e.into_inner()).install(

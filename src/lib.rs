@@ -37,7 +37,8 @@ use std::fmt::Debug;
 
 pub use icloud_auth::{
     default_provider, AppleAccount, ArcAnisetteClient, DefaultAnisetteProvider,
-    GenerateVerificationTokenRequest, LoginClientInfo, LoginState, TrustedPhoneNumber, VerifyBody,
+    Error as AppleAuthError, GenerateVerificationTokenRequest, LoginClientInfo, LoginState,
+    TrustedPhoneNumber, VerifyBody,
 };
 
 use activation::ActivationInfo;
@@ -71,7 +72,7 @@ pub use imessage::messages::{
 };
 pub use imessage::name_photo_sharing;
 pub use mmcs::{prepare_put, FileContainer};
-pub use omnisette::{AnisetteError, AnisetteProvider};
+pub use omnisette::{native_relay_provider, AnisetteError, AnisetteProvider};
 use util::encode_hex;
 pub use util::{
     coder_decode_flattened, coder_encode_flattened, EntitlementAuthState, EntitlementsResponse,
