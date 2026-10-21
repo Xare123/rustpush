@@ -55,6 +55,10 @@ use crate::{
     OSConfig, PushError,
 };
 
+#[cfg(feature = "native-aps-qualification")]
+#[path = "aps_native_qualification.rs"]
+pub mod native_qualification;
+
 #[derive(Clone, Debug, PartialEq)]
 enum APSPackedValue {
     Data(Vec<u8>),
@@ -1731,6 +1735,24 @@ async fn open_socket(
     ),
     PushError,
 > {
+    open_socket_with_protocols(last_successful_ip, false).await
+}
+
+// Production keeps both existing protocols. The feature-gated, one-shot native
+// identity qualifier uses the same route, roots and TLS setup with raw framing.
+async fn open_socket_with_protocols(
+    last_successful_ip: Option<IpAddr>,
+    raw_only: bool,
+) -> Result<
+    (
+        TlsStream<TcpStream>,
+        Option<APSPackedEncoder>,
+        Option<APSPackedDecoder>,
+        u16,
+        IpAddr,
+    ),
+    PushError,
+> {
     let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!(
         "../certs/root/profileidentity.ess.apple.com.cert"
     )))?;
@@ -1743,7 +1765,11 @@ async fn open_socket(
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    config.alpn_protocols = vec!["apns-pack-v1".into(), "apns-security-v3".into()];
+    config.alpn_protocols = if raw_only {
+        vec!["apns-security-v3".into()]
+    } else {
+        vec!["apns-pack-v1".into(), "apns-security-v3".into()]
+    };
     config.check_selected_alpn = false;
     let connector = TlsConnector::from(Arc::new(config));
 

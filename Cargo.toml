@@ -8,6 +8,7 @@ remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-aniset
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]
 aps-proxy-test = []
+native-aps-qualification = []
 default = ["macos-validation-data"]
 
 [dependencies]
@@ -66,6 +67,11 @@ prost-build = { version = "0.12.0" }
 name = "rustpush-test"
 required-features = ["macos-validation-data"]
 path = "src/test.rs"
+
+[[bin]]
+name = "native-aps-qualifier"
+required-features = ["native-aps-qualification"]
+path = "src/bin/native_aps_qualifier.rs"
 
 [lib]
 name = "rustpush"

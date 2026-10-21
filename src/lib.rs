@@ -43,6 +43,8 @@ pub use icloud_auth::{
 
 use activation::ActivationInfo;
 pub use aps::{APSConnection, APSConnectionResource, APSMessage, APSState};
+#[cfg(feature = "native-aps-qualification")]
+pub use aps::native_qualification;
 use async_trait::async_trait;
 pub use auth::{
     authenticate_apple, authenticate_phone, authenticate_smsless, login_apple_delegates, AuthPhone,
