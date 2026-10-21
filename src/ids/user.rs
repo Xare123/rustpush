@@ -889,7 +889,7 @@ pub struct HandleProvisionAttributes {
 }
 
 impl IDSUser {
-    fn base_request(
+    async fn base_request(
         &self,
         aps: &APSState,
         bag: &'static str,
@@ -902,7 +902,7 @@ impl IDSUser {
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header("x-auth-user-id", &self.user_id)
             .sign(&self.auth_keypair, KeyType::Auth, aps, None)?
-            .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?)
+            .sign_push(aps).await?)
     }
 
     pub async fn provision_alias(
@@ -959,7 +959,7 @@ impl IDSUser {
                 &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?),
             )
             .body(gzip_normal(&plist_to_buf(&body)?)?)
-            .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
+            .sign_push(aps).await?;
 
         for topic in services.keys() {
             request = request.sign(
@@ -995,7 +995,7 @@ impl IDSUser {
 
     pub async fn get_handle_data(&self, aps: &APSState) -> Result<Vec<ResultHandle>, PushError> {
         let request = self
-            .base_request(aps, "id-get-handles")?
+            .base_request(aps, "id-get-handles").await?
             .send(&REQWEST)
             .await?
             .bytes()
@@ -1020,7 +1020,7 @@ impl IDSUser {
         aps: &APSState,
     ) -> Result<Vec<PrivateDeviceInfo>, PushError> {
         let request = self
-            .base_request(aps, "id-get-dependent-registrations")?
+            .base_request(aps, "id-get-dependent-registrations").await?
             .send(&REQWEST)
             .await?
             .bytes()
@@ -1482,14 +1482,7 @@ pub async fn register(
         .header("content-encoding", "gzip")
         .header("accept-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&body)?)?)
-        .sign(
-            aps.keypair
-                .as_ref()
-                .ok_or(PushError::APSNotReady("keypair"))?,
-            KeyType::Push,
-            aps,
-            None,
-        )?;
+        .sign_push(aps).await?;
 
     for (idx, user) in users.iter().enumerate() {
         request = request

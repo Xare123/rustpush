@@ -1566,11 +1566,49 @@ pub fn new_aps_id() -> i32 {
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct APSState {
     #[serde(
+        default,
         serialize_with = "bin_serialize_opt",
         deserialize_with = "bin_deserialize_opt"
     )]
     pub token: Option<[u8; 32]>,
     pub keypair: Option<KeyPairNew<RsaKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_push: Option<crate::native_push::NativePushIdentity>,
+    // Runtime transport is restored from the independently persisted OSConfig.
+    // Tickets and access credentials must not leak into the APS state.
+    #[serde(skip)]
+    pub native_transport: Option<crate::native_push::NativePushTransport>,
+}
+
+impl APSState {
+    pub fn has_push_identity(&self) -> bool {
+        match (&self.keypair,&self.native_push) {
+            (Some(_),None) => true,
+            (None,Some(identity)) => !identity.device_id.is_empty() && !identity.device_uuid.is_empty()
+                && crate::native_push::certificate_public_key(&identity.certificate).is_ok(),
+            _ => false,
+        }
+    }
+    pub async fn sign_push_connect(&self, nonce:&[u8]) -> Result<(Vec<u8>,Vec<u8>),PushError> {
+        match (&self.keypair,&self.native_push) {
+            (Some(pair),None) => Ok((pair.cert.clone(),do_ids_signature(&pair.private,nonce)?)),
+            (None,Some(identity)) => {
+                let transport=self.native_transport.as_ref().ok_or(PushError::APSNotReady("native transport"))?;
+                Ok((identity.certificate.clone(),transport.sign_connect(identity,nonce).await?))
+            },
+            _ => Err(PushError::APSNotReady("push identity")),
+        }
+    }
+    pub async fn sign_push_http(&self,nonce:&[u8],bag:&str,payload:&[u8]) -> Result<(Vec<u8>,Vec<u8>),PushError> {
+        match (&self.keypair,&self.native_push) {
+            (Some(pair),None) => Ok((pair.cert.clone(),do_ids_signature(&pair.private,payload)?)),
+            (None,Some(identity)) => {
+                let transport=self.native_transport.as_ref().ok_or(PushError::APSNotReady("native transport"))?;
+                Ok((identity.certificate.clone(),transport.sign_http(identity,nonce,bag,payload).await?))
+            },
+            _ => Err(PushError::APSNotReady("push identity")),
+        }
+    }
 }
 
 pub struct APSInterestToken {
@@ -2085,21 +2123,28 @@ impl APSConnectionResource {
         let mut state = self.state.write().await;
         info!("Locked state");
 
-        if state.keypair.is_none() {
+        if state.keypair.is_some() && state.native_push.is_some() {
+            return Err(PushError::APSNotReady("ambiguous push identity"));
+        }
+        state.native_transport=self.os_config.native_push_transport();
+        if let Some(identity)=&state.native_push {
+            let transport=state.native_transport.as_ref().ok_or(PushError::APSNotReady("native transport"))?;
+            if !identity.matches(transport) { return Err(PushError::APSNotReady("native owner")); }
+        } else if state.keypair.is_none() && state.native_transport.is_some() {
+            state.native_push=Some(state.native_transport.as_ref().ok_or(PushError::NotConnected)?.discover().await?);
+        } else if state.keypair.is_none() {
             info!("Activating");
             state.keypair = Some(activate(self.os_config.as_ref()).await?);
         }
-        let pair = state.keypair.as_ref().unwrap();
-
         let nonce = generate_nonce(NonceType::APNS);
-        let signature = do_ids_signature(&pair.private, &nonce)?;
+        let (certificate,signature) = state.sign_push_connect(&nonce).await?;
 
         info!("Subscribing APS");
         let recv = self.subscribe().await;
         info!("Sending");
         self.send(APSMessage::Connect {
             flags: 0b01000001,
-            certificate: Some(pair.cert.clone()),
+            certificate: Some(certificate),
             nonce: Some(nonce),
             signature: Some(signature),
             token: state.token.clone(),

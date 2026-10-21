@@ -1934,7 +1934,7 @@ impl<S: RequestState> SignedRequest<S> {
                 self.bag.as_bytes(),
                 "".as_bytes(), // query str
                 &self.body,
-                aps.token.as_ref().unwrap(),
+                aps.token.as_ref().ok_or(PushError::APSNotReady("token"))?,
             ],
         );
         self.headers.append::<HeaderName>(
@@ -1954,6 +1954,21 @@ impl<S: RequestState> SignedRequest<S> {
             bag: self.bag,
             marker: PhantomData,
         })
+    }
+
+    /// Push signatures may require asynchronous native signing. Auth and ID
+    /// signatures deliberately keep the existing local-keystore path.
+    pub async fn sign_push(mut self, aps:&APSState) -> Result<SignedRequest<Signed>,PushError> {
+        let token=aps.token.as_ref().ok_or(PushError::APSNotReady("token"))?;
+        let nonce=generate_nonce(NonceType::HTTP);
+        let payload=build_payload(&nonce,&[self.bag.as_bytes(),b"",&self.body,token]);
+        let (certificate,signature)=aps.sign_push_http(&nonce,self.bag,&payload).await?;
+        for (name,value) in [("x-push-nonce",base64_encode(&nonce)),
+            ("x-push-sig",base64_encode(&signature)),("x-push-cert",base64_encode(&certificate))] {
+            self.headers.append::<HeaderName>(name.try_into().map_err(|_| PushError::BadMsg)?,
+                value.parse().map_err(|_| PushError::BadMsg)?);
+        }
+        Ok(SignedRequest { headers:self.headers,method:self.method,body:self.body,bag:self.bag,marker:PhantomData })
     }
 
     pub async fn send(self, client: &Client) -> Result<Response, PushError> {

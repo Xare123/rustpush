@@ -48,6 +48,8 @@ pub struct RelayConfig {
     /// Persist the capability only, never the transient headers or signature.
     #[serde(default)]
     pub native_auth_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_push_v1: bool,
 }
 
 impl RelayConfig {
@@ -64,6 +66,13 @@ impl RelayConfig {
         code: &str,
         beeper_token: &Option<String>,
     ) -> Result<(Versions, bool), PushError> {
+        let (versions, native_auth, _) = Self::get_versions_with_capabilities(host, code, beeper_token).await?;
+        Ok((versions, native_auth))
+    }
+
+    pub async fn get_versions_with_capabilities(
+        host: &str, code: &str, beeper_token: &Option<String>,
+    ) -> Result<(Versions, bool, bool), PushError> {
         let mut data = REQWEST
             .post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code)
@@ -85,8 +94,10 @@ impl RelayConfig {
         // six-field persistent type. Unknown proof fields are intentionally lost.
         let value: serde_json::Value = result.json().await?;
         let native_auth = has_native_auth_capability(&value);
+        let native_push = native_auth && value.pointer("/versions/ob_push_capabilities")
+            .and_then(serde_json::Value::as_str) == Some("native-push-v1");
         let result: VersionsResp = serde_json::from_value(value)?;
-        Ok((result.versions, native_auth))
+        Ok((result.versions, native_auth, native_push))
     }
 
     pub fn native_auth_config(&self) -> Option<omnisette::native_relay::NativeRelayConfig> {
@@ -122,6 +133,7 @@ impl RelayConfig {
         retained.code = replacement.code.clone();
         retained.beeper_token = replacement.beeper_token.clone();
         retained.native_auth_v1 = true;
+        retained.native_push_v1 = replacement.native_push_v1;
         Some(retained)
     }
 }
@@ -203,6 +215,12 @@ mod native_auth_persistence_tests {
 
 #[async_trait]
 impl OSConfig for RelayConfig {
+    fn native_push_transport(&self) -> Option<crate::native_push::NativePushTransport> {
+        self.native_push_v1.then(|| crate::native_push::NativePushTransport {
+            host:self.host.clone(),code:self.code.clone(),beeper_token:self.beeper_token.clone(),
+            device_id:self.version.unique_device_id.clone(),device_uuid:self.dev_uuid.clone(),
+        })
+    }
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
             activation_randomness: Uuid::new_v4().to_string().to_uppercase(),

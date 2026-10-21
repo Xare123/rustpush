@@ -73,6 +73,11 @@ name = "native-aps-qualifier"
 required-features = ["native-aps-qualification"]
 path = "src/bin/native_aps_qualifier.rs"
 
+[[bin]]
+name = "native-push-qualifier"
+required-features = ["native-aps-qualification"]
+path = "src/bin/native_push_qualifier.rs"
+
 [lib]
 name = "rustpush"
 path = "src/lib.rs"

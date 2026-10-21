@@ -27,6 +27,7 @@ pub use util::CompactECKey;
 pub mod macos;
 
 mod relay;
+pub mod native_push;
 
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
@@ -106,6 +107,7 @@ pub struct DebugMeta {
 
 #[async_trait]
 pub trait OSConfig: Sync + Send {
+    fn native_push_transport(&self) -> Option<native_push::NativePushTransport> { None }
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo;
     fn get_activation_device(&self) -> String;
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError>;
