@@ -14,11 +14,16 @@ pub enum CloudAttachmentRecordOrigin {
     IdsSent,
     HistoricalSent,
     HistoricalReceived,
+    ReceivedIncoming,
+    ReceivedMirrored,
 }
 
 impl CloudAttachmentRecordOrigin {
     pub fn is_outgoing(self) -> bool {
-        self != Self::HistoricalReceived
+        match self {
+            Self::IdsSent | Self::HistoricalSent | Self::ReceivedMirrored => true,
+            Self::HistoricalReceived | Self::ReceivedIncoming => false,
+        }
     }
 }
 
@@ -272,7 +277,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
-    /// Same one-shot save path for an explicitly retained historical origin.
+    /// Same one-shot save path for an explicitly retained historical/received origin.
     /// The caller must bind this origin to the original source and upload plan;
     /// neither a direction flag nor a completed asset proves that authority.
     pub async fn prepare_attachment_save_submission_for_origin(
@@ -333,7 +338,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     /// Exact-name reconciliation with a caller-bound expected direction.
-    /// Historical readback is not an IDS receipt or upload-retry permission.
+    /// Historical/received readback is not an IDS receipt or upload-retry permission.
     pub async fn lookup_attachment_record_for_origin(
         &self,
         writer_binding: &CloudMessagesWriterPreparationBinding<P>,
@@ -818,12 +823,19 @@ mod tests {
 
     #[test]
     fn historical_attachment_create_preserves_direction_and_all_asset_checks() {
-        use CloudAttachmentRecordOrigin::{HistoricalReceived, HistoricalSent};
-        for origin in [HistoricalSent, HistoricalReceived] {
+        use CloudAttachmentRecordOrigin::{
+            HistoricalReceived, HistoricalSent, ReceivedIncoming, ReceivedMirrored,
+        };
+        for origin in [
+            HistoricalSent,
+            HistoricalReceived,
+            ReceivedIncoming,
+            ReceivedMirrored,
+        ] {
             let mut candidate = input();
             candidate.attachment.cm.0.is_outgoing = origin.is_outgoing();
             assert!(validate_input(&candidate, &identity(), origin).is_ok());
-            if origin == HistoricalReceived {
+            if !origin.is_outgoing() {
                 assert!(validate_input(&candidate, &identity(), IdsSent).is_err());
             }
             let changes: &[fn(&mut CloudAttachmentSaveInput)] = &[
@@ -851,6 +863,8 @@ mod tests {
         for origin in [
             CloudAttachmentRecordOrigin::HistoricalSent,
             CloudAttachmentRecordOrigin::HistoricalReceived,
+            CloudAttachmentRecordOrigin::ReceivedIncoming,
+            CloudAttachmentRecordOrigin::ReceivedMirrored,
         ] {
             let zone = zone();
             let keys = vec![PCSKey::random()];
@@ -879,7 +893,7 @@ mod tests {
                 field.identifier.as_ref().and_then(|id| id.name.as_deref()),
                 Some("cm" | "lqa")
             )));
-            if origin == CloudAttachmentRecordOrigin::HistoricalReceived {
+            if !origin.is_outgoing() {
                 assert!(decode_attachment(&record.record_field, &decryptor, IdsSent).is_err());
             }
             let wrong_origin = if origin.is_outgoing() {
@@ -894,6 +908,46 @@ mod tests {
             });
             assert!(decode_attachment(&corrupt, &decryptor, origin).is_err());
         }
+    }
+
+    #[test]
+    fn received_origins_remain_distinct_even_when_remote_content_has_the_same_direction() {
+        use CloudAttachmentRecordOrigin::{
+            HistoricalReceived, HistoricalSent, ReceivedIncoming, ReceivedMirrored,
+        };
+        assert!(!ReceivedIncoming.is_outgoing());
+        assert!(ReceivedMirrored.is_outgoing());
+        for (index, origin) in [
+            IdsSent,
+            HistoricalSent,
+            HistoricalReceived,
+            ReceivedIncoming,
+            ReceivedMirrored,
+        ]
+        .iter()
+        .enumerate()
+        {
+            for other in [
+                IdsSent,
+                HistoricalSent,
+                HistoricalReceived,
+                ReceivedIncoming,
+                ReceivedMirrored,
+            ]
+            .iter()
+            .skip(index + 1)
+            {
+                assert_ne!(origin, other);
+            }
+        }
+        // Remote metadata conveys direction, not retained local provenance.
+        // The caller must still bind its exact protected envelope/plan kind.
+        let mut incoming = input();
+        incoming.attachment.cm.0.is_outgoing = false;
+        validate_input(&incoming, &identity(), ReceivedIncoming).unwrap();
+        assert!(validate_input(&incoming, &identity(), ReceivedMirrored).is_err());
+        validate_input(&input(), &identity(), ReceivedMirrored).unwrap();
+        assert!(validate_input(&input(), &identity(), ReceivedIncoming).is_err());
     }
 
     #[test]
