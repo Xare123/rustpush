@@ -118,6 +118,19 @@ use backon::Retryable;
 use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
 use keystore::KeystoreEncryptKey;
 
+async fn refreshed_clique_membership<F, R, Read>(
+    refresh: F,
+    read_membership: Read,
+) -> Result<bool, PushError>
+where
+    F: std::future::Future<Output = Result<(), PushError>>,
+    R: std::future::Future<Output = bool>,
+    Read: FnOnce() -> R,
+{
+    refresh.await?;
+    Ok(read_membership().await)
+}
+
 // ansi_x963_kdf (use crate later, current dependencies are broken)
 #[inline]
 pub fn derive_key_into<D>(secret: &[u8], shared_info: &[u8], key: &mut [u8])
@@ -2067,6 +2080,21 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             .unwrap_or(false)
     }
 
+    /// Unlike the legacy cached check, unavailable trust refresh is unknown,
+    /// not proof that recovery or a new clique join is necessary.
+    pub async fn checked_is_in_clique(&self) -> Result<bool, PushError> {
+        refreshed_clique_membership(self.sync_trust(), || async {
+            self.state
+                .read()
+                .await
+                .user_identity
+                .as_ref()
+                .map(|identity| identity.is_in_clique())
+                .unwrap_or(false)
+        })
+        .await
+    }
+
     async fn invoke_cuttlefish_read_only<T: prost::Message, R: prost::Message + Default>(
         &self,
         method: ReadOnlyCuttlefishMethod,
@@ -3987,6 +4015,40 @@ mod tests {
     };
     use crate::PushError;
     use cloudkit_proto::{CuttlefishPeer, Record, RecordIdentifier};
+
+    #[tokio::test]
+    async fn checked_clique_refresh_failure_never_reads_stale_membership() {
+        let reads = std::cell::Cell::new(0);
+        let result = super::refreshed_clique_membership(
+            async { Err(PushError::BadMsg) },
+            || async {
+                reads.set(reads.get() + 1);
+                false
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(PushError::BadMsg)));
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn checked_clique_membership_is_conclusive_only_after_refresh() {
+        for expected in [true, false] {
+            let refreshed = std::cell::Cell::new(false);
+            let result = super::refreshed_clique_membership(
+                async {
+                    refreshed.set(true);
+                    Ok(())
+                },
+                || async {
+                    assert!(refreshed.get());
+                    expected
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
 
     #[test]
     fn malformed_remote_record_identifier_is_a_typed_error_instead_of_a_panic() {
