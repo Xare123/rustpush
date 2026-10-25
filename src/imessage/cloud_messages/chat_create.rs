@@ -305,6 +305,27 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         .await
     }
 
+    /// A separately admitted fresh group uses the same create-only PCS owner.
+    /// The application must bind the explicit fresh-group protected purpose,
+    /// positive native-send origin, complete identity coverage and durable
+    /// stage before calling. This primitive grants no admission or IDS resend.
+    pub async fn prepare_fresh_group_chat_save_submission(
+        &self,
+        writer_binding: &CloudMessagesWriterPreparationBinding<P>,
+        input: CloudChatSaveInput,
+        request_identity: CloudKitRequestIdentity,
+        request_timeout: Duration,
+    ) -> Result<CloudMessagesPreparedSaveSubmission<P>, PushError> {
+        self.prepare_validated_chat_submission(
+            writer_binding,
+            input,
+            request_identity,
+            request_timeout,
+            validate_group_chat_input,
+        )
+        .await
+    }
+
     /// Snapshot-bound direct history uses the same create-only PCS owner, but
     /// preserves saved lineage instead of pretending this is a new local send.
     pub async fn prepare_historical_direct_chat_save_submission(
