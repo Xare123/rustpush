@@ -93,7 +93,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         server_record_name: &str,
     ) -> Result<super::CloudMessageRecordVersionLookup, PushError> {
         use crate::cloudkit::{
-            record_identifier, CloudKitFailureClass, CloudKitSession, FetchRecordOperation,
+            record_identifier, CloudKitSession, FetchRecordOperation,
             InspectReceivedRecordOperation, NO_ASSETS,
         };
         use cloudkit_proto::request_operation::header::IsolationLevel;
@@ -124,16 +124,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         if !std::sync::Arc::ptr_eq(&container, &after) {
             return Err(PushError::UnauthorizedAccountError);
         };
-        let unresolved = || super::CloudMessageRecordVersionLookup::Unresolved {
-            failure_class: Some(CloudKitFailureClass::Unknown),
-            retry_after: None,
-        };
-        let response = match response {
-            Ok(value) => value,
-            Err(_) => return Ok(unresolved()),
-        };
+        // Validate the same pinned container even when the transport failed.
+        let response = response?;
         if response.len() != 1 {
-            return Ok(unresolved());
+            return Err(PushError::BadMsg);
         };
         let outcome = response.into_iter().next().ok_or(PushError::BadMsg)?;
         match outcome {
@@ -141,7 +135,10 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             Err(error) if super::is_cloudkit_record_not_found(&error) => {
                 Ok(super::CloudMessageRecordVersionLookup::NotFound)
             }
-            Err(_) => Ok(unresolved()),
+            // Preserve the typed failure for the caller's closed classifier.
+            // A rejected response is neither an absent record nor a network
+            // diagnosis. The caller still revalidates the pinned identity.
+            Err(error) => Err(error),
         }
     }
 
