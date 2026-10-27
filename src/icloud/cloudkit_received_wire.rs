@@ -10,8 +10,10 @@
 //! fail with BadMsg. Field-name uniqueness and type/payload consistency remain
 //! the inspector's job. Absent and explicit empty values are never normalized.
 //!
-//! Scope is conservative: other response payloads and Record.shareInfo (16)
-//! are unsupported. The unrelated ResponseOperation.header payload is opaque;
+//! Scope is conservative: other response payloads, Record.shareInfo (16), and
+//! nonempty Record.protectionInfoKeysToRemove (31) are unsupported. Empty31 is
+//! preserved; no key removal or protection-tag instruction is applied or ignored.
+//! The unrelated ResponseOperation.header payload is opaque;
 //! it cannot provide identity or a result and is still decoded by the caller.
 //! bytesValue/PCS/asset bytes are opaque, including encrypted EncryptedValue.
 //! Decrypted scalar and MessageProto validation belongs to the inspector.
@@ -50,6 +52,8 @@ enum Schema {
     Asset,
     Package,
     Protection,
+    ProtectionKeysToRemove,
+    ProtectionRemovalKey,
     StableUrl,
 }
 
@@ -72,6 +76,7 @@ enum WireFailureKind {
     ErrorCode,
     InvalidShape,
     ResultConflict,
+    UnsupportedProtectionMetadata,
 }
 
 /// Protocol structure only. No response values, identifiers or error text.
@@ -147,6 +152,18 @@ fn rule(schema: Schema, tag: u64) -> Result<(Kind, bool), PushError> {
         (Record, 15) => U32,
         (Record, 22) => Message(StableUrl),
         (Record, 24) => Bytes,
+        // Published iOS26.1/23B85 CKDPRecordReadFrom case0x1f stores the singular
+        // CKDPProtectionInfoKeysToRemove at offset136; CKDPRecord.copyWithZone
+        // binds136 to that property. Decoder sub_2253101B8 defines the nested
+        // fields below. Source: EthanArbuckle/iPhone18-3_26.1_23B85_Restore,
+        // commit90aa0cfe59d9682b4265e1354c8b19ec3c7823ab, CloudKitDaemon_01/13.mm.
+        // This is strict read grammar only: every nonempty message is held
+        // below before returning raw bytes, so it cannot become Found/staged.
+        (Record, 31) => Message(ProtectionKeysToRemove),
+        (ProtectionKeysToRemove, 1) => return Ok((Message(ProtectionRemovalKey), true)),
+        (ProtectionKeysToRemove, 2) => Text,
+        (ProtectionRemovalKey, 1) => Bytes,
+        (ProtectionRemovalKey, 2) => I32,
         (RecordId, 1) => Message(Identifier),
         (RecordId, 2) => Message(ZoneId),
         (ZoneId, 1 | 2) => Message(Identifier),
@@ -283,6 +300,14 @@ fn parse_received_record_wire(
         if level.pos == level.bytes.len() {
             diagnostic.reason = WireFailureKind::InvalidShape;
             level.finish()?;
+            // A present key (even an empty entry) or tag (even empty text) is
+            // protection-management metadata. Cached decryption is not proof
+            // that ignoring it is safe. Traverse it first, then hold before
+            // the strict fetch can return Found or authorize source staging.
+            if level.schema == Schema::ProtectionKeysToRemove && level.seen != 0 {
+                diagnostic.reason = WireFailureKind::UnsupportedProtectionMetadata;
+                return Err(PushError::BadMsg);
+            }
             levels.pop();
             continue;
         }
@@ -301,7 +326,9 @@ fn parse_received_record_wire(
         if key & 7 != kind.wire() {
             return Err(PushError::BadMsg);
         }
-        // Every admitted tag fits 1..=24 except ResponseOperation.211.
+        // Every admitted tag fits 1..=31 except ResponseOperation.211.
+        // The31 sentinel is local to each schema level, never shared by
+        // Response.211 and its nested Record.31.
         let bit = 1u32 << if tag == 211 { 31 } else { tag as u32 };
         diagnostic.reason = WireFailureKind::DuplicateSingular;
         if !repeated && level.seen & bit != 0 {
@@ -320,6 +347,9 @@ fn parse_received_record_wire(
                 return Err(PushError::BadMsg);
             }
             match (level.schema, tag) {
+                (Schema::ProtectionRemovalKey, 2) if !(1..=3).contains(&value) => {
+                    return Err(PushError::BadMsg);
+                }
                 (Schema::Operation, 2) if value != 211 => {
                     diagnostic.reason = WireFailureKind::OperationKind;
                     return Err(PushError::BadMsg);
@@ -456,11 +486,11 @@ mod tests {
     #[test]
     fn diagnostics_identify_fixed_schema_rules_without_response_values() {
         let private = b"private-selector-credential-record";
-        let unknown = success(&data(31, private));
+        let unknown = success(&data(63, private));
         let duplicate = success(&[data(1, private), data(1, private)].concat());
         for (raw, expected) in [
             (unknown, ReceivedWireDiagnostic {
-                schema: Schema::Record, field: Some(31), reason: WireFailureKind::UnknownField,
+                schema: Schema::Record, field: Some(63), reason: WireFailureKind::UnknownField,
             }),
             (duplicate, ReceivedWireDiagnostic {
                 schema: Schema::Record, field: Some(1), reason: WireFailureKind::DuplicateSingular,
@@ -893,5 +923,97 @@ mod tests {
         rejected(&success(&record_with_value(&nested)));
         let small = data(11, &data(11, &number(4, 0)));
         assert!(received_record_wire(&success(&record_with_value(&small))).is_ok());
+    }
+
+    #[test]
+    fn record31_empty_metadata_preserves_original_record_and_typed_content() {
+        let opaque = [number(1, 20), data(2, &[0xff, 0, 0x80]), number(13, 1)].concat();
+        let base = [data(1, b"synthetic-etag"),
+            data(2, &data(1, &data(1, b"synthetic-record"))),
+            data(3, &data(1, b"MessageEncryptedV3")),
+            data(7, &field("msgProto", &opaque)), data(24, &[0, 1, 2, 3])].concat();
+        // Absent and present-empty remain different original wire values.
+        // The current generated Record drops31; it must not replace raw bytes.
+        let typed = Record::decode(base.as_slice()).unwrap();
+        assert_eq!(received_record_wire(&success(&base)).unwrap(), Some(base.clone()));
+        for record in [
+            [data(31, &[]), base.clone()].concat(),
+            [base.clone(), data(31, &[])].concat(),
+            [base.clone(), vec![0xfa, 0x81, 0, 0x80, 0]].concat(),
+        ] {
+            let raw = received_record_wire(&success(&record)).unwrap().unwrap();
+            assert_eq!(raw, record);
+            assert_eq!(Record::decode(raw.as_slice()).unwrap(), typed);
+            assert_ne!(raw, typed.encode_to_vec());
+        }
+    }
+
+    #[test]
+    fn record31_nonempty_protection_metadata_is_held_before_found() {
+        let key = |kind| [data(1, b"synthetic-key"), number(2, kind)].concat();
+        for metadata in [data(1, &[]), data(2, b""), data(2, b"synthetic-tag"),
+            data(1, &data(1, b"")), data(1, &number(2, 1)),
+            data(1, &key(1)), data(1, &key(2)), data(1, &key(3)),
+            [data(1, &key(1)), data(1, &key(2)), data(2, b"synthetic-tag")].concat()] {
+            let wire = success(&data(31, &metadata));
+            assert!(matches!(received_record_wire(&wire), Err(PushError::BadMsg)));
+            assert_eq!(received_record_wire_diagnostic(&wire).unwrap_err().to_string(),
+                "schema=ProtectionKeysToRemove field=None reason=UnsupportedProtectionMetadata");
+        }
+    }
+
+    #[test]
+    fn record31_wrong_wire_truncation_nested_unknowns_and_duplicates_reject() {
+        for (record, reason) in [(number(31, 0), "WrongWireType"),
+            (fixed(31, 1.0), "WrongWireType"),
+            ([vi((31 << 3) | 5), vec![0; 4]].concat(), "WrongWireType"),
+            ([vi((31 << 3) | 2), vi(100), vec![0x42]].concat(), "InvalidLength"),
+            ([vi((31 << 3) | 2), vec![0x80]].concat(), "InvalidLength"),
+            ([data(31, &[]), data(31, &[])].concat(), "DuplicateSingular")] {
+            let wire = success(&record);
+            rejected(&wire);
+            assert_eq!(received_record_wire_diagnostic(&wire).unwrap_err().to_string(),
+                format!("schema=Record field=Some(31) reason={reason}"));
+        }
+        let key = [data(1, b"synthetic-key"), number(2, 1)].concat();
+        for metadata in [number(1, 0), number(2, 0), data(2, &[0xff]),
+            data(3, &[]), [data(2, b"a"), data(2, b"b")].concat(),
+            data(1, &[data(1, b"a"), data(1, b"b")].concat()),
+            data(1, &[number(2, 1), number(2, 1)].concat()),
+            data(1, &number(1, 0)), data(1, &data(2, &[])),
+            data(1, &data(3, &[])), data(1, &number(2, 0)),
+            data(1, &number(2, 4)), data(1, &number(2, 0x1_0000_0001)),
+            data(1, &number(2, u64::MAX)),
+            data(1, &[vi((1 << 3) | 2), vi(100), vec![0x42]].concat()),
+            [data(1, &key), data(2, &[0xff])].concat()] {
+            let diagnostic = received_record_wire_diagnostic(&success(&data(31, &metadata)))
+                .unwrap_err().to_string();
+            assert!(!diagnostic.contains("UnsupportedProtectionMetadata"),
+                "malformed content must be validated before the semantic hold");
+        }
+    }
+
+    #[test]
+    fn record31_does_not_relax_critical_duplicates_unknowns_or_bounds() {
+        let empty = data(31, &[]);
+        for record in [
+            [empty.clone(), data(1, b"a"), data(1, b"b")].concat(),
+            [empty.clone(), data(2, &[]), data(2, &[])].concat(),
+            [empty.clone(), data(3, &[]), data(3, &[])].concat(),
+            [empty.clone(), number(1, 0)].concat(),
+            [empty.clone(), data(32, &[])].concat(),
+            [empty.clone(), data(33, &[])].concat(),
+            [empty.clone(), data(63, &[])].concat(),
+        ] { rejected(&success(&record)); }
+        // Inventory from the same pinned CKDPRecord decoder, not new support.
+        // Protection/sharing/lifecycle families remain closed in this patch.
+        for unsupported in [16, 17, 18, 21, 23, 26, 29, 30, 32, 33] {
+            rejected(&success(&[empty.clone(), data(unsupported, &[])].concat()));
+        }
+        rejected(&success(&[empty.clone(), number(28, 0)].concat()));
+        let duplicated_operation = [operation(), data(1, b"other-operation")].concat();
+        rejected(&frame(&duplicated_operation, &number(1, 1), Some(&data(1, &empty))));
+        rejected(&frame(&[], &number(1, 1), Some(&data(1, &empty))));
+        rejected(&success(&data(31, &data(1, &[]).repeat(MAX_FIELDS))));
     }
 }
