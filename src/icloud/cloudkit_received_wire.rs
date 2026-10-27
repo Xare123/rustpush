@@ -18,8 +18,10 @@
 //! bytesValue/PCS/asset bytes are opaque, including encrypted EncryptedValue.
 //! Decrypted scalar and MessageProto validation belongs to the inspector.
 //!
-//! No I/O, decryption, logging or authority. At most 8 MiB input, 4096 visited
-//! fields, 16 active message levels; one final Record-sized allocation only.
+//! No I/O, decryption, logging or authority. At most 8 MiB input, 4096 validator
+//! field visits, 16 active message levels; one final Record-sized allocation only.
+//! An already-refused Record unknown field permits a separate diagnostic walk:
+//! at most 4096 top-level visits and 32 distinct shapes, with no nested traversal.
 //! Any legal field order and non-minimal, non-overflowing varints are accepted.
 
 use crate::PushError;
@@ -27,6 +29,7 @@ use crate::PushError;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FIELDS: usize = 4096;
 const MAX_DEPTH: usize = 16;
+const MAX_RECORD_DIAGNOSTIC_SHAPES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Schema {
@@ -85,11 +88,45 @@ pub(super) struct ReceivedWireDiagnostic {
     schema: Schema,
     field: Option<u32>,
     reason: WireFailureKind,
+    unknown_record: Option<RecordUnknownSummary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct RecordUnknownField {
+    field: u32,
+    wire: u8,
+    empty: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Complete describes top-level framing only, not semantic or cardinality validity.
+enum RecordScanStop { Complete, FrameLimit, FieldLimit, ShapeLimit, Malformed, UnsupportedWire }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordUnknownSummary {
+    fields: [RecordUnknownField; MAX_RECORD_DIAGNOSTIC_SHAPES],
+    used: usize,
+    stop: RecordScanStop,
 }
 
 impl std::fmt::Display for ReceivedWireDiagnostic {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "schema={:?} field={:?} reason={:?}", self.schema, self.field, self.reason)
+        write!(out, "schema={:?} field={:?} reason={:?}", self.schema, self.field, self.reason)?;
+        if let Some(summary) = &self.unknown_record {
+            write!(out, " unknown_record=[")?;
+            for (index, field) in summary.fields[..summary.used].iter().enumerate() {
+                if index != 0 { write!(out, ";")?; }
+                write!(out, "field={} wire={}", field.field, field.wire)?;
+                if field.wire == 2 {
+                    match field.empty {
+                        Some(empty) => write!(out, " empty={empty}")?,
+                        None => write!(out, " empty=unknown")?,
+                    }
+                }
+            }
+            write!(out, "] scan={:?}", summary.stop)?;
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +304,66 @@ fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], Pu
     Ok(value)
 }
 
+/// Structural diagnostics only, after the Record has already been rejected.
+/// Skip top-level values without interpreting nested messages or opaque bytes.
+/// No raw bytes, values, identifiers or exact nonzero lengths enter the summary.
+fn diagnostic_skip_value(bytes: &[u8], pos: &mut usize, wire: u8)
+    -> Result<Option<bool>, RecordScanStop>
+{
+    let malformed = |_| RecordScanStop::Malformed;
+    match wire {
+        0 => { varint(bytes, pos).map_err(malformed)?; }
+        1 => { take(bytes, pos, 8).map_err(malformed)?; }
+        2 => {
+            let len = usize::try_from(varint(bytes, pos).map_err(malformed)?)
+                .map_err(|_| RecordScanStop::Malformed)?;
+            take(bytes, pos, len).map_err(malformed)?;
+            return Ok(Some(len == 0));
+        }
+        5 => { take(bytes, pos, 4).map_err(malformed)?; }
+        _ => return Err(RecordScanStop::UnsupportedWire), // Never traverse groups.
+    }
+    Ok(None)
+}
+
+fn summarize_unknown_record_fields(bytes: &[u8]) -> RecordUnknownSummary {
+    let mut summary = RecordUnknownSummary {
+        fields: [RecordUnknownField::default(); MAX_RECORD_DIAGNOSTIC_SHAPES],
+        used: 0, stop: RecordScanStop::Complete,
+    };
+    if bytes.len() > MAX_FRAME_BYTES {
+        summary.stop = RecordScanStop::FrameLimit;
+        return summary;
+    }
+    let mut pos = 0;
+    for _ in 0..MAX_FIELDS {
+        if pos == bytes.len() { return summary; }
+        let key = match varint(bytes, &mut pos) {
+            Ok(key) if key >> 3 != 0 && key >> 3 <= 0x1fff_ffff => key,
+            _ => { summary.stop = RecordScanStop::Malformed; return summary; }
+        };
+        let tag = key >> 3;
+        let wire = (key & 7) as u8;
+        let shape = diagnostic_skip_value(bytes, &mut pos, wire);
+        if rule(Schema::Record, tag).is_err() {
+            let field = RecordUnknownField { field: tag as u32, wire,
+                empty: shape.as_ref().ok().copied().flatten() };
+            // Repeated identical shapes do not reveal occurrence counts.
+            if !summary.fields[..summary.used].contains(&field) {
+                if summary.used == MAX_RECORD_DIAGNOSTIC_SHAPES {
+                    summary.stop = RecordScanStop::ShapeLimit;
+                    return summary;
+                }
+                summary.fields[summary.used] = field;
+                summary.used += 1;
+            }
+        }
+        if let Err(stop) = shape { summary.stop = stop; return summary; }
+    }
+    if pos != bytes.len() { summary.stop = RecordScanStop::FieldLimit; }
+    summary
+}
+
 pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, PushError> {
     received_record_wire_diagnostic(frame).map_err(|_| PushError::BadMsg)
 }
@@ -276,6 +373,7 @@ pub(super) fn received_record_wire_diagnostic(
 ) -> Result<Option<Vec<u8>>, ReceivedWireDiagnostic> {
     let mut diagnostic = ReceivedWireDiagnostic {
         schema: Schema::Response, field: None, reason: WireFailureKind::FrameLimit,
+        unknown_record: None,
     };
     parse_received_record_wire(frame, &mut diagnostic).map_err(|_| diagnostic)
 }
@@ -321,7 +419,15 @@ fn parse_received_record_wire(
         }
         diagnostic.field = Some(tag as u32);
         diagnostic.reason = WireFailureKind::UnknownField;
-        let (kind, repeated) = rule(level.schema, tag)?;
+        let (kind, repeated) = match rule(level.schema, tag) {
+            Ok(rule) => rule,
+            Err(error) => {
+                if level.schema == Schema::Record {
+                    diagnostic.unknown_record = Some(summarize_unknown_record_fields(level.bytes));
+                }
+                return Err(error); // Diagnostics never relax the original refusal.
+            }
+        };
         diagnostic.reason = WireFailureKind::WrongWireType;
         if key & 7 != kind.wire() {
             return Err(PushError::BadMsg);
@@ -417,6 +523,7 @@ fn parse_received_record_wire(
     {
         *diagnostic = ReceivedWireDiagnostic {
             schema: Schema::Response, field: None, reason: WireFailureKind::ResultConflict,
+            unknown_record: None,
         };
         return Err(PushError::BadMsg);
     }
@@ -489,18 +596,12 @@ mod tests {
         let unknown = success(&data(63, private));
         let duplicate = success(&[data(1, private), data(1, private)].concat());
         for (raw, expected) in [
-            (unknown, ReceivedWireDiagnostic {
-                schema: Schema::Record, field: Some(63), reason: WireFailureKind::UnknownField,
-            }),
-            (duplicate, ReceivedWireDiagnostic {
-                schema: Schema::Record, field: Some(1), reason: WireFailureKind::DuplicateSingular,
-            }),
-            (success(&number(1, 1)), ReceivedWireDiagnostic {
-                schema: Schema::Record, field: Some(1), reason: WireFailureKind::WrongWireType,
-            }),
+            (unknown, (Schema::Record, Some(63), WireFailureKind::UnknownField)),
+            (duplicate, (Schema::Record, Some(1), WireFailureKind::DuplicateSingular)),
+            (success(&number(1, 1)), (Schema::Record, Some(1), WireFailureKind::WrongWireType)),
         ] {
             let diagnostic = received_record_wire_diagnostic(&raw).unwrap_err();
-            assert_eq!(diagnostic, expected);
+            assert_eq!((diagnostic.schema, diagnostic.field, diagnostic.reason), expected);
             assert!(!diagnostic.to_string().contains(std::str::from_utf8(private).unwrap()));
             assert!(matches!(received_record_wire(&raw), Err(PushError::BadMsg)));
         }
@@ -512,7 +613,8 @@ mod tests {
         assert_eq!(received_record_wire_diagnostic(&success(&record)).unwrap(), Some(record));
         assert_eq!(received_record_wire_diagnostic(&frame(&operation(), &not_found(), None)).unwrap(), None);
         assert_eq!(received_record_wire_diagnostic(&frame(&operation(), &number(1, 1), None)),
-            Err(ReceivedWireDiagnostic {schema: Schema::Response, field: None, reason: WireFailureKind::ResultConflict}));
+            Err(ReceivedWireDiagnostic {schema: Schema::Response, field: None,
+                reason: WireFailureKind::ResultConflict, unknown_record: None}));
     }
 
     #[test]
@@ -1015,5 +1117,106 @@ mod tests {
         rejected(&frame(&duplicated_operation, &number(1, 1), Some(&data(1, &empty))));
         rejected(&frame(&[], &number(1, 1), Some(&data(1, &empty))));
         rejected(&success(&data(31, &data(1, &[]).repeat(MAX_FIELDS))));
+    }
+
+    #[test]
+    fn record_unknown_diagnostics_report_top_level_shapes_and_keep_refusal() {
+        let record = [data(31, &[]), data(33, &[]), data(32, b"opaque"),
+            number(34, 123), fixed(35, 456.0),
+            [vi(36 << 3 | 5), vec![1, 2, 3, 4]].concat(),
+            data(33, &[0xff, 0x80]), data(33, &[]),
+            data(7, &field("msgProto", &data(2, &data(63, b"opaque"))))].concat();
+        let wire = success(&record);
+        rejected(&wire);
+        assert_eq!(received_record_wire_diagnostic(&wire).unwrap_err().to_string(),
+            "schema=Record field=Some(33) reason=UnknownField unknown_record=[field=33 wire=2 empty=true;field=32 wire=2 empty=false;field=34 wire=0;field=35 wire=1;field=36 wire=5;field=33 wire=2 empty=false] scan=Complete");
+    }
+
+    #[test]
+    fn record_unknown_diagnostics_never_include_values_lengths_or_nested_shapes() {
+        let mut output = None;
+        for size in [17, 317, 6001] {
+            let private = vec![b'Z'; size];
+            let opaque = [data(200, &private), vec![0xff, 0x80, 0x0b]].concat();
+            let record = [data(1, &private), data(2, &data(1, &data(1, &private))),
+                data(24, &private), data(33, &opaque), data(32, &[])].concat();
+            let diagnostic = received_record_wire_diagnostic(&success(&record)).unwrap_err();
+            let text = diagnostic.to_string();
+            let debug = format!("{diagnostic:?}");
+            assert!(!text.contains("ZZZ") && !debug.contains("ZZZ"));
+            assert!(!text.contains("field=200") && !text.contains("length"));
+            if let Some(expected) = &output { assert_eq!(&text, expected); }
+            else { output = Some(text); }
+            rejected(&success(&record));
+        }
+        assert_eq!(output.unwrap(), "schema=Record field=Some(33) reason=UnknownField unknown_record=[field=33 wire=2 empty=false;field=32 wire=2 empty=true] scan=Complete");
+        let repeated = success(&data(33, &[]).repeat(100));
+        assert_eq!(received_record_wire_diagnostic(&repeated).unwrap_err().to_string(),
+            received_record_wire_diagnostic(&success(&data(33, &[]))).unwrap_err().to_string());
+    }
+
+    #[test]
+    fn record_unknown_diagnostics_mark_truncation_without_claiming_empty_form() {
+        for record in [
+            [vi(33 << 3 | 2), vec![0x80]].concat(),
+            [vi(33 << 3 | 2), vi(1000), vec![1]].concat(),
+        ] {
+            let diagnostic = received_record_wire_diagnostic(&success(&record)).unwrap_err();
+            assert_eq!(diagnostic.to_string(), "schema=Record field=Some(33) reason=UnknownField unknown_record=[field=33 wire=2 empty=unknown] scan=Malformed");
+            rejected(&success(&record));
+        }
+        for wire in [0, 1, 5] {
+            let record = [vi(33 << 3 | wire), vec![0x80]].concat();
+            let diagnostic = received_record_wire_diagnostic(&success(&record)).unwrap_err();
+            assert_eq!(diagnostic.unknown_record.unwrap().stop, RecordScanStop::Malformed);
+            rejected(&success(&record));
+        }
+        for wire in [3, 4, 6, 7] {
+            let record = vi(33 << 3 | wire);
+            let diagnostic = received_record_wire_diagnostic(&success(&record)).unwrap_err();
+            assert_eq!(diagnostic.unknown_record.unwrap().stop, RecordScanStop::UnsupportedWire);
+            rejected(&success(&record));
+        }
+        for bad_key in [vec![0], vec![0x80], vec![0xff; 10], vi(0x2000_0000 << 3)] {
+            let record = [data(33, &[]), bad_key].concat();
+            let diagnostic = received_record_wire_diagnostic(&success(&record)).unwrap_err();
+            assert_eq!(diagnostic.unknown_record.unwrap().stop, RecordScanStop::Malformed);
+            rejected(&success(&record));
+        }
+    }
+
+    #[test]
+    fn record_unknown_diagnostics_are_bounded_and_explicitly_partial() {
+        let fields = [data(33, &[]), number(34, 938271649).repeat(MAX_FIELDS)].concat();
+        let diagnostic = received_record_wire_diagnostic(&success(&fields)).unwrap_err();
+        let summary = diagnostic.unknown_record.unwrap();
+        assert_eq!(summary.stop, RecordScanStop::FieldLimit);
+        assert_eq!(summary.used, 2);
+        assert!(!diagnostic.to_string().contains("938271649"));
+        let distinct: Vec<u8> = (100..100 + MAX_RECORD_DIAGNOSTIC_SHAPES as u64)
+            .flat_map(|tag| data(tag, &[])).collect();
+        let diagnostic = received_record_wire_diagnostic(&success(&[data(33, &[]), distinct].concat())).unwrap_err();
+        let summary = diagnostic.unknown_record.unwrap();
+        assert_eq!(summary.stop, RecordScanStop::ShapeLimit);
+        assert_eq!(summary.used, MAX_RECORD_DIAGNOSTIC_SHAPES);
+        assert!(diagnostic.to_string().len() < 2048);
+        assert_eq!(summarize_unknown_record_fields(&vec![0; MAX_FRAME_BYTES + 1]).stop,
+            RecordScanStop::FrameLimit);
+    }
+
+    #[test]
+    fn record_unknown_diagnostics_are_only_attached_to_existing_record_unknown_refusals() {
+        for raw in [success(&number(1, 0)), success(&data(31, &data(2, b""))),
+            [frame(&operation(), &not_found(), None), number(63, 1)].concat()] {
+            let diagnostic = received_record_wire_diagnostic(&raw).unwrap_err();
+            assert!(diagnostic.unknown_record.is_none());
+            rejected(&raw);
+        }
+        let empty31 = data(31, &[]);
+        assert_eq!(received_record_wire_diagnostic(&success(&empty31)).unwrap(), Some(empty31));
+        assert_eq!(received_record_wire_diagnostic(&frame(&operation(), &not_found(), None)).unwrap(), None);
+        for record in [data(33, &[]), data(33, b"opaque"),
+            [data(31, &[]), data(33, &[])].concat(),
+            [data(33, &[]), data(31, &[])].concat()] { rejected(&success(&record)); }
     }
 }
