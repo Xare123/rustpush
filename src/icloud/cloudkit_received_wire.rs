@@ -26,7 +26,7 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FIELDS: usize = 4096;
 const MAX_DEPTH: usize = 16;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Schema {
     Response,
     Operation,
@@ -51,6 +51,41 @@ enum Schema {
     Package,
     Protection,
     StableUrl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireFailureKind {
+    FrameLimit,
+    FieldLimit,
+    DepthLimit,
+    InvalidKey,
+    UnknownField,
+    WrongWireType,
+    DuplicateSingular,
+    InvalidScalar,
+    InvalidLength,
+    TruncatedFixed64,
+    InvalidText,
+    InvalidOperationIdentity,
+    OperationKind,
+    ResultCode,
+    ErrorCode,
+    InvalidShape,
+    ResultConflict,
+}
+
+/// Protocol structure only. No response values, identifiers or error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReceivedWireDiagnostic {
+    schema: Schema,
+    field: Option<u32>,
+    reason: WireFailureKind,
+}
+
+impl std::fmt::Display for ReceivedWireDiagnostic {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "schema={:?} field={:?} reason={:?}", self.schema, self.field, self.reason)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -216,6 +251,22 @@ fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], Pu
 }
 
 pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, PushError> {
+    received_record_wire_diagnostic(frame).map_err(|_| PushError::BadMsg)
+}
+
+pub(super) fn received_record_wire_diagnostic(
+    frame: &[u8],
+) -> Result<Option<Vec<u8>>, ReceivedWireDiagnostic> {
+    let mut diagnostic = ReceivedWireDiagnostic {
+        schema: Schema::Response, field: None, reason: WireFailureKind::FrameLimit,
+    };
+    parse_received_record_wire(frame, &mut diagnostic).map_err(|_| diagnostic)
+}
+
+fn parse_received_record_wire(
+    frame: &[u8],
+    diagnostic: &mut ReceivedWireDiagnostic,
+) -> Result<Option<Vec<u8>>, PushError> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(PushError::BadMsg);
     }
@@ -227,28 +278,38 @@ pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, Push
     let mut has_error = false;
     let mut server_code = None;
     while let Some(level) = levels.last_mut() {
+        diagnostic.schema = level.schema;
+        diagnostic.field = None;
         if level.pos == level.bytes.len() {
+            diagnostic.reason = WireFailureKind::InvalidShape;
             level.finish()?;
             levels.pop();
             continue;
         }
+        diagnostic.reason = WireFailureKind::FieldLimit;
         remaining = remaining.checked_sub(1).ok_or(PushError::BadMsg)?;
+        diagnostic.reason = WireFailureKind::InvalidKey;
         let key = varint(level.bytes, &mut level.pos)?;
         let tag = key >> 3;
         if tag == 0 || tag > 0x1fff_ffff {
             return Err(PushError::BadMsg);
         }
+        diagnostic.field = Some(tag as u32);
+        diagnostic.reason = WireFailureKind::UnknownField;
         let (kind, repeated) = rule(level.schema, tag)?;
+        diagnostic.reason = WireFailureKind::WrongWireType;
         if key & 7 != kind.wire() {
             return Err(PushError::BadMsg);
         }
         // Every admitted tag fits 1..=24 except ResponseOperation.211.
         let bit = 1u32 << if tag == 211 { 31 } else { tag as u32 };
+        diagnostic.reason = WireFailureKind::DuplicateSingular;
         if !repeated && level.seen & bit != 0 {
             return Err(PushError::BadMsg);
         }
         level.seen |= bit;
         if kind.wire() == 0 {
+            diagnostic.reason = WireFailureKind::InvalidScalar;
             let value = varint(level.bytes, &mut level.pos)?;
             if matches!(kind, Kind::U32) && value > u64::from(u32::MAX)
                 || matches!(kind, Kind::Bool) && value > 1
@@ -259,36 +320,46 @@ pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, Push
                 return Err(PushError::BadMsg);
             }
             match (level.schema, tag) {
-                (Schema::Operation, 2) if value != 211 => return Err(PushError::BadMsg),
+                (Schema::Operation, 2) if value != 211 => {
+                    diagnostic.reason = WireFailureKind::OperationKind;
+                    return Err(PushError::BadMsg);
+                }
                 (Schema::Result, 1) => {
                     if !(1..=4).contains(&value) {
+                        diagnostic.reason = WireFailureKind::ResultCode;
                         return Err(PushError::BadMsg);
                     }
                     result_code = value;
                 }
                 (Schema::ServerError, 1) => {
                     if !matches!(value, 1..=4 | 6..=8) {
+                        diagnostic.reason = WireFailureKind::ErrorCode;
                         return Err(PushError::BadMsg);
                     }
                     server_code = Some(value);
                 }
                 (Schema::ClientError, 1) if !matches!(value, 1..=43 | 46..=62) => {
+                    diagnostic.reason = WireFailureKind::ErrorCode;
                     return Err(PushError::BadMsg)
                 }
                 _ => {}
             }
         } else if kind.wire() == 1 {
+            diagnostic.reason = WireFailureKind::TruncatedFixed64;
             take(level.bytes, &mut level.pos, 8)?;
         } else {
+            diagnostic.reason = WireFailureKind::InvalidLength;
             let len = usize::try_from(varint(level.bytes, &mut level.pos)?)
                 .map_err(|_| PushError::BadMsg)?;
             let bytes = take(level.bytes, &mut level.pos, len)?;
             if matches!(kind, Kind::Text) {
+                diagnostic.reason = WireFailureKind::InvalidText;
                 std::str::from_utf8(bytes).map_err(|_| PushError::BadMsg)?;
                 if level.schema == Schema::Operation
                     && tag == 1
                     && (bytes.is_empty() || bytes.len() > 128)
                 {
+                    diagnostic.reason = WireFailureKind::InvalidOperationIdentity;
                     return Err(PushError::BadMsg);
                 }
             }
@@ -300,6 +371,7 @@ pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, Push
             }
             if let Kind::Message(schema) = kind {
                 if levels.len() == MAX_DEPTH {
+                    diagnostic.reason = WireFailureKind::DepthLimit;
                     return Err(PushError::BadMsg);
                 }
                 levels.push(Level::new(schema, bytes));
@@ -313,6 +385,9 @@ pub(super) fn received_record_wire(frame: &[u8]) -> Result<Option<Vec<u8>>, Push
         || (result_code == 1 && has_error)
         || (server_code == Some(3) && result_code != 3)
     {
+        *diagnostic = ReceivedWireDiagnostic {
+            schema: Schema::Response, field: None, reason: WireFailureKind::ResultConflict,
+        };
         return Err(PushError::BadMsg);
     }
     Ok(record.map(<[u8]>::to_vec))
@@ -376,6 +451,38 @@ mod tests {
             received_record_wire(frame),
             Err(PushError::BadMsg)
         ));
+    }
+
+    #[test]
+    fn diagnostics_identify_fixed_schema_rules_without_response_values() {
+        let private = b"private-selector-credential-record";
+        let unknown = success(&data(31, private));
+        let duplicate = success(&[data(1, private), data(1, private)].concat());
+        for (raw, expected) in [
+            (unknown, ReceivedWireDiagnostic {
+                schema: Schema::Record, field: Some(31), reason: WireFailureKind::UnknownField,
+            }),
+            (duplicate, ReceivedWireDiagnostic {
+                schema: Schema::Record, field: Some(1), reason: WireFailureKind::DuplicateSingular,
+            }),
+            (success(&number(1, 1)), ReceivedWireDiagnostic {
+                schema: Schema::Record, field: Some(1), reason: WireFailureKind::WrongWireType,
+            }),
+        ] {
+            let diagnostic = received_record_wire_diagnostic(&raw).unwrap_err();
+            assert_eq!(diagnostic, expected);
+            assert!(!diagnostic.to_string().contains(std::str::from_utf8(private).unwrap()));
+            assert!(matches!(received_record_wire(&raw), Err(PushError::BadMsg)));
+        }
+    }
+
+    #[test]
+    fn diagnostics_preserve_success_absence_and_all_existing_rejections() {
+        let record = record_with_value(&[number(1, 20), data(2, &[0xff, 0]), number(13, 1)].concat());
+        assert_eq!(received_record_wire_diagnostic(&success(&record)).unwrap(), Some(record));
+        assert_eq!(received_record_wire_diagnostic(&frame(&operation(), &not_found(), None)).unwrap(), None);
+        assert_eq!(received_record_wire_diagnostic(&frame(&operation(), &number(1, 1), None)),
+            Err(ReceivedWireDiagnostic {schema: Schema::Response, field: None, reason: WireFailureKind::ResultConflict}));
     }
 
     #[test]

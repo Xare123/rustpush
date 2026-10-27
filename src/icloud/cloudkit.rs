@@ -1713,9 +1713,9 @@ pub struct InspectReceivedRecordOperation(pub FetchRecordOperation);
 impl CloudKitOp for InspectReceivedRecordOperation {
     type Response=FetchedRecord;
     fn validate_response_wire(wire:&[u8])->Result<(),PushError>{
-        received_wire::received_record_wire(wire).map(|_|()).map_err(|error| {
-            warn!("CloudKit exact record fetch rejected original response wire");
-            error
+        received_wire::received_record_wire_diagnostic(wire).map(|_|()).map_err(|diagnostic| {
+            warn!("CloudKit exact record fetch rejected original response wire: {diagnostic}");
+            PushError::BadMsg
         })
     }
     fn set_request(&self,out:&mut cloudkit_proto::RequestOperation){self.0.set_request(out)}
